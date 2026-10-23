@@ -92,6 +92,21 @@ impl Window {
         self.invalidate();
     }
 
+    /// LBTerm: move the tab at `from` to `to`, the same tab staying active, with no focus
+    /// change sent to any pane (the Conductor's tab kept first; lbterm_extras::conductor)
+    pub fn lbterm_move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let active = self.get_active_tab().map(|tab| tab.tab_id());
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(idx) = active.and_then(|id| self.get_tab_idx_for_id(id)) {
+            self.active_tab_idx = idx;
+        }
+        self.invalidate();
+    }
+
     /// Insert `tab` in window, after other tabs.
     pub fn push_tab(&mut self, tab: &Arc<Tab>) {
         self.assert_tab_isnt_already_in_window(tab);

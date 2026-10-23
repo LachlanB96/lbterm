@@ -32,6 +32,8 @@ pub mod esc;
 pub mod hyperlink;
 pub mod osc;
 pub mod parser;
+/// LBTerm: OSC 7501, the Program Status Protocol
+pub mod program_status;
 #[cfg(feature = "tmux_cc")]
 pub mod tmux_cc;
 

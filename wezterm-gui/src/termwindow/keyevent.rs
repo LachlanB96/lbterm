@@ -270,6 +270,30 @@ impl super::TermWindow {
 
         if is_down {
             if only_key_bindings == OnlyKeyBindings::No {
+                // LBTerm: the tab menu takes every key while it's open (render/tab_menu.rs)
+                if self.lbterm_menu_is_open() {
+                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
+                        if self.lbterm_tab_menu_key(&term_key, raw_modifiers.remove_positional_mods()) {
+                            return true;
+                        }
+                    }
+                }
+                // LBTerm: so does the list of prompts (render/prompt.rs)
+                if self.lbterm_prompt_list_is_open() {
+                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
+                        if self.lbterm_prompt_list_key(&term_key, raw_modifiers.remove_positional_mods()) {
+                            return true;
+                        }
+                    }
+                }
+                // LBTerm: and the Conductor's menu (render/conductor.rs)
+                if self.lbterm_conductor_menu_is_open() {
+                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
+                        if self.lbterm_conductor_menu_key(&term_key, raw_modifiers.remove_positional_mods()) {
+                            return true;
+                        }
+                    }
+                }
                 if let Some(modal) = self.get_modal() {
                     if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
                         match modal.key_down(term_key, raw_modifiers.remove_positional_mods(), self)
@@ -428,6 +452,9 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        // LBTerm: whatever this key does to the panes is the key's, not an arrival
+        // (lbterm_extras::arrival)
+        self.lbterm_arrival.input(std::time::Instant::now());
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -662,6 +689,28 @@ impl super::TermWindow {
                         return;
                     }
                     self.key_table_state.did_process_key();
+                }
+
+                // LBTerm: the tab menu takes every key while it's open (render/tab_menu.rs)
+                if self.lbterm_menu_is_open() {
+                    if window_key.key_is_down {
+                        self.lbterm_tab_menu_key(&key, modifiers);
+                    }
+                    return;
+                }
+                // LBTerm: so does the list of prompts (render/prompt.rs)
+                if self.lbterm_prompt_list_is_open() {
+                    if window_key.key_is_down {
+                        self.lbterm_prompt_list_key(&key, modifiers);
+                    }
+                    return;
+                }
+                // LBTerm: and the Conductor's menu (render/conductor.rs)
+                if self.lbterm_conductor_menu_is_open() {
+                    if window_key.key_is_down {
+                        self.lbterm_conductor_menu_key(&key, modifiers);
+                    }
+                    return;
                 }
 
                 if let Some(modal) = self.get_modal() {

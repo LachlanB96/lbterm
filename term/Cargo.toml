@@ -11,7 +11,7 @@ keywords = ["terminal", "emulator", "vte"]
 readme = "README.md"
 
 [features]
-use_serde = ["termwiz/use_serde", "wezterm-cell/use_serde", "wezterm-escape-parser/use_serde", "wezterm-surface/use_serde"]
+use_serde = ["termwiz/use_serde", "wezterm-cell/use_serde", "wezterm-escape-parser/use_serde", "wezterm-surface/use_serde", "lbterm-notify/use_serde"]
 
 [dependencies]
 anyhow.workspace = true
@@ -23,6 +23,7 @@ hex.workspace = true
 humansize.workspace = true
 image.workspace = true
 lazy_static.workspace = true
+lbterm-notify.workspace = true
 log.workspace = true
 lru.workspace = true
 miniz_oxide.workspace = true

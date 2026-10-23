@@ -2,15 +2,19 @@ use anyhow::{anyhow, Result};
 use async_executor::Executor;
 use flume::{bounded, unbounded, Receiver, TryRecvError};
 use std::future::Future;
+use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
 pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
-pub type ScheduleFunc = Box<dyn Fn(Runnable) + Send + Sync + 'static>;
+/// LBTerm: where a task was spawned, handed to the scheduler with each run so the main
+/// thread's queue can name it in the slow-frame log (lbterm_extras::slow)
+pub type SpawnSite = &'static Location<'static>;
+pub type ScheduleFunc = Box<dyn Fn(Runnable, SpawnSite) + Send + Sync + 'static>;
 
-fn no_scheduler_configured(_: Runnable) {
+fn no_scheduler_configured(_: Runnable, _: SpawnSite) {
     panic!("no scheduler has been configured");
 }
 
@@ -22,14 +26,14 @@ lazy_static::lazy_static! {
 
 static SCHEDULER_CONFIGURED: AtomicBool = AtomicBool::new(false);
 
-fn schedule_runnable(runnable: Runnable, high_pri: bool) {
+fn schedule_runnable(runnable: Runnable, high_pri: bool, site: SpawnSite) {
     let func = if high_pri {
         ON_MAIN_THREAD.lock()
     } else {
         ON_MAIN_THREAD_LOW_PRI.lock()
     }
     .unwrap();
-    func(runnable);
+    func(runnable, site);
 }
 
 pub fn is_scheduler_configured() -> bool {
@@ -54,6 +58,7 @@ pub fn set_schedulers(main: ScheduleFunc, low_pri: ScheduleFunc) {
 /// and that can be used to await and yield the return value
 /// from the thread.
 /// Can be called from any thread.
+#[track_caller]
 pub fn spawn_into_new_thread<F, T>(f: F) -> Task<Result<T>>
 where
     F: FnOnce() -> Result<T>,
@@ -123,6 +128,7 @@ fn get_scoped() -> Option<Arc<Executor<'static>>> {
 /// This function can be called from any thread.
 /// If you are on the main thread already, consider using
 /// spawn() instead to lift the `Send` requirement.
+#[track_caller]
 pub fn spawn_into_main_thread<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + Send + 'static,
@@ -131,7 +137,10 @@ where
     if let Some(executor) = get_scoped() {
         return executor.spawn(future);
     }
-    let (runnable, task) = async_task::spawn(future, |runnable| schedule_runnable(runnable, true));
+    let site = Location::caller();
+    let (runnable, task) = async_task::spawn(future, move |runnable| {
+        schedule_runnable(runnable, true, site)
+    });
     runnable.schedule();
     task
 }
@@ -142,6 +151,7 @@ where
 /// spawns.
 /// If you are on the main thread already, consider using `spawn_with_low_priority`
 /// instead to lift the `Send` requirement.
+#[track_caller]
 pub fn spawn_into_main_thread_with_low_priority<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + Send + 'static,
@@ -150,32 +160,41 @@ where
     if let Some(executor) = get_scoped() {
         return executor.spawn(future);
     }
-    let (runnable, task) = async_task::spawn(future, |runnable| schedule_runnable(runnable, false));
+    let site = Location::caller();
+    let (runnable, task) = async_task::spawn(future, move |runnable| {
+        schedule_runnable(runnable, false, site)
+    });
     runnable.schedule();
     task
 }
 
 /// Spawn a future with normal priority.
+#[track_caller]
 pub fn spawn<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + 'static,
     R: 'static,
 {
-    let (runnable, task) =
-        async_task::spawn_local(future, |runnable| schedule_runnable(runnable, true));
+    let site = Location::caller();
+    let (runnable, task) = async_task::spawn_local(future, move |runnable| {
+        schedule_runnable(runnable, true, site)
+    });
     runnable.schedule();
     task
 }
 
 /// Spawn a future with low priority; it will be polled only after
 /// all other normal priority items are processed.
+#[track_caller]
 pub fn spawn_with_low_priority<F, R>(future: F) -> Task<R>
 where
     F: Future<Output = R> + 'static,
     R: 'static,
 {
-    let (runnable, task) =
-        async_task::spawn_local(future, |runnable| schedule_runnable(runnable, false));
+    let site = Location::caller();
+    let (runnable, task) = async_task::spawn_local(future, move |runnable| {
+        schedule_runnable(runnable, false, site)
+    });
     runnable.schedule();
     task
 }
@@ -200,12 +219,12 @@ impl SimpleExecutor {
             tx_low.send(f).ok();
         };
         set_schedulers(
-            Box::new(move |task| {
+            Box::new(move |task, _site| {
                 queue_func(Box::new(move || {
                     task.run();
                 }))
             }),
-            Box::new(move |task| {
+            Box::new(move |task, _site| {
                 queue_func_low(Box::new(move || {
                     task.run();
                 }))

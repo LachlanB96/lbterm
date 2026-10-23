@@ -458,6 +458,8 @@ enum Entity {
     CommandPalette,
     CharSelect,
     PaneSelect,
+    /// LBTerm: the labels under the tab rail's pads
+    PanelLabel,
 }
 
 struct FontConfigInner {
@@ -473,6 +475,7 @@ struct FontConfigInner {
     pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
+    panel_label_font: RefCell<Option<Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -494,6 +497,7 @@ impl FontConfigInner {
             pane_select_font: RefCell::new(None),
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
+            panel_label_font: RefCell::new(None),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
@@ -512,6 +516,7 @@ impl FontConfigInner {
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
+        self.panel_label_font.borrow_mut().take();
         self.metrics.borrow_mut().take();
         *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
         Ok(())
@@ -615,6 +620,7 @@ impl FontConfigInner {
                 config.pane_select_font_size,
                 config.pane_select_font.as_ref(),
             ),
+            Entity::PanelLabel => (config.lbterm_tab_panel.label_font_size, None),
         };
 
         let text_style =
@@ -692,6 +698,16 @@ impl FontConfigInner {
 
         char_select_font.replace(Rc::clone(&loaded));
 
+        Ok(loaded)
+    }
+
+    fn panel_label_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let mut panel_label_font = self.panel_label_font.borrow_mut();
+        if let Some(entry) = panel_label_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+        let loaded = self.make_entity_font_impl(myself, Entity::PanelLabel)?;
+        panel_label_font.replace(Rc::clone(&loaded));
         Ok(loaded)
     }
 
@@ -955,6 +971,7 @@ impl FontConfigInner {
         self.fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
+        self.panel_label_font.borrow_mut().take();
 
         (prior_font, prior_dpi)
     }
@@ -1069,6 +1086,12 @@ impl FontConfiguration {
 
     pub fn command_palette_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.command_palette_font(&self.inner)
+    }
+
+    /// LBTerm: the window frame's font at the tab rail's label size
+    /// (`lbterm_tab_panel.label_font_size`)
+    pub fn panel_label_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.panel_label_font(&self.inner)
     }
 
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {

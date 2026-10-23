@@ -17,7 +17,7 @@ use parking_lot::{
 };
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::{Read, Write};
 #[cfg(windows)]
@@ -37,6 +37,8 @@ pub mod activity;
 pub mod client;
 pub mod connui;
 pub mod domain;
+pub mod lbterm_repaint;
+pub mod lbterm_typed;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
@@ -861,28 +863,13 @@ impl Mux {
 
         let window = self.windows.write().remove(&window_id);
         if let Some(window) = window {
-            // Gather all the domains referenced by this window
-            let mut domains_of_window = HashSet::new();
-            for tab in window.iter_tabs() {
-                for pane in tab.iter_panes_ignoring_zoom() {
-                    domains_of_window.insert(pane.pane.domain_id());
-                }
-            }
-
-            for domain_id in domains_of_window {
-                if let Some(domain) = self.get_domain(domain_id) {
-                    if domain.detachable() {
-                        log::info!("detaching domain");
-                        if let Err(err) = domain.detach() {
-                            log::error!(
-                                "while detaching domain {domain_id} {}: {err:#}",
-                                domain.domain_name()
-                            );
-                        }
-                    }
-                }
-            }
-
+            // LBTerm: upstream detaches the window's mux domains here, so
+            // closing a window left its panes running in the mux server, and
+            // the next start brought them back. In LBTerm closing a window
+            // ends its tabs, as it does for local panes: remove_tab_internal
+            // kills each pane, and a ClientPane passes that to the server.
+            // Only a GUI that dies (a crash, a kill, an install) leaves them
+            // running there. DetachDomain still detaches.
             for tab in window.iter_tabs() {
                 self.remove_tab_internal(tab.tab_id());
             }
@@ -1324,6 +1311,36 @@ impl Mux {
         workspace_for_new_window: String,
         window_position: Option<GuiPosition>,
     ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        self.spawn_tab_or_window_activating(
+            window_id,
+            domain,
+            command,
+            command_dir,
+            size,
+            current_pane_id,
+            workspace_for_new_window,
+            window_position,
+            true,
+        )
+        .await
+    }
+
+    /// LBTerm: spawn_tab_or_window, where `activate` false adds the tab
+    /// without switching the window to it, so nothing typed lands in it and
+    /// the tab that was active isn't told it lost focus
+    /// (`lbterm cli spawn --no-activate`)
+    pub async fn spawn_tab_or_window_activating(
+        &self,
+        window_id: Option<WindowId>,
+        domain: SpawnTabDomain,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        size: TerminalSize,
+        current_pane_id: Option<PaneId>,
+        workspace_for_new_window: String,
+        window_position: Option<GuiPosition>,
+        activate: bool,
+    ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
         let domain = self
             .resolve_spawn_tab_domain(current_pane_id, &domain)
             .context("resolve_spawn_tab_domain")?;
@@ -1401,7 +1418,10 @@ impl Mux {
             .get_window_mut(window_id)
             .ok_or_else(|| anyhow!("no such window!?"))?;
         if let Some(idx) = window.get_tab_idx_for_id(tab.tab_id()) {
-            window.remember_and_set_active_tab_idx(idx);
+            // LBTerm: a window's only tab is active whatever this says
+            if activate {
+                window.remember_and_set_active_tab_idx(idx);
+            }
         }
 
         Ok((tab, pane, window_id))

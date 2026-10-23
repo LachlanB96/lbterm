@@ -434,6 +434,15 @@ async fn client_thread_async(
     }
 }
 
+static LBTERM_STARTED_SERVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// LBTerm: whether this process started a mux server, finding none on its socket. When it
+/// didn't and it has tabs in one, it reattached to tabs a GUI before it left running (a
+/// restart, a crash): the window strip says so (wezterm-gui's restart.rs).
+pub fn lbterm_started_server() -> bool {
+    LBTERM_STARTED_SERVER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn unix_connect_with_retry(
     target: &UnixTarget,
     just_spawned: bool,
@@ -759,6 +768,16 @@ impl Reconnectable {
                 let mut cmd = std::process::Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
 
+                // LBTerm: the mux server is a console program, and a GUI has no console to
+                // lend it, so Windows opened one for it (a Windows Terminal window, in front
+                // and taking the keyboard) for the moment before it detached itself
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    cmd.creation_flags(CREATE_NO_WINDOW);
+                }
+
                 #[cfg(unix)]
                 if let Some(mask) = umask::UmaskSaver::saved_umask() {
                     unsafe {
@@ -771,6 +790,9 @@ impl Reconnectable {
 
                 log::warn!("Running: {:?}", cmd);
                 ui.output_str(&format!("Running: {:?}\n", cmd));
+                // LBTerm: a GUI that started its server found no tabs running there to
+                // reattach to (lbterm_started_server)
+                LBTERM_STARTED_SERVER.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 let child = cmd
                     .spawn()
@@ -1341,6 +1363,7 @@ impl Client {
     rpc!(ping, Ping = (), Pong);
     rpc!(list_panes, ListPanes = (), ListPanesResponse);
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
+    rpc!(spawn_no_activate, SpawnNoActivate, SpawnResponse);
     rpc!(split_pane, SplitPane, SpawnResponse);
     rpc!(
         move_pane_to_new_tab,

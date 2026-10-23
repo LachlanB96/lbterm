@@ -43,6 +43,11 @@ pub struct SpawnCommand {
     #[arg(long, requires = "new_window")]
     workspace: Option<String>,
 
+    /// Add the tab without switching the window to it, so nothing
+    /// typed lands in it. Cannot be used with `--new-window`.
+    #[arg(long, conflicts_with = "new_window")]
+    no_activate: bool,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `wezterm cli spawn -- bash -l` will spawn bash
     /// as if it were a login shell.
@@ -96,28 +101,58 @@ impl SpawnCommand {
 
         let size = config.initial_size(0, None);
 
-        let spawned = client
-            .spawn_v2(codec::SpawnV2 {
-                domain: self
-                    .domain_name
-                    .map_or(SpawnTabDomain::DefaultDomain, |name| {
-                        SpawnTabDomain::DomainName(name)
-                    }),
-                window_id,
-                command: if self.prog.is_empty() {
-                    None
-                } else {
-                    let builder = CommandBuilder::from_argv(self.prog);
-                    Some(builder)
-                },
-                command_dir: resolve_relative_cwd(self.cwd)?,
-                size,
-                workspace,
-            })
-            .await?;
+        let spawn = codec::SpawnV2 {
+            domain: self
+                .domain_name
+                .map_or(SpawnTabDomain::DefaultDomain, |name| {
+                    SpawnTabDomain::DomainName(name)
+                }),
+            window_id,
+            command: if self.prog.is_empty() {
+                None
+            } else {
+                let builder = CommandBuilder::from_argv(self.prog);
+                Some(builder)
+            },
+            command_dir: resolve_relative_cwd(self.cwd)?,
+            size,
+            workspace,
+        };
+        let spawned = if self.no_activate {
+            spawn_no_activate(&client, spawn).await?
+        } else {
+            client.spawn_v2(spawn).await?
+        };
 
         log::debug!("{:?}", spawned);
         println!("{}", spawned.pane_id);
         Ok(())
+    }
+}
+
+/// LBTerm: a mux server keeps the build it started with until its last tab
+/// closes, so one from before --no-activate decodes SpawnNoActivate as
+/// Pdu::Invalid and says so. Spawn the usual way then rather than fail:
+/// the GUI of a mux server doesn't follow its switch to the new tab (seen
+/// 2026-10-21), so the keyboard stays put. An older GUI's own socket does
+/// switch, as every spawn did before.
+async fn spawn_no_activate(
+    client: &Client,
+    spawn: codec::SpawnV2,
+) -> anyhow::Result<codec::SpawnResponse> {
+    match client
+        .spawn_no_activate(codec::SpawnNoActivate {
+            spawn: spawn.clone(),
+        })
+        .await
+    {
+        Err(err) if format!("{err:#}").contains("invalid PDU Invalid { ident: 7502 }") => {
+            eprintln!(
+                "lbterm: this server is an older build that can't spawn without \
+                 activating, so the tab was spawned the usual way"
+            );
+            client.spawn_v2(spawn).await
+        }
+        result => result,
     }
 }

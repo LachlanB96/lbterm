@@ -1,0 +1,9 @@
+[package]
+name = "lbterm-panel"
+version = "0.1.0"
+edition = "2021"
+description = "LBTerm's tab panel: Claude status from pane user vars, the idle timer, row text, hover timing and layout"
+license = "MIT"
+publish = false
+
+[dependencies]

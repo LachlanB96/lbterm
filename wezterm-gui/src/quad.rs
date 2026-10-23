@@ -156,6 +156,42 @@ impl<'a> QuadTrait for QuadImpl<'a> {
     }
 }
 
+impl<'a> QuadImpl<'a> {
+    /// LBTerm: four corners anywhere (top-left, top-right, bottom-left,
+    /// bottom-right, as the quad's two triangles take them), each with its
+    /// own colour, blended across the quad. The tab panel's light is drawn
+    /// with these (lbterm/TAB-PANEL.md).
+    pub fn set_corners(&mut self, corners: [[f32; 2]; VERTICES_PER_CELL], colors: [LinearRgba; VERTICES_PER_CELL]) {
+        match self {
+            Self::Vert(q) => {
+                for (i, v) in q.vert.iter_mut().enumerate() {
+                    v.position = corners[i];
+                    v.fg_color = colors[i].into();
+                    v.alt_color = colors[i].into();
+                    v.mix_value = 0.;
+                }
+            }
+            Self::Boxed(q) => q.corners = Some((corners, colors.map(Into::into))),
+        }
+    }
+
+    /// LBTerm: the tint shades from `left` at the quad's left edge to `right` at its right,
+    /// for a glyph a rainbow trigger colours (render/triggers.rs). After set_fg_color.
+    pub fn set_fg_gradient(&mut self, left: LinearRgba, right: LinearRgba) {
+        match self {
+            Self::Vert(q) => {
+                for (i, v) in q.vert.iter_mut().enumerate() {
+                    let c = if i == V_TOP_LEFT || i == V_BOT_LEFT { left } else { right };
+                    v.fg_color = c.into();
+                    v.alt_color = c.into();
+                    v.mix_value = 0.;
+                }
+            }
+            Self::Boxed(q) => q.gradient = Some((left.into(), right.into())),
+        }
+    }
+}
+
 /// A helper for updating the 4 vertices that compose a glyph cell
 pub struct Quad<'a> {
     pub(crate) vert: &'a mut [Vertex],
@@ -231,6 +267,10 @@ pub struct BoxedQuad {
     hsv: [f32; 3],
     has_color: f32,
     mix_value: f32,
+    /// LBTerm: from `QuadImpl::set_corners`
+    corners: Option<([[f32; 2]; VERTICES_PER_CELL], [[f32; 4]; VERTICES_PER_CELL])>,
+    /// LBTerm: from `QuadImpl::set_fg_gradient`, left and right
+    gradient: Option<([f32; 4], [f32; 4])>,
 }
 
 impl QuadTrait for BoxedQuad {
@@ -276,6 +316,9 @@ impl BoxedQuad {
             fg_color: verts[V_TOP_LEFT].fg_color,
             hsv: verts[V_TOP_LEFT].hsv,
             mix_value: verts[V_TOP_LEFT].mix_value,
+            corners: None,
+            gradient: (verts[V_TOP_LEFT].fg_color != verts[V_TOP_RIGHT].fg_color)
+                .then(|| (verts[V_TOP_LEFT].fg_color, verts[V_TOP_RIGHT].fg_color)),
         }
     }
 
@@ -303,6 +346,21 @@ impl BoxedQuad {
             self.fg_color[3],
         ));
         quad.set_alt_color_and_mix_value(self.alt_color.into(), self.mix_value);
+        if let Some((corners, colors)) = &self.corners {
+            for (i, v) in vert.iter_mut().enumerate() {
+                v.position = corners[i];
+                v.fg_color = colors[i];
+                v.alt_color = colors[i];
+            }
+        }
+        if let Some((left, right)) = self.gradient {
+            for (i, v) in vert.iter_mut().enumerate() {
+                let c = if i == V_TOP_LEFT || i == V_BOT_LEFT { left } else { right };
+                v.fg_color = c;
+                v.alt_color = c;
+                v.mix_value = 0.;
+            }
+        }
 
         vert
     }
@@ -391,6 +449,17 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
         match self {
             Self::Gpu(b) => b.extend_with(layer_num, vertices),
             Self::Heap(h) => h.extend_with(layer_num, vertices),
+        }
+    }
+}
+
+impl<'a> TripleLayerQuadAllocator<'a> {
+    /// LBTerm: the quads allocated so far in each sub-layer, so the paint
+    /// pass can mark which visual they belong to (lbterm/COMPOSITOR.md).
+    pub fn quad_counts(&self) -> [usize; 3] {
+        match self {
+            Self::Gpu(b) => b.quad_counts(),
+            Self::Heap(h) => [h.layer0.len(), h.layer1.len(), h.layer2.len()],
         }
     }
 }

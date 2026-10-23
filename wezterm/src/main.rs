@@ -23,7 +23,8 @@ mod cli;
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    name = config::lbterm::CLI_EXE,
+    about = config::lbterm::ABOUT,
     version = wezterm_version()
 )]
 pub struct Opt {
@@ -771,11 +772,7 @@ fn delegate_to_gui(saver: UmaskSaver) -> anyhow::Result<()> {
     // Restore the original umask
     drop(saver);
 
-    let exe_name = if cfg!(windows) {
-        "wezterm-gui.exe"
-    } else {
-        "wezterm-gui"
-    };
+    let exe_name = config::lbterm::exe_file_name(config::lbterm::GUI_EXE);
 
     let exe = std::env::current_exe()?
         .parent()

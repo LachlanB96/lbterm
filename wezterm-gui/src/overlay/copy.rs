@@ -590,6 +590,7 @@ impl CopyRenderable {
                 self.results.len() - 1
             };
             self.activate_match_number(prior);
+            self.lbterm_mark_match();
         }
     }
 
@@ -602,7 +603,24 @@ impl CopyRenderable {
                 *cur + 1
             };
             self.activate_match_number(next);
+            self.lbterm_mark_match();
         }
+    }
+
+    /// LBTerm: the match a key moved to is marked for a moment, as a prompt jump marks where it
+    /// lands (render/prompt.rs). Not as the pattern is typed: that's typing.
+    fn lbterm_mark_match(&self) {
+        let Some(n) = self.result_pos else {
+            return;
+        };
+        let Some(result) = self.results.get(n) else {
+            return;
+        };
+        let (pane_id, row) = (self.delegate.pane_id(), result.start_y);
+        self.window
+            .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.lbterm_mark_landed(pane_id, row);
+            })));
     }
 
     /// Skip this page of matches and move down to the first match from

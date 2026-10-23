@@ -1,0 +1,15 @@
+[package]
+name = "lbterm-notify"
+version = "0.1.0"
+edition = "2021"
+description = "LBTerm's kitty desktop notifications (OSC 99): parsing, putting chunks together, and the replies"
+license = "MIT"
+publish = false
+
+[features]
+# The commands travel inside the terminal's alerts, which the mux serializes
+use_serde = ["serde"]
+
+[dependencies]
+base64 = { workspace = true, features = ["std"] }
+serde = { workspace = true, optional = true, features = ["std"] }

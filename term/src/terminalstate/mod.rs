@@ -350,6 +350,8 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    /// LBTerm: kitty notifications (OSC 99) being put together from their chunks
+    lbterm_notify: lbterm_notify::Assembler,
 
     palette: Option<ColorPalette>,
 
@@ -373,6 +375,8 @@ pub struct TerminalState {
     sixel_scrolls_right: bool,
 
     user_vars: HashMap<String, String>,
+    /// LBTerm: what programs say they're doing (OSC 7501)
+    program_status: crate::program_status::ProgramStatusRecords,
 
     kitty_img: KittyImageState,
     seqno: SequenceNo,
@@ -582,6 +586,7 @@ impl TerminalState {
             writer,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
+            program_status: Default::default(),
             kitty_img: Default::default(),
             seqno,
             unicode_version,
@@ -595,6 +600,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            lbterm_notify: Default::default(),
         }
     }
 
@@ -658,6 +664,20 @@ impl TerminalState {
 
     pub fn get_progress(&self) -> Progress {
         self.progress.clone()
+    }
+
+    /// LBTerm: what the programs here say they're doing (OSC 7501)
+    pub fn program_status(&self) -> Vec<crate::program_status::ProgramStatusRecord> {
+        self.program_status.records()
+    }
+
+    /// LBTerm: tell the GUI the program status changed
+    fn program_status_changed(&mut self, changed: bool) {
+        if changed {
+            if let Some(handler) = self.alert_handler.as_mut() {
+                handler.alert(Alert::ProgramStatus);
+            }
+        }
     }
 
     /// Returns the current working directory associated with the
@@ -806,6 +826,30 @@ impl TerminalState {
     /// (DEC mode 1004), which causes focus-in and focus-out events to be reported.
     pub fn focus_tracking_enabled(&self) -> bool {
         self.focus_tracking
+    }
+
+    /// LBTerm: a shell's prompt (OSC 133 A, or N, which starts one too)
+    /// means the program before it has gone. One that left mouse or focus
+    /// reporting on, as a Claude Code that's killed or crashes does, would
+    /// have every mouse move and focus change typed into the shell as escape
+    /// codes. Shells ask for neither, so the prompt turns both off, and the
+    /// mouse encoding back to the default. Whether anything was on.
+    pub(crate) fn release_mouse_and_focus(&mut self) -> bool {
+        let was_on = self.mouse_tracking
+            || self.button_event_mouse
+            || self.any_event_mouse
+            || self.focus_tracking
+            || self.mouse_encoding != MouseEncoding::X10;
+        if was_on {
+            log::info!("a shell prompt turned off the mouse and focus reporting a program left on");
+            self.mouse_tracking = false;
+            self.button_event_mouse = false;
+            self.any_event_mouse = false;
+            self.focus_tracking = false;
+            self.mouse_encoding = MouseEncoding::X10;
+            self.last_mouse_move.take();
+        }
+        was_on
     }
 
     /// Returns true if the associated application has enabled application cursor keys mode

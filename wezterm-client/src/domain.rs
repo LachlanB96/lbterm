@@ -903,6 +903,17 @@ impl Domain for ClientDomain {
             })
             .await?;
 
+        // LBTerm: the server makes the new pane its tab's active pane without
+        // a word to us. Note it, or activating the pane split from (as
+        // Terminal's summary-pane handler does straight after) looks like no
+        // change, never reaches the server, and the next resync hands the
+        // keyboard to the new pane (lbterm/perf/split-focus.ps1)
+        inner
+            .focused_remote_pane_id
+            .lock()
+            .unwrap()
+            .replace(result.pane_id);
+
         let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
             &inner,
             result.tab_id,

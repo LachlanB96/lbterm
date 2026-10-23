@@ -349,6 +349,61 @@ pub struct Config {
     #[dynamic(default)]
     pub front_end: FrontEndSelection,
 
+    /// LBTerm: draw through DirectComposition so Windows' compositor can
+    /// move panes. Needs `front_end = "WebGpu"`; see lbterm/COMPOSITOR.md.
+    #[dynamic(default)]
+    pub lbterm_compositor: bool,
+
+    /// LBTerm: how panes move with the compositor (lbterm/COMPOSITOR.md)
+    #[dynamic(default)]
+    pub lbterm_motion: crate::lbterm::LbtermMotion,
+
+    /// LBTerm: the tab panel down the left of the window (lbterm/TAB-PANEL.md)
+    #[dynamic(default)]
+    pub lbterm_tab_panel: crate::lbterm::LbtermTabPanel,
+
+    /// LBTerm: patterns that colour what they match in panes, play an effect and fire the
+    /// `lbterm-trigger` Lua event (lbterm/TRIGGERS.md). Unset: the built-in easter eggs.
+    #[dynamic(default)]
+    pub lbterm_triggers: Option<Vec<crate::lbterm::LbtermTrigger>>,
+
+    /// LBTerm: a key that brings LBTerm forward from any other app
+    #[dynamic(default)]
+    pub lbterm_summon: Option<crate::lbterm::LbtermSummon>,
+
+    /// LBTerm: after LBTerm ends without closing cleanly, offer to open its tabs again
+    #[dynamic(default = "default_true")]
+    pub lbterm_crash_restore: bool,
+
+    /// LBTerm: hide the scrollbar while the active pane's program has the whole screen (the
+    /// alternate screen or mouse reporting on, as Claude Code's fullscreen mode has), since the
+    /// terminal's viewport can't follow where it's scrolled. Its room stays, so nothing resizes
+    #[dynamic(default = "default_true")]
+    pub lbterm_hide_scroll_bar_in_apps: bool,
+
+    /// LBTerm: the folder Claude Code sessions' summaries are written to, by
+    /// session id (`<id>.txt`, `.detail.txt`, `.label.txt`; Terminal's summary
+    /// worker), read for the tab rail's labels. Unset: none are read.
+    #[dynamic(default)]
+    pub lbterm_summaries: Option<String>,
+
+    /// LBTerm: Claude Code's prompt history (`~/.claude/history.jsonl`). Set, the window strip
+    /// has a second row with the Claude pane's last prompt, and lists the session's prompts from
+    /// it, each a jump back to where it is in the conversation (render/prompt.rs)
+    #[dynamic(default)]
+    pub lbterm_prompt_history: Option<String>,
+
+    /// LBTerm: the Conductor on the tab rail, its pad above the tabs and its outlines on the tabs
+    /// it's on (render/conductor.rs)
+    #[dynamic(default)]
+    pub lbterm_conductor: Option<crate::lbterm::LbtermConductor>,
+
+    /// LBTerm: the slow-frame log. Whatever holds the GUI thread longer than this many
+    /// milliseconds (a window message, a task from its queue, a part of a paint) is logged by
+    /// name, since that thread also takes every keypress (lbterm_extras::slow). 0 turns it off
+    #[dynamic(default = "crate::lbterm::default_slow_ms")]
+    pub lbterm_slow_ms: u64,
+
     /// Whether to select the higher powered discrete GPU when
     /// the system has a choice of integrated or discrete.
     /// Defaults to low power.
@@ -1025,26 +1080,26 @@ impl Config {
         // multiple.  In addition, it spawns a lot of subprocesses,
         // so we do this bit "by-hand"
 
-        let mut paths = vec![PathPossibility::optional(HOME_DIR.join(".wezterm.lua"))];
-        for dir in CONFIG_DIRS.iter() {
-            paths.push(PathPossibility::optional(dir.join("wezterm.lua")))
-        }
+        // On Windows, a common use case is to maintain a thumb drive
+        // with a set of portable tools that don't need to be installed
+        // to run on a target system.  In that scenario, the user would
+        // like to run with the config from their thumbdrive because
+        // either the target system won't have any config, or will have
+        // the config of another user.
+        // So we prioritize that here: if there is a config in the same
+        // dir as the executable that will take precedence.
+        let exe = std::env::current_exe().ok();
+        let exe_dir = exe
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|_| cfg!(windows));
 
-        if cfg!(windows) {
-            // On Windows, a common use case is to maintain a thumb drive
-            // with a set of portable tools that don't need to be installed
-            // to run on a target system.  In that scenario, the user would
-            // like to run with the config from their thumbdrive because
-            // either the target system won't have any config, or will have
-            // the config of another user.
-            // So we prioritize that here: if there is a config in the same
-            // dir as the executable that will take precedence.
-            if let Ok(exe_name) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_name.parent() {
-                    paths.insert(0, PathPossibility::optional(exe_dir.join("wezterm.lua")));
-                }
-            }
-        }
+        // LBTerm: its own config first, then WezTerm's (see lbterm.rs)
+        let mut paths: Vec<PathPossibility> =
+            crate::lbterm::config_file_candidates(&HOME_DIR, exe_dir, crate::config_dirs_for)
+                .into_iter()
+                .map(PathPossibility::optional)
+                .collect();
         if let Some(path) = std::env::var_os("WEZTERM_CONFIG_FILE") {
             log::trace!("Note: WEZTERM_CONFIG_FILE is set in the environment");
             paths.insert(0, PathPossibility::required(path.into()));
@@ -1624,7 +1679,9 @@ impl Config {
 }
 
 fn default_check_for_updates() -> bool {
-    cfg!(not(feature = "distro-defaults"))
+    // LBTerm: off. The check reads WezTerm's GitHub releases and would
+    // offer a WezTerm build in place of this one.
+    false
 }
 
 fn default_pane_select_fg_color() -> RgbaColor {
@@ -1756,28 +1813,36 @@ fn default_font_size() -> f64 {
     12.0
 }
 
+// LBTerm: its own folders, so its sockets, logs and plugins never mix with WezTerm's
+
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::cache_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join(crate::lbterm::DIR_NAME));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR
+        .join(".local/share")
+        .join(crate::lbterm::DIR_NAME))
 }
 
 pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::data_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join(crate::lbterm::DIR_NAME));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR
+        .join(".local/share")
+        .join(crate::lbterm::DIR_NAME))
 }
 
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
-        return Ok(runtime.join("wezterm"));
+        return Ok(runtime.join(crate::lbterm::DIR_NAME));
     }
 
-    Ok(crate::HOME_DIR.join(".local/share/wezterm"))
+    Ok(crate::HOME_DIR
+        .join(".local/share")
+        .join(crate::lbterm::DIR_NAME))
 }
 
 pub fn pki_dir() -> anyhow::Result<PathBuf> {

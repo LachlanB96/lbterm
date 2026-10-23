@@ -100,6 +100,11 @@ impl crate::TermWindow {
                 })
                 .ceil() as usize,
         );
+        // LBTerm: the tab panel's rail takes a strip like a border
+        // (lbterm/TAB-PANEL.md)
+        border.left += ULength::new(
+            super::tab_panel::rail_width(config, dimensions, render_metrics) as usize,
+        );
         border.right += ULength::new(
             config
                 .window_frame

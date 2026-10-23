@@ -52,6 +52,8 @@ pub enum OperatingSystemCommand {
     ResetColors(Vec<u8>),
     RxvtExtension(Vec<String>),
     ConEmuProgress(Progress),
+    /// LBTerm: OSC 7501, the Program Status Protocol
+    ProgramStatus(crate::program_status::ProgramStatus),
 
     Unspecified(Vec<Vec<u8>>),
 }
@@ -363,6 +365,8 @@ impl OperatingSystemCommand {
             }
             FinalTermSemanticPrompt => self::FinalTermSemanticPrompt::parse(osc)
                 .map(OperatingSystemCommand::FinalTermSemanticPrompt),
+            ProgramStatus => crate::program_status::ProgramStatus::parse(osc)
+                .map(OperatingSystemCommand::ProgramStatus),
             ChangeColorNumber => Self::parse_change_color_number(osc),
             ResetColors => Self::parse_reset_colors(osc),
 
@@ -499,6 +503,8 @@ osc_entries!(
     RxvtProprietary = "777",
     FinalTermSemanticPrompt = "133",
     ITermProprietary = "1337",
+    /// LBTerm: the Program Status Protocol
+    ProgramStatus = "7501",
     /// Here the "Sun" suffix comes from the table in
     /// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Miscellaneous>
     /// that lays out various window related escape sequences.
@@ -612,6 +618,7 @@ impl Display for OperatingSystemCommand {
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,
             ConEmuProgress(Progress::SetIndeterminate) => write!(f, "9;4;3")?,
             ConEmuProgress(Progress::Paused) => write!(f, "9;4;4")?,
+            ProgramStatus(p) => p.fmt(f)?,
         };
         // Use the longer form ST as neovim doesn't like the BEL version
         write!(f, "\x1b\\")?;

@@ -40,6 +40,8 @@ pub enum Progress {
     Percentage(u8),
     Error(u8),
     Indeterminate,
+    /// LBTerm: ConEmu's `9;4;4`, shown yellow at the last percentage (WezTerm dropped it)
+    Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,11 @@ pub enum Alert {
     OutputSinceFocusLost,
     /// A change to the progress bar state
     Progress(Progress),
+    /// LBTerm: a program reported its status (OSC 7501), or a prompt or
+    /// reset ended some
+    ProgramStatus,
+    /// LBTerm: a kitty notification (OSC 99) to show, close or list
+    KittyNotification(lbterm_notify::Command),
 }
 
 pub trait AlertHandler: Send + Sync {

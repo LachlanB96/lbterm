@@ -32,6 +32,14 @@ pub enum TabBarItem {
     Tab { tab_idx: usize, active: bool },
     NewTabButton,
     WindowButton(IntegratedTitleButton),
+    /// LBTerm: the "Restart to update" pill on the window strip (restart.rs)
+    LbtermRestart,
+    /// LBTerm: the active tab's title and Claude summary on the window strip (render/strip.rs)
+    LbtermSummary,
+    /// LBTerm: the Claude pane's last prompt, on the strip's second row (render/prompt.rs)
+    LbtermPrompt,
+    /// LBTerm: the arrow before it, which lists the session's prompts (render/prompt.rs)
+    LbtermPromptList,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -242,7 +250,8 @@ fn compute_tab_title(
                 }
 
                 match pane.progress {
-                    Progress::None => {}
+                    // LBTerm: paused shows on the taskbar button (termwindow/taskbar.rs)
+                    Progress::None | Progress::Paused => {}
                     Progress::Percentage(pct) | Progress::Error(pct) => {
                         let graphic = format!("{} ", pct_to_glyph(pct));
                         len += unicode_column_width(&graphic, None);

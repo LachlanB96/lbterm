@@ -198,6 +198,43 @@ impl UserData for MuxPane {
             Ok(pane.copy_user_vars())
         });
 
+        // LBTerm: what the programs in the pane say they're doing (OSC
+        // 7501), a table per record: `id` ('' for a program's own), `state`,
+        // and `kind`, `progress`, `app`, `title`, `msg` when set, `updated`
+        // in Unix seconds
+        methods.add_method("get_program_status", |lua, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            let records = lua.create_table()?;
+            for (i, r) in pane.get_program_status().into_iter().enumerate() {
+                let record = lua.create_table()?;
+                record.set("id", r.id)?;
+                record.set("state", r.state.as_str())?;
+                if let Some(kind) = r.kind {
+                    record.set("kind", kind.as_str())?;
+                }
+                if let Some(progress) = r.progress {
+                    record.set("progress", progress)?;
+                }
+                if let Some(app) = r.app {
+                    record.set("app", app)?;
+                }
+                if let Some(title) = r.title {
+                    record.set("title", title)?;
+                }
+                if let Some(msg) = r.msg {
+                    record.set("msg", msg)?;
+                }
+                let updated = r
+                    .updated
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_secs_f64());
+                record.set("updated", updated)?;
+                records.set(i + 1, record)?;
+            }
+            Ok(records)
+        });
+
         methods.add_method("has_unseen_output", |_, this, _: ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;

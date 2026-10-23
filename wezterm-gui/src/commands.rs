@@ -1271,6 +1271,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["WezTerm"],
             icon: Some("md_reload"),
         },
+        // LBTerm: the key Lachlan picked for the "Restart to update" pill (restart.rs)
+        LbtermRestart => CommandDef {
+            brief: "Restart into the installed LBTerm".into(),
+            doc: "Starts the installed LBTerm and ends this one; the tabs live on in the mux server"
+                .into(),
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "F5".into())],
+            args: &[],
+            menubar: &[],
+            icon: Some("md_restart"),
+        },
         QuitApplication => CommandDef {
             brief: "Quit WezTerm".into(),
             doc: "Quits WezTerm".into(),
@@ -1745,6 +1755,8 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         DisableDefaultAssignment => return None,
+        // LBTerm: bound to a held button, not a command to pick (render/questions.rs)
+        LbtermQuestions(_) => return None,
         SelectTextAtMouseCursor(mode) => CommandDef {
             brief: format!(
                 "Selects text at the mouse cursor \
@@ -2021,6 +2033,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
     return vec![
         // ----------------- WezTerm
         ReloadConfiguration,
+        LbtermRestart,
         #[cfg(target_os = "macos")]
         HideApplication,
         #[cfg(target_os = "macos")]

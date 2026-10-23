@@ -66,6 +66,42 @@ impl super::TermWindow {
         };
 
         self.current_mouse_event.replace(event.clone());
+        // LBTerm: whatever a click does to the panes is the click's, not an arrival
+        // (lbterm_extras::arrival)
+        if matches!(event.kind, WMEK::Press(_)) {
+            self.lbterm_arrival.input(std::time::Instant::now());
+        }
+
+        // LBTerm: the question colours go when the button holding them is let go, wherever that
+        // is (render/questions.rs)
+        self.lbterm_questions_mouse(&event);
+
+        // LBTerm: the tab panel behind an open menu still sees the pointer leave
+        // (render/tab_panel.rs)
+        self.tab_panel_hover_under_menu(&event, context);
+        // LBTerm: the tab menu takes everything while it's open, and a tab being dragged
+        // takes the moves and the release, wherever they are (lbterm/TAB-MOUSE.md)
+        if self.lbterm_tab_menu_mouse(&event, context)
+            || self.lbterm_prompt_list_mouse(&event, context)
+            || self.lbterm_conductor_menu_mouse(&event, context)
+            || self.lbterm_tab_drag_mouse(&event, context)
+        {
+            return;
+        }
+
+        // LBTerm: the strip's detail card, while it's open under its words (render/strip.rs)
+        if self.lbterm_strip_mouse(&event, context) {
+            return;
+        }
+
+        // LBTerm: the tab panel takes what's over it (lbterm/TAB-PANEL.md)
+        if self.tab_panel_mouse(&event, context) {
+            if let Some(prior) = self.last_ui_item.take() {
+                self.leave_ui_item(&prior);
+                context.invalidate();
+            }
+            return;
+        }
 
         let border = self.get_os_border();
 
@@ -245,6 +281,8 @@ impl super::TermWindow {
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
+        self.tab_panel_mouse_leave();
+        self.lbterm_strip_mouse_leave();
         self.current_mouse_event = None;
         self.update_title();
         context.set_cursor(Some(CursorIcon::Default));
@@ -295,19 +333,16 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
+        // LBTerm: the track runs down the active pane's card, as it's drawn
+        // (render/card.rs)
+        let track = self
+            .get_panes_to_render()
+            .into_iter()
+            .find(|p| p.is_active)
+            .and_then(|pos| self.lbterm_scroll_track(&pos).ok());
+        let Some((y_offset, track_height)) = track else {
+            return;
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
-
-        let border = self.get_os_border();
-        let y_offset = top_bar_height + border.top.get() as f32;
 
         let from_top = start_event.coords.y.saturating_sub(item.y as isize);
         let effective_thumb_top = event
@@ -322,9 +357,7 @@ impl super::TermWindow {
             effective_thumb_top,
             &*pane,
             current_viewport,
-            self.dimensions.pixel_height.saturating_sub(
-                y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
-            ),
+            track_height,
             self.min_scroll_bar_height() as usize,
         );
         self.set_viewport(pane.pane_id(), Some(row), dims);
@@ -463,11 +496,21 @@ impl super::TermWindow {
             WMEK::Press(MousePress::Left) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
                     self.activate_tab(tab_idx as isize).ok();
+                    // LBTerm: a press on a tab may become a drag (tab_mouse.rs)
+                    self.lbterm_tab_pressed(tab_idx, &event, super::tab_mouse::Source::Bar);
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
-                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                // LBTerm: the strip's last prompt, and the arrow that lists them all
+                // (render/prompt.rs)
+                TabBarItem::LbtermPrompt => self.lbterm_prompt_jump_last(),
+                TabBarItem::LbtermPromptList => self.lbterm_prompt_list_toggle(),
+                // LBTerm: the strip's words are the strip's (render/strip.rs)
+                TabBarItem::None
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::LbtermSummary => {
                     let maximized = self
                         .window_state
                         .intersects(WindowState::MAXIMIZED | WindowState::FULL_SCREEN);
@@ -509,6 +552,8 @@ impl super::TermWindow {
                         }
                     }
                 }
+                // LBTerm: the "Restart to update" pill (restart.rs)
+                TabBarItem::LbtermRestart => crate::restart::restart(),
             },
             WMEK::Press(MousePress::Middle) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
@@ -520,11 +565,21 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
-                | TabBarItem::WindowButton(_) => {}
+                | TabBarItem::WindowButton(_)
+                | TabBarItem::LbtermRestart
+                | TabBarItem::LbtermSummary
+                | TabBarItem::LbtermPrompt
+                | TabBarItem::LbtermPromptList => {}
             },
             WMEK::Press(MousePress::Right) => match item {
-                TabBarItem::Tab { .. } => {
-                    self.show_tab_navigator();
+                TabBarItem::Tab { tab_idx, .. } => {
+                    // LBTerm: the tab menu, where WezTerm showed the tab navigator
+                    let tab = Mux::get()
+                        .get_window(self.mux_window_id)
+                        .and_then(|w| w.get_tab_at_idx(tab_idx).map(|t| t.tab_id()));
+                    if let Some(tab) = tab {
+                        self.lbterm_open_tab_menu(tab, (event.coords.x as f64, event.coords.y as f64));
+                    }
                 }
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Right);
@@ -532,10 +587,18 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
-                | TabBarItem::WindowButton(_) => {}
+                | TabBarItem::WindowButton(_)
+                | TabBarItem::LbtermRestart
+                | TabBarItem::LbtermSummary
+                | TabBarItem::LbtermPrompt
+                | TabBarItem::LbtermPromptList => {}
             },
             WMEK::Move => match item {
-                TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
+                // LBTerm: the strip's words drag the window too (render/strip.rs)
+                TabBarItem::None
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::LbtermSummary => {
                     context.set_window_drag_position(event.screen_coords);
                 }
                 TabBarItem::WindowButton(window::IntegratedTitleButton::Maximize) => {
@@ -550,7 +613,13 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
-                | TabBarItem::NewTabButton { .. } => {}
+                | TabBarItem::NewTabButton { .. }
+                | TabBarItem::LbtermRestart => {}
+                // LBTerm: things to click, not to drag the window by
+                TabBarItem::LbtermPrompt | TabBarItem::LbtermPromptList => {
+                    context.set_cursor(Some(CursorIcon::Pointer));
+                    return;
+                }
             },
             WMEK::VertWheel(n) => {
                 if self.config.mouse_wheel_scrolls_tabs {
@@ -571,6 +640,12 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
+            // LBTerm: on a prompt mark, go to that prompt instead (render/marks.rs)
+            if self.lbterm_mark_click(&pane, event.coords.y) {
+                context.invalidate();
+                context.set_cursor(Some(CursorIcon::Default));
+                return;
+            }
             let dims = pane.get_dimensions();
             let current_viewport = self.get_viewport(pane.pane_id());
             // Page up
@@ -596,6 +671,12 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if let WMEK::Press(MousePress::Left) = event.kind {
+            // LBTerm: on a prompt mark, go to that prompt instead (render/marks.rs)
+            if self.lbterm_mark_click(&pane, event.coords.y) {
+                context.invalidate();
+                context.set_cursor(Some(CursorIcon::Default));
+                return;
+            }
             let dims = pane.get_dimensions();
             let current_viewport = self.get_viewport(pane.pane_id());
             // Page down
@@ -654,6 +735,13 @@ impl super::TermWindow {
         capture_mouse: bool,
     ) {
         let mut is_click_to_focus_pane = false;
+
+        // LBTerm: a right-click answers with a ripple where it landed (render/lights.rs).
+        // Terminal's wezterm.lua swallows a plain one so Claude Code doesn't paste, and
+        // Shift's smart paste looks at the clipboard first
+        if matches!(event.kind, WMEK::Press(MousePress::Right)) {
+            self.lbterm_light_press(event.coords.x as f64, event.coords.y as f64);
+        }
 
         let ClickPosition {
             mut column,
@@ -926,6 +1014,36 @@ impl super::TermWindow {
                     if modifiers.contains(self.config.bypass_mouse_reporting_modifiers) {
                         modifiers.remove(self.config.bypass_mouse_reporting_modifiers);
                         mouse_reporting = false;
+                    }
+                }
+
+                // LBTerm: a plain click on a link opens it even while the program has the
+                // mouse, as the pointer's hand over it says it will. Claude Code takes every
+                // click and does nothing with one on a link, so clicking links in it did
+                // nothing. The press, the moves and the release are LBTerm's, so the program
+                // never sees half a click.
+                if matches!(event.kind, WMEK::Press(_)) {
+                    self.lbterm_link_press = None;
+                }
+                if mouse_reporting && modifiers == ::window::Modifiers::NONE {
+                    match &event.kind {
+                        WMEK::Press(MousePress::Left) if self.current_highlight.is_some() => {
+                            self.lbterm_link_press = self.current_highlight.clone();
+                            return;
+                        }
+                        WMEK::Move if self.lbterm_link_press.is_some() => return,
+                        WMEK::Release(MousePress::Left) if self.lbterm_link_press.is_some() => {
+                            let pressed = self.lbterm_link_press.take();
+                            let same = matches!(
+                                (&pressed, &self.current_highlight),
+                                (Some(a), Some(b)) if Arc::ptr_eq(a, b)
+                            );
+                            if same {
+                                self.do_open_link_at_mouse_cursor(&pane);
+                            }
+                            return;
+                        }
+                        _ => {}
                     }
                 }
 

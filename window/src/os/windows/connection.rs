@@ -144,6 +144,8 @@ impl Connection {
         self.windows.borrow().get(&handle).map(Rc::clone)
     }
 
+    // LBTerm: the task is named by the caller in the slow-frame log (lbterm_extras::slow)
+    #[track_caller]
     pub(crate) fn with_window_inner<
         R,
         F: FnOnce(&mut WindowInner) -> anyhow::Result<R> + Send + 'static,

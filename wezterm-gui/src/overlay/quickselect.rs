@@ -1027,6 +1027,8 @@ impl QuickSelectRenderable {
 
                     let text = term_window.selection_text(&pane);
                     if !text.is_empty() {
+                        // LBTerm: the pick lights up, copied or opened (render/lights.rs)
+                        term_window.lbterm_light_selection(&pane);
                         if paste {
                             let _ = pane.send_paste(&text);
                         }

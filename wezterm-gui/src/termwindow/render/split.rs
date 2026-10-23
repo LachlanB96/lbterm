@@ -5,14 +5,15 @@ use mux::tab::{PositionedSplit, SplitDirection};
 use std::sync::Arc;
 
 impl crate::TermWindow {
+    /// LBTerm: the panes are cards with a gutter between them
+    /// (render/card.rs), so no line is drawn; the split is still where a
+    /// drag resizes the panes.
     pub fn paint_split(
         &mut self,
-        layers: &mut TripleLayerQuadAllocator,
+        _layers: &mut TripleLayerQuadAllocator,
         split: &PositionedSplit,
-        pane: &Arc<dyn Pane>,
+        _pane: &Arc<dyn Pane>,
     ) -> anyhow::Result<()> {
-        let palette = pane.palette();
-        let foreground = palette.split.to_linear();
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
 
@@ -25,21 +26,7 @@ impl crate::TermWindow {
 
         let (padding_left, padding_top) = self.padding_left_top();
 
-        let pos_y = split.top as f32 * cell_height + first_row_offset + padding_top;
-        let pos_x = split.left as f32 * cell_width + padding_left + border.left.get() as f32;
-
         if split.direction == SplitDirection::Horizontal {
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(
-                    pos_x + (cell_width / 2.0),
-                    pos_y - (cell_height / 2.0),
-                    self.render_metrics.underline_height as f32,
-                    (1. + split.size as f32) * cell_height,
-                ),
-                foreground,
-            )?;
             self.ui_items.push(UIItem {
                 x: border.left.get() as usize
                     + padding_left as usize
@@ -52,17 +39,6 @@ impl crate::TermWindow {
                 item_type: UIItemType::Split(split.clone()),
             });
         } else {
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(
-                    pos_x - (cell_width / 2.0),
-                    pos_y + (cell_height / 2.0),
-                    (1.0 + split.size as f32) * cell_width,
-                    self.render_metrics.underline_height as f32,
-                ),
-                foreground,
-            )?;
             self.ui_items.push(UIItem {
                 x: border.left.get() as usize
                     + padding_left as usize

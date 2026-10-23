@@ -290,6 +290,20 @@ pub struct DecodedPdu {
 const COMPRESS_THRESH: usize = 32;
 
 fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
+    serialize_with(t, compress)
+}
+
+/// LBTerm: compression only saves bytes, so a PDU that fails to compress goes
+/// out uncompressed, as one that doesn't compress well already does. zstd
+/// allocates a few MB of workspace for each PDU it compresses. On 2026-10-21
+/// the PC ran out of commit (two image viewers took 33 GB), that allocation
+/// failed in the mux server ("Allocation error : not enough memory"), and the
+/// server dropped the GUI's connection over it. A unix-domain client doesn't
+/// reconnect, so every tab left the window.
+fn serialize_with<T: serde::Serialize>(
+    t: &T,
+    compress: impl FnOnce(&T) -> Result<Vec<u8>, Error>,
+) -> Result<(Vec<u8>, bool), Error> {
     let mut uncompressed = Vec::new();
     let mut encode = varbincode::Serializer::new(&mut uncompressed);
     t.serialize(&mut encode)?;
@@ -298,12 +312,17 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
         return Ok((uncompressed, false));
     }
     // It's a little heavy; let's try compressing it
-    let mut compressed = Vec::new();
-    let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    let mut encode = varbincode::Serializer::new(&mut compress);
-    t.serialize(&mut encode)?;
-    drop(encode);
-    compress.finish()?;
+    let compressed = match compress(t) {
+        Ok(compressed) => compressed,
+        Err(err) => {
+            log::warn!(
+                "compressing a PDU of {} bytes failed, sending it uncompressed: {:#}",
+                uncompressed.len(),
+                err
+            );
+            return Ok((uncompressed, false));
+        }
+    };
 
     log::debug!(
         "serialized+compress len {} vs {}",
@@ -316,6 +335,16 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     } else {
         Ok((uncompressed, false))
     }
+}
+
+fn compress<T: serde::Serialize>(t: &T) -> Result<Vec<u8>, Error> {
+    let mut compressed = Vec::new();
+    let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    let mut encode = varbincode::Serializer::new(&mut compress);
+    t.serialize(&mut encode)?;
+    drop(encode);
+    compress.finish()?;
+    Ok(compressed)
 }
 
 fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
@@ -503,6 +532,11 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    // LBTerm's own, numbered well clear of upstream's. Additive, so the
+    // codec version stays upstream's: a peer that doesn't know one decodes
+    // it as Pdu::Invalid.
+    SetProgramStatus: 7501,
+    SpawnNoActivate: 7502,
 }
 
 impl Pdu {
@@ -594,6 +628,7 @@ impl Pdu {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::SetPalette(SetPalette { pane_id, .. })
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
+            | Pdu::SetProgramStatus(SetProgramStatus { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
             | Pdu::PaneFocused(PaneFocused { pane_id })
             | Pdu::PaneRemoved(PaneRemoved { pane_id }) => Some(*pane_id),
@@ -675,7 +710,7 @@ pub struct MovePaneToNewTabResponse {
     pub window_id: WindowId,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug)]
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct SpawnV2 {
     pub domain: config::keyassignment::SpawnTabDomain,
     /// If None, create a new window for this new tab
@@ -795,6 +830,24 @@ pub struct SetPalette {
 pub struct NotifyAlert {
     pub pane_id: PaneId,
     pub alert: Alert,
+}
+
+/// LBTerm: server to client, a pane's OSC 7501 records, all of them, sent
+/// when they change and when a client first looks at the pane.
+/// Alert::ProgramStatus only says that they changed.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetProgramStatus {
+    pub pane_id: PaneId,
+    pub records: Vec<wezterm_term::program_status::ProgramStatusRecord>,
+}
+
+/// LBTerm: SpawnV2, leaving the window on the tab it was on
+/// (`lbterm cli spawn --no-activate`). A PDU of its own rather than a field
+/// on SpawnV2, so a server of an older build still reads every other spawn.
+/// Answered with SpawnResponse. Not user input: nobody pressed anything.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SpawnNoActivate {
+    pub spawn: SpawnV2,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1263,5 +1316,133 @@ mod test {
             },
             Pdu::decode(encoded.as_slice()).unwrap()
         );
+    }
+
+    #[test]
+    fn lbterm_program_status_round_trip() {
+        use std::time::{Duration, UNIX_EPOCH};
+        use wezterm_term::program_status::{BlockedKind, ProgramState, ProgramStatusRecord};
+        let pdu = || {
+            Pdu::SetProgramStatus(SetProgramStatus {
+                pane_id: 7,
+                records: vec![
+                    ProgramStatusRecord {
+                        id: String::new(),
+                        state: ProgramState::Blocked,
+                        kind: Some(BlockedKind::Question),
+                        progress: None,
+                        app: Some("claude".to_string()),
+                        title: Some("Which branch?".to_string()),
+                        msg: None,
+                        updated: UNIX_EPOCH + Duration::from_millis(1_790_000_000_123),
+                    },
+                    ProgramStatusRecord {
+                        id: "agent/1".to_string(),
+                        state: ProgramState::Working,
+                        kind: None,
+                        progress: Some(40),
+                        app: Some("claude".to_string()),
+                        title: None,
+                        msg: Some("tests".to_string()),
+                        updated: UNIX_EPOCH + Duration::from_secs(1_790_000_001),
+                    },
+                ],
+            })
+        };
+        let mut encoded = Vec::new();
+        pdu().encode(&mut encoded, 0x42).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 0x42);
+        assert_eq!(decoded.pdu, pdu());
+        assert_eq!(decoded.pdu.pane_id(), Some(7));
+        // Numbered clear of upstream's, so an upstream PDU can't take it
+        assert_eq!(decode_raw(encoded.as_slice()).unwrap().ident, 7501);
+    }
+
+    #[test]
+    fn lbterm_spawn_no_activate_round_trip() {
+        let spawn = SpawnV2 {
+            domain: config::keyassignment::SpawnTabDomain::DomainName("lbterm".to_string()),
+            window_id: Some(3),
+            command: Some(CommandBuilder::from_argv(vec!["pwsh".into(), "-NoLogo".into()])),
+            command_dir: Some("C:/Users/me".to_string()),
+            size: TerminalSize::default(),
+            workspace: "default".to_string(),
+        };
+        let pdu = || {
+            Pdu::SpawnNoActivate(SpawnNoActivate {
+                spawn: spawn.clone(),
+            })
+        };
+        let mut encoded = Vec::new();
+        pdu().encode(&mut encoded, 9).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.pdu, pdu());
+        assert_eq!(decode_raw(encoded.as_slice()).unwrap().ident, 7502);
+        // Nobody pressed anything, so the spawn doesn't make its client the
+        // one with the latest input
+        assert!(!decoded.pdu.is_user_input());
+    }
+
+    /// Scrollback as the GUI fetches it with GetLines
+    fn lbterm_scrollback(rows: usize) -> Pdu {
+        use termwiz::cell::CellAttributes;
+        let lines: Vec<(StableRowIndex, Line)> = (0..rows)
+            .map(|row| {
+                let text = format!(
+                    "{row:>6}    Compiling wezterm-gui v0.1.0 (C:\\Users\\me\\Code\\LBTerm\\wezterm-gui)"
+                );
+                let line = Line::from_text(
+                    &text,
+                    &CellAttributes::default(),
+                    termwiz::surface::SEQ_ZERO,
+                    None,
+                );
+                (row as StableRowIndex, line)
+            })
+            .collect();
+        Pdu::GetLinesResponse(GetLinesResponse {
+            pane_id: 7,
+            lines: lines.into(),
+        })
+    }
+
+    #[test]
+    fn lbterm_pdu_that_fails_to_compress_goes_uncompressed() {
+        // 2,000 rows of a build's output
+        let rows = 2_000;
+        let Pdu::GetLinesResponse(response) = lbterm_scrollback(rows) else {
+            unreachable!()
+        };
+
+        // As it goes when zstd has its memory: compressed, and back whole
+        let mut normal = Vec::new();
+        lbterm_scrollback(rows).encode(&mut normal, 5).unwrap();
+        let frame = decode_raw(normal.as_slice()).unwrap();
+        assert!(frame.is_compressed);
+        assert_eq!(
+            Pdu::decode(normal.as_slice()).unwrap().pdu,
+            lbterm_scrollback(rows)
+        );
+
+        // zstd failing to allocate its workspace, as in the mux server on
+        // 2026-10-21: that used to fail the encode, and the server dropped
+        // the client for it. Now the frame goes uncompressed and decodes to
+        // the same PDU.
+        let (data, is_compressed) = serialize_with(&response, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Allocation error : not enough memory",
+            )
+            .into())
+        })
+        .unwrap();
+        assert!(!is_compressed);
+        assert!(data.len() > frame.data.len());
+        let mut encoded = Vec::new();
+        encode_raw(frame.ident, 5, &data, is_compressed, &mut encoded).unwrap();
+        let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.serial, 5);
+        assert_eq!(decoded.pdu, lbterm_scrollback(rows));
     }
 }

@@ -26,6 +26,7 @@ use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
+use wezterm_term::program_status::ProgramStatusRecord;
 use wezterm_term::{
     Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, StableRowIndex,
     TerminalConfiguration, TerminalSize,
@@ -50,6 +51,8 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    /// LBTerm: the server's OSC 7501 records for this pane
+    program_status: Mutex<Vec<ProgramStatusRecord>>,
 }
 
 impl ClientPane {
@@ -133,6 +136,7 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            program_status: Mutex::new(vec![]),
         }
     }
 
@@ -180,6 +184,14 @@ impl ClientPane {
                 mux.notify(MuxNotification::Alert {
                     pane_id: self.local_pane_id,
                     alert: Alert::PaletteChanged,
+                });
+            }
+            Pdu::SetProgramStatus(SetProgramStatus { records, .. }) => {
+                *self.program_status.lock() = records;
+                let mux = Mux::get();
+                mux.notify(MuxNotification::Alert {
+                    pane_id: self.local_pane_id,
+                    alert: Alert::ProgramStatus,
                 });
             }
             Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
@@ -274,6 +286,13 @@ impl Pane for ClientPane {
             Value::String("since_last_response_ms".to_string()),
             Value::U64(inner.last_recv_time.elapsed().as_millis() as u64),
         );
+        // LBTerm: the pane's id in the mux server, which is what WEZTERM_PANE
+        // says inside it and what `lbterm cli` there takes. pane_id() is
+        // this GUI's own number for it.
+        map.insert(
+            Value::String("remote_pane_id".to_string()),
+            Value::U64(self.remote_pane_id as u64),
+        );
 
         Value::Object(map.into())
     }
@@ -326,6 +345,10 @@ impl Pane for ClientPane {
         let renderable = self.renderable.lock();
         let inner = renderable.inner.borrow();
         inner.title.clone()
+    }
+
+    fn get_program_status(&self) -> Vec<ProgramStatusRecord> {
+        self.program_status.lock().clone()
     }
 
     fn get_progress(&self) -> Progress {
@@ -512,13 +535,24 @@ impl Pane for ClientPane {
         }
 
         if send_kill {
+            // LBTerm: closing a window kills its panes here rather than
+            // detaching (Mux::remove_window_internal), and the GUI exits
+            // once the mux is empty and no Activity is held. Hold one until
+            // the server has the kill, or the last window's panes would live
+            // on in the server. Bounded, so a server that stopped answering
+            // can't keep a closed LBTerm running.
+            let activity = mux::activity::Activity::new();
             promise::spawn::spawn(async move {
-                client
-                    .client
-                    .kill_pane(KillPane {
-                        pane_id: remote_pane_id,
-                    })
-                    .await
+                let kill = client.client.kill_pane(KillPane {
+                    pane_id: remote_pane_id,
+                });
+                let timeout = async {
+                    smol::Timer::after(std::time::Duration::from_secs(3)).await;
+                    anyhow::bail!("timed out asking the server to kill pane {remote_pane_id}")
+                };
+                let result = smol::future::or(kill, timeout).await;
+                drop(activity);
+                result
             })
             .detach();
         }

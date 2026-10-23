@@ -1,4 +1,4 @@
-use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
+use crate::quad::{HeapQuadAllocator, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
 use crate::termwindow::render::{
@@ -68,7 +68,7 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
+        let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom {
             (0.0, tab_bar_height)
         } else {
             (tab_bar_height, 0.0)
@@ -105,72 +105,42 @@ impl crate::TermWindow {
                 config.text_background_opacity
             });
 
-        let cell_width = self.render_metrics.cell_size.width as f32;
-        let cell_height = self.render_metrics.cell_size.height as f32;
-        let background_rect = {
-            // We want to fill out to the edges of the splits
-            let (x, width_delta) = if pos.left == 0 {
-                (
-                    0.,
-                    padding_left + border.left.get() as f32 + (cell_width / 2.0),
-                )
-            } else {
-                (
-                    padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                        + (pos.left as f32 * cell_width),
-                    cell_width,
-                )
-            };
-
-            let (y, height_delta) = if pos.top == 0 {
-                (
-                    (top_pixel_y - padding_top),
-                    padding_top + (cell_height / 2.0),
-                )
-            } else {
-                (
-                    top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
-                    cell_height,
-                )
-            };
-            euclid::rect(
-                x,
-                y,
-                // Go all the way to the right edge if we're right-most
-                if pos.left + pos.width >= self.terminal_size.cols as usize {
-                    self.dimensions.pixel_width as f32 - x
-                } else {
-                    (pos.width as f32 * cell_width) + width_delta
-                },
-                // Go all the way to the bottom if we're bottom-most
-                if pos.top + pos.height >= self.terminal_size.rows as usize {
-                    self.dimensions.pixel_height as f32 - y
-                } else {
-                    (pos.height as f32 * cell_height) + height_delta as f32
-                },
-            )
-        };
-
-        if self.window_background.is_empty() {
-            // Per-pane, palette-specified background
-
-            let mut quad = self
-                .filled_rectangle(
-                    layers,
-                    0,
-                    background_rect,
-                    palette
-                        .background
-                        .to_linear()
-                        .mul_alpha(config.window_background_opacity),
-                )
-                .context("filled_rectangle")?;
-            quad.set_hsv(if pos.is_active {
-                None
-            } else {
-                Some(config.inactive_pane_hsb)
-            });
+        // LBTerm: the pane is a card with a gutter round it rather than a
+        // background out to the splits' middles and the window's edges
+        // (render/card.rs). With the compositor, half a gutter round the card
+        // is the pane's visual
+        let card = self.lbterm_card(pos).context("lbterm_card")?;
+        let visual = self.lbterm_shape().visual(card);
+        self.lbterm_spans.set_pane_rect(
+            pane_id,
+            lbterm_motion::PixelRect::snap(visual.x, visual.y, visual.w, visual.h),
+        );
+        if pos.is_active {
+            self.lbterm_spans.set_active(pane_id);
         }
+        // With the compositor a pane without the keyboard is its visual at
+        // 85%, so it draws undimmed; and the outline, the active pane's
+        // alone, is the one that glides between them
+        let composited = self.lbterm_composited();
+        let hsv = if pos.is_active || composited {
+            None
+        } else {
+            Some(config.inactive_pane_hsb)
+        };
+        let outline = (pos.is_active && !composited).then(|| {
+            let (r, g, b, _) = palette.background.to_srgb_u8();
+            lbterm_panel::palette::card_outline(((r as u32) << 16) | ((g as u32) << 8) | b as u32)
+        });
+
+        // Per-pane, palette-specified background
+        let fill = self.window_background.is_empty().then(|| {
+            palette
+                .background
+                .to_linear()
+                .mul_alpha(config.window_background_opacity)
+        });
+        self.lbterm_paint_card(layers, card, fill, hsv, outline)
+            .context("lbterm_paint_card")?;
 
         {
             // If the bell is ringing, we draw another background layer over the
@@ -209,15 +179,9 @@ impl crate::TermWindow {
                 };
                 log::trace!("bell color is {:?}", background);
 
-                let mut quad = self
-                    .filled_rectangle(layers, 0, background_rect, background)
-                    .context("filled_rectangle")?;
-
-                quad.set_hsv(if pos.is_active {
-                    None
-                } else {
-                    Some(config.inactive_pane_hsb)
-                });
+                // LBTerm: the card, not the whole rectangle (render/card.rs)
+                self.lbterm_paint_card(layers, card, Some(background), hsv, None)
+                    .context("lbterm_paint_card")?;
             }
         }
 
@@ -226,17 +190,20 @@ impl crate::TermWindow {
         // do a per-pane scrollbar.  That will require more extensive
         // changes to ScrollHit, mouse positioning, PositionedPane
         // and tab size calculation.
-        if pos.is_active && self.show_scroll_bar {
-            let thumb_y_offset = top_bar_height as usize + border.top.get();
+        // LBTerm: none while a program has the whole screen, since the
+        // viewport can't follow where it's scrolled (render/card.rs)
+        if pos.is_active && self.show_scroll_bar && self.lbterm_scroll_bar_shows(&pos.pane) {
+            // LBTerm: the track runs down the active pane's card, clear of
+            // its rounded corners (render/card.rs)
+            let (thumb_y_offset, track_height) =
+                self.lbterm_scroll_track(pos).context("lbterm_scroll_track")?;
 
             let min_height = self.min_scroll_bar_height();
 
             let info = ScrollHit::thumb(
                 &*pos.pane,
                 current_viewport,
-                self.dimensions.pixel_height.saturating_sub(
-                    thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
-                ),
+                track_height,
                 min_height as usize,
             );
             let abs_thumb_top = thumb_y_offset + info.top;
@@ -275,18 +242,32 @@ impl crate::TermWindow {
                 item_type: UIItemType::BelowScrollThumb,
             });
 
-            self.filled_rectangle(
+            // LBTerm: the thumb sits in the window's padding, not the pane,
+            // so it goes over the panes; it's drawn inside the card's
+            // outline, rounded (render/card.rs)
+            self.lbterm_spans
+                .switch(lbterm_motion::Target::Over, layers.quad_counts());
+            let (bar_x, bar_width) = self.lbterm_scroll_column(thumb_x as f32)?;
+            self.lbterm_fill_rounded(
                 layers,
-                2,
-                euclid::rect(
-                    thumb_x as f32,
-                    abs_thumb_top as f32,
-                    padding,
-                    thumb_size as f32,
-                ),
+                lbterm_panel::Area::new(bar_x, abs_thumb_top as f32, bar_width, thumb_size as f32),
+                bar_width / 2.0,
                 color,
+                None,
             )
-            .context("filled_rectangle")?;
+            .context("lbterm_fill_rounded")?;
+            // LBTerm: a tick for each shell prompt, over the thumb (render/marks.rs)
+            self.paint_lbterm_marks(
+                layers,
+                &pos.pane,
+                bar_x,
+                bar_width,
+                thumb_y_offset,
+                track_height,
+            )
+            .context("paint_lbterm_marks")?;
+            self.lbterm_spans
+                .switch(lbterm_motion::Target::Pane(pane_id), layers.quad_counts());
         }
 
         let (selrange, rectangular) = {
@@ -375,6 +356,15 @@ impl crate::TermWindow {
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
                     let stable_row = stable_top + line_idx as StableRowIndex;
+                    // LBTerm: what triggers colour is drawn from a recoloured copy, and what's
+                    // new is noted for its effect (render/triggers.rs)
+                    let styled = self.term_window.lbterm_trigger_line(
+                        self.pane_id,
+                        stable_row,
+                        line,
+                        self.palette,
+                    );
+                    let line: &Line = styled.as_ref().unwrap_or(&**line);
                     let selrange = self
                         .selrange
                         .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));

@@ -1,0 +1,18 @@
+[package]
+name = "lbterm-extras"
+version = "0.1.0"
+edition = "2021"
+description = "LBTerm's smaller additions, as logic tested without a window: taskbar progress, scrollbar marks, crash restore, Claude summaries, the window strip's words and last prompt, a test window's state file"
+license = "MIT"
+publish = false
+
+[dependencies]
+chrono.workspace = true
+log.workspace = true
+notify.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

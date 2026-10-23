@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{Sgr, CSI};
@@ -36,6 +37,31 @@ use wezterm_term::{
 };
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
+
+/// How divine_process_list brings a pane's process list up to date (LBTerm)
+#[derive(Debug, PartialEq, Eq)]
+enum ProcListRefresh {
+    /// Walk the processes before answering
+    Now,
+    /// Answer with the stale list and walk on a thread of its own
+    InBackground,
+    /// The list is fresh, or a refresh is already under way
+    No,
+}
+
+/// AllowStale callers run on the GUI thread (`cli list`, the tab bar's Lua, the tab panel), and
+/// on Windows a walk per pane there held up typing for 200-290 ms with ~18 panes. So only
+/// FetchImmediate, or a pane with no list yet, waits for the walk; a stale list is answered at
+/// once and refreshed in the background, as get_leader does on unix.
+fn proc_list_refresh(policy: CachePolicy, age: Option<Duration>, updating: bool) -> ProcListRefresh {
+    match (policy, age) {
+        (CachePolicy::FetchImmediate, _) | (_, None) => ProcListRefresh::Now,
+        (CachePolicy::AllowStale, Some(age)) if age > PROC_INFO_CACHE_TTL && !updating => {
+            ProcListRefresh::InBackground
+        }
+        _ => ProcListRefresh::No,
+    }
+}
 
 #[derive(Debug)]
 enum ProcessState {
@@ -56,6 +82,46 @@ struct CachedProcInfo {
     root: LocalProcessInfo,
     updated: Instant,
     foreground: LocalProcessInfo,
+}
+
+impl CachedProcInfo {
+    /// Walks the process tree under `pid`. On Windows this snapshots every process on the
+    /// system and reads each descendant's memory for its cwd and argv: milliseconds per pane.
+    fn fetch(pid: u32) -> Option<Self> {
+        log::trace!("CachedProcInfo expired, refresh");
+        let root = LocalProcessInfo::with_root_pid(pid)?;
+
+        // Windows doesn't have any job control or session concept,
+        // so we infer that the equivalent to the process group
+        // leader is the most recently spawned program running
+        // in the console
+        let mut youngest = &root;
+
+        fn find_youngest<'a>(proc: &'a LocalProcessInfo, youngest: &mut &'a LocalProcessInfo) {
+            if proc.start_time >= youngest.start_time {
+                *youngest = proc;
+            }
+
+            for child in proc.children.values() {
+                #[cfg(windows)]
+                if child.console == 0 {
+                    continue;
+                }
+                find_youngest(child, youngest);
+            }
+        }
+
+        find_youngest(&root, &mut youngest);
+        let mut foreground = youngest.clone();
+        foreground.children.clear();
+
+        log::trace!("CachedProcInfo updated");
+        Some(Self {
+            root,
+            foreground,
+            updated: Instant::now(),
+        })
+    }
 }
 
 /// This is a bit horrible; it can take 700us to tcgetpgrp, so if we have
@@ -129,7 +195,9 @@ pub struct LocalPane {
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
-    proc_list: Mutex<Option<CachedProcInfo>>,
+    proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
+    /// A background refresh of proc_list is under way
+    proc_list_updating: Arc<AtomicBool>,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
@@ -464,6 +532,10 @@ impl Pane for LocalPane {
 
     fn get_progress(&self) -> Progress {
         self.terminal.lock().get_progress()
+    }
+
+    fn get_program_status(&self) -> Vec<wezterm_term::program_status::ProgramStatusRecord> {
+        self.terminal.lock().program_status()
     }
 
     fn palette(&self) -> ColorPalette {
@@ -1033,7 +1105,8 @@ impl LocalPane {
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain: Mutex::new(None),
-            proc_list: Mutex::new(None),
+            proc_list: Arc::new(Mutex::new(None)),
+            proc_list_updating: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
@@ -1090,51 +1163,28 @@ impl LocalPane {
         policy: CachePolicy,
     ) -> Option<MappedMutexGuard<'_, CachedProcInfo>> {
         if let ProcessState::Running { pid: Some(pid), .. } = &*self.process.lock() {
+            let pid = *pid;
             let mut proc_list = self.proc_list.lock();
+            let age = proc_list.as_ref().map(|info| info.updated.elapsed());
+            let updating = self.proc_list_updating.load(Ordering::Acquire);
 
-            let expired = policy == CachePolicy::FetchImmediate
-                || proc_list
-                    .as_ref()
-                    .map(|info| info.updated.elapsed() > PROC_INFO_CACHE_TTL)
-                    .unwrap_or(true);
-
-            if expired {
-                log::trace!("CachedProcInfo expired, refresh");
-                let root = LocalProcessInfo::with_root_pid(*pid)?;
-
-                // Windows doesn't have any job control or session concept,
-                // so we infer that the equivalent to the process group
-                // leader is the most recently spawned program running
-                // in the console
-                let mut youngest = &root;
-
-                fn find_youngest<'a>(
-                    proc: &'a LocalProcessInfo,
-                    youngest: &mut &'a LocalProcessInfo,
-                ) {
-                    if proc.start_time >= youngest.start_time {
-                        *youngest = proc;
-                    }
-
-                    for child in proc.children.values() {
-                        #[cfg(windows)]
-                        if child.console == 0 {
-                            continue;
-                        }
-                        find_youngest(child, youngest);
-                    }
+            match proc_list_refresh(policy, age, updating) {
+                ProcListRefresh::Now => {
+                    proc_list.replace(CachedProcInfo::fetch(pid)?);
                 }
-
-                find_youngest(&root, &mut youngest);
-                let mut foreground = youngest.clone();
-                foreground.children.clear();
-
-                proc_list.replace(CachedProcInfo {
-                    root,
-                    foreground,
-                    updated: Instant::now(),
-                });
-                log::trace!("CachedProcInfo updated");
+                ProcListRefresh::InBackground
+                    if !self.proc_list_updating.swap(true, Ordering::AcqRel) =>
+                {
+                    let cache = Arc::clone(&self.proc_list);
+                    let updating = Arc::clone(&self.proc_list_updating);
+                    std::thread::spawn(move || {
+                        if let Some(fresh) = CachedProcInfo::fetch(pid) {
+                            cache.lock().replace(fresh);
+                        }
+                        updating.store(false, Ordering::Release);
+                    });
+                }
+                _ => {}
             }
 
             return Some(MutexGuard::map(proc_list, |info| info.as_mut().unwrap()));
@@ -1159,5 +1209,57 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod lbterm_proc_list_tests {
+    use super::*;
+
+    const FRESH: Duration = Duration::from_millis(100);
+    const STALE: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_pane_with_no_list_yet_waits_for_the_walk() {
+        assert_eq!(
+            proc_list_refresh(CachePolicy::AllowStale, None, false),
+            ProcListRefresh::Now
+        );
+    }
+
+    #[test]
+    fn fetch_immediate_always_waits_for_the_walk() {
+        for age in [None, Some(FRESH), Some(STALE)] {
+            for updating in [false, true] {
+                assert_eq!(
+                    proc_list_refresh(CachePolicy::FetchImmediate, age, updating),
+                    ProcListRefresh::Now
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_list_is_answered_at_once_and_refreshed_in_the_background() {
+        assert_eq!(
+            proc_list_refresh(CachePolicy::AllowStale, Some(STALE), false),
+            ProcListRefresh::InBackground
+        );
+    }
+
+    #[test]
+    fn one_background_refresh_at_a_time() {
+        assert_eq!(
+            proc_list_refresh(CachePolicy::AllowStale, Some(STALE), true),
+            ProcListRefresh::No
+        );
+    }
+
+    #[test]
+    fn a_fresh_list_is_left_alone() {
+        assert_eq!(
+            proc_list_refresh(CachePolicy::AllowStale, Some(FRESH), false),
+            ProcListRefresh::No
+        );
     }
 }

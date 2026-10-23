@@ -96,7 +96,9 @@ fn main() {
 
         let rcfile_name = Path::new(&std::env::var_os("OUT_DIR").unwrap()).join("resource.rc");
         let mut rcfile = std::fs::File::create(&rcfile_name).unwrap();
-        println!("cargo:rerun-if-changed=../assets/windows/terminal.ico");
+        // LBTerm: its own icon (lbterm/make-icon.ps1) and version strings. LegalCopyright
+        // keeps Wez Furlong's MIT notice, which goes with every copy.
+        println!("cargo:rerun-if-changed=../assets/windows/lbterm.ico");
         write!(
             rcfile,
             r#"
@@ -104,7 +106,7 @@ fn main() {
 // This ID is coupled with code in window/src/os/windows/window.rs
 #define IDI_ICON 0x101
 1 RT_MANIFEST "{win}\\manifest.manifest"
-IDI_ICON ICON "{win}\\terminal.ico"
+IDI_ICON ICON "{win}\\lbterm.ico"
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     1,0,0,0
 PRODUCTVERSION  1,0,0,0
@@ -118,13 +120,13 @@ BEGIN
     BEGIN
         BLOCK "040904E4"
         BEGIN
-            VALUE "CompanyName",      "Wez Furlong\0"
-            VALUE "FileDescription",  "WezTerm - Wez's Terminal Emulator\0"
+            VALUE "CompanyName",      "Lachlan Brown\0"
+            VALUE "FileDescription",  "LBTerm, a fork of WezTerm\0"
             VALUE "FileVersion",      "{version}\0"
-            VALUE "LegalCopyright",   "Wez Furlong, MIT licensed\0"
+            VALUE "LegalCopyright",   "WezTerm (c) 2018-Present Wez Furlong, MIT licensed. LBTerm changes (c) 2026 Lachlan Brown\0"
             VALUE "InternalName",     "\0"
             VALUE "OriginalFilename", "\0"
-            VALUE "ProductName",      "WezTerm\0"
+            VALUE "ProductName",      "LBTerm\0"
             VALUE "ProductVersion",   "{version}\0"
         END
     END

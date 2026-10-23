@@ -2,7 +2,7 @@
 use crate::os::windows::event::EventHandle;
 #[cfg(target_os = "macos")]
 use core_foundation::runloop::*;
-use promise::spawn::{Runnable, SpawnFunc};
+use promise::spawn::{Runnable, SpawnFunc, SpawnSite};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -34,13 +34,26 @@ pub(crate) struct SpawnQueue {
     read: Mutex<FileDescriptor>,
 }
 
-fn schedule_with_pri(runnable: Runnable, high_pri: bool) {
+fn schedule_with_pri(runnable: Runnable, high_pri: bool, site: SpawnSite) {
     SPAWN_QUEUE.spawn_impl(
         Box::new(move || {
+            // LBTerm: each run timed for the slow-frame log, named by where the task was
+            // spawned (lbterm_extras::slow)
+            let _slow = lbterm_extras::slow::task(site);
             runnable.run();
         }),
         high_pri,
     );
+}
+
+/// LBTerm: ends the slow-frame log's 10 s windows on time, from a timer on the main thread, so
+/// a summary is logged when its window ends rather than with whatever is timed next
+fn slow_log_wake(after: std::time::Duration) {
+    promise::spawn::spawn_into_main_thread(async move {
+        async_io::Timer::after(after).await;
+        lbterm_extras::slow::wake_up();
+    })
+    .detach();
 }
 
 impl SpawnQueue {
@@ -50,13 +63,14 @@ impl SpawnQueue {
 
     pub fn register_promise_schedulers(&self) {
         promise::spawn::set_schedulers(
-            Box::new(|runnable| {
-                schedule_with_pri(runnable, true);
+            Box::new(|runnable, site| {
+                schedule_with_pri(runnable, true, site);
             }),
-            Box::new(|runnable| {
-                schedule_with_pri(runnable, false);
+            Box::new(|runnable, site| {
+                schedule_with_pri(runnable, false, site);
             }),
         );
+        lbterm_extras::slow::set_waker(slow_log_wake);
     }
 
     pub fn run(&self) -> bool {

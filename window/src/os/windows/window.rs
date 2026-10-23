@@ -411,6 +411,12 @@ fn get_primary_monitor_dpi() -> u32 {
 }
 
 impl Window {
+    /// LBTerm: the window's HWND without borrowing its state, as `window_handle()` does, which
+    /// panics when asked from inside a paint that already holds it (the OpenGL front end's)
+    pub fn lbterm_hwnd(&self) -> isize {
+        (self.0).0 as isize
+    }
+
     fn create_window(
         config: ConfigHandle,
         class_name: &str,
@@ -480,10 +486,19 @@ impl Window {
             }
         };
 
+        // LBTerm: with the compositor every frame goes through DirectComposition
+        // visuals, so DWM needn't keep a GDI surface for the window
+        // (lbterm/COMPOSITOR.md). Flip-model swapchains still present without one.
+        let ex_style = if config::lbterm::uses_compositor(&config) {
+            winapi::um::winuser::WS_EX_NOREDIRECTIONBITMAP
+        } else {
+            0
+        };
+
         let name = wide_string(name);
         let hwnd = unsafe {
             CreateWindowExW(
-                0,
+                ex_style,
                 class_name.as_ptr(),
                 name.as_ptr(),
                 style,
@@ -600,14 +615,31 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
     promise::spawn::spawn(async move {
         unsafe {
             log::trace!("applying ShowWindowCommand {show:?}");
+            // LBTerm: test and demo windows (lbterm/motion) open without
+            // taking the keyboard from whoever is typing, and at the bottom
+            // of the z-order, so closing the window in use never hands them
+            // the keyboard either
+            let quiet = std::env::var_os("LBTERM_NO_ACTIVATE").is_some();
             ShowWindow(
                 hwnd.0,
                 match show {
+                    ShowWindowCommand::Normal if quiet => SW_SHOWNOACTIVATE,
                     ShowWindowCommand::Normal => SW_NORMAL,
                     ShowWindowCommand::Minimize => SW_MINIMIZE,
                     ShowWindowCommand::Maximize => SW_MAXIMIZE,
                 },
             );
+            if quiet && matches!(show, ShowWindowCommand::Normal) {
+                SetWindowPos(
+                    hwnd.0,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+            }
         }
     })
     .detach();
@@ -770,6 +802,8 @@ impl WindowOps for Window {
         .await
     }
 
+    // LBTerm: the task is named by the caller in the slow-frame log (lbterm_extras::slow)
+    #[track_caller]
     fn notify<T: Any + Send + Sync>(&self, t: T)
     where
         Self: Sized,
@@ -798,6 +832,11 @@ impl WindowOps for Window {
     }
 
     fn focus(&self) {
+        // LBTerm: a window shown without activating (a test's) never takes the foreground,
+        // and never types the Alt below into whatever has the keyboard
+        if std::env::var_os("LBTERM_NO_ACTIVATE").is_some() {
+            return;
+        }
         let window = self.0;
         let handle = window.0;
         promise::spawn::spawn(async move {
@@ -1837,11 +1876,19 @@ unsafe fn nc_mouse_button(
     Some(0)
 }
 
+/// LBTerm: a test window driven by posted moves (lbterm/perf, lbterm/motion) asks for no
+/// WM_MOUSELEAVE, which Windows would send at once with the real pointer elsewhere: the pointer
+/// stays where the last posted move put it, hovering, until the test posts WM_MOUSELEAVE itself
+fn lbterm_posted_pointer() -> bool {
+    static POSTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POSTED.get_or_init(|| std::env::var_os("LBTERM_POSTED_POINTER").is_some())
+}
+
 unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    if !inner.track_mouse_leave {
+    if !inner.track_mouse_leave && !lbterm_posted_pointer() {
         inner.track_mouse_leave = true;
 
         let mut trk = TRACKMOUSEEVENT {
@@ -2202,7 +2249,17 @@ struct KeyboardLayoutInfo {
     dead_keys: HashMap<(Modifiers, u8), DeadKey>,
 }
 
-#[derive(Debug)]
+/// LBTerm: what KeyboardLayoutInfo::probe finds in a layout: whether it has AltGr, and its dead keys
+type LayoutProbe = (bool, HashMap<(Modifiers, u8), DeadKey>);
+
+thread_local! {
+    /// LBTerm: every keyboard layout the GUI thread's windows have probed, by HKL
+    /// (lbterm_extras::layouts)
+    static PROBED_LAYOUTS: RefCell<lbterm_extras::layouts::Probed<LayoutProbe>> =
+        RefCell::new(Default::default());
+}
+
+#[derive(Debug, Clone)]
 struct DeadKey {
     dead_char: char,
     _vk: u8,
@@ -2415,22 +2472,50 @@ impl KeyboardLayoutInfo {
 
     unsafe fn update(&mut self) {
         let current_layout = GetKeyboardLayout(0);
-        if current_layout == self.layout {
-            // Avoid recomputing this if the layout hasn't changed
-            return;
+        // LBTerm: the probe holds the key that meets it for 10 ms on an idle PC and several
+        // times that on a busy one, so it's made once per layout for every window of the GUI
+        // thread, not once per window. Avoid recomputing this if the layout hasn't changed, take
+        // another window's probe of it if there is one, else probe (lbterm_extras::layouts)
+        let probed = PROBED_LAYOUTS.with(|probed| {
+            probed
+                .borrow_mut()
+                .update(self.layout as usize, current_layout as usize, || {
+                    let start = std::time::Instant::now();
+                    let found = Self::probe();
+                    if let Some((has_alt_gr, dead_keys)) = &found {
+                        log::info!(
+                            "keyboard layout {:#x} probed in {:.1} ms: AltGr {}, {} dead keys",
+                            current_layout as usize,
+                            start.elapsed().as_secs_f64() * 1000.0,
+                            if *has_alt_gr { "yes" } else { "no" },
+                            dead_keys.len()
+                        );
+                    }
+                    found
+                })
+        });
+        if let Some((has_alt_gr, dead_keys)) = probed {
+            self.has_alt_gr = has_alt_gr;
+            self.dead_keys = dead_keys;
+            self.layout = current_layout;
         }
+    }
 
+    /// LBTerm: upstream's probe of the thread's layout, made in a KeyboardLayoutInfo of its own:
+    /// whether it has AltGr, and its dead keys. None when the keyboard state can't be saved.
+    unsafe fn probe() -> Option<LayoutProbe> {
         let mut saved_state = [0u8; 256];
         if GetKeyboardState(saved_state.as_mut_ptr()) == 0 {
-            return;
+            return None;
         }
 
-        self.probe_alt_gr();
-        self.probe_dead_keys();
-        log::trace!("dead_keys: {:#x?}", self.dead_keys);
+        let mut info = Self::new();
+        info.probe_alt_gr();
+        info.probe_dead_keys();
+        log::trace!("dead_keys: {:#x?}", info.dead_keys);
 
         SetKeyboardState(saved_state.as_mut_ptr());
-        self.layout = current_layout;
+        Some((info.has_alt_gr, info.dead_keys))
     }
 
     pub fn has_alt_gr(&mut self) -> bool {
@@ -3014,8 +3099,14 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match std::panic::catch_unwind(|| {
-        do_wnd_proc(hwnd, msg, wparam, lparam)
-            .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
+        // LBTerm: our handling of each message timed for the slow-frame log, by message;
+        // Windows' default handling isn't, where a title-bar drag's modal loop runs
+        // (lbterm_extras::slow)
+        let handled = {
+            let _slow = lbterm_extras::slow::message(msg);
+            do_wnd_proc(hwnd, msg, wparam, lparam)
+        };
+        handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
     }) {
         Ok(result) => result,
         Err(e) => {

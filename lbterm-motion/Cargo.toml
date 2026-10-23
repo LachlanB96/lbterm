@@ -1,0 +1,9 @@
+[package]
+name = "lbterm-motion"
+version = "0.1.0"
+edition = "2021"
+description = "LBTerm's motion: springs and CSS-syntax curves sampled into DirectComposition cubics, and the pane layout planner"
+license = "MIT"
+publish = false
+
+[dependencies]

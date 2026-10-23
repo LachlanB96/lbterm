@@ -77,9 +77,10 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     */
 
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(HSTRING::from(
-        "org.wezfurlong.wezterm",
-    ))?;
+    // LBTerm: the AppUserModelID wezterm-gui sets (config::lbterm::APP_ID;
+    // this crate doesn't depend on config)
+    let notifier =
+        ToastNotificationManager::CreateToastNotifierWithId(HSTRING::from("com.lachlanb.lbterm"))?;
 
     notifier.Show(&notif)?;
 

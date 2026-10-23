@@ -75,11 +75,10 @@ pub fn confirm_quit_program(
     window: ::window::Window,
     tab_id: TabId,
 ) -> anyhow::Result<()> {
-    if confirm::run_confirmation("🛑 Really Quit WezTerm?", &mut term)? {
+    let question = format!("🛑 Really Quit {}?", config::lbterm::APP_NAME);
+    if confirm::run_confirmation(&question, &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
-            use ::window::{Connection, ConnectionOps};
-            let con = Connection::get().expect("call on gui thread");
-            con.terminate_message_loop();
+            crate::frontend::quit_application();
         })
         .detach();
     }

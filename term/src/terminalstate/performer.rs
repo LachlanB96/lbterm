@@ -721,6 +721,9 @@ impl<'a> Performer<'a> {
                 self.accumulating_title.take();
                 self.progress = Progress::default();
 
+                let changed = self.program_status.reset();
+                self.program_status_changed(changed);
+
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
                 self.erase_in_display(EraseInDisplay::EraseDisplay);
@@ -774,6 +777,24 @@ impl<'a> Performer<'a> {
                 self.set_hyperlink(link);
             }
             OperatingSystemCommand::Unspecified(unspec) => {
+                // LBTerm: kitty's desktop notifications, OSC 99 (lbterm-notify). A query is
+                // answered here; the rest goes to the GUI, which shows the toasts.
+                let parts: Vec<&[u8]> = unspec.iter().map(|p| p.as_slice()).collect();
+                if let Some(request) = lbterm_notify::parse(&parts) {
+                    match self.lbterm_notify.feed(request) {
+                        Some(lbterm_notify::Command::Query(id)) => {
+                            write!(self.writer, "{}", lbterm_notify::reply::query(&id)).ok();
+                            self.writer.flush().ok();
+                        }
+                        Some(command) => {
+                            if let Some(handler) = self.alert_handler.as_mut() {
+                                handler.alert(Alert::KittyNotification(command));
+                            }
+                        }
+                        None => {}
+                    }
+                    return;
+                }
                 if self.config.log_unknown_escape_sequences() {
                     let mut output = String::new();
                     write!(&mut output, "Unhandled OSC ").ok();
@@ -872,6 +893,11 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                // LBTerm: a new prompt ends anything still working or blocked,
+                // and the mouse and focus reporting a program left on
+                let changed = self.program_status.end_activity();
+                self.program_status_changed(changed);
+                self.release_mouse_and_focus();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
@@ -883,6 +909,9 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                let changed = self.program_status.end_activity();
+                self.program_status_changed(changed);
+                self.release_mouse_and_focus();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker { .. },
@@ -904,6 +933,23 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus { .. },
             ) => {}
+
+            // LBTerm: OSC 7501. The answer to a query says only that this
+            // terminal speaks the protocol; nothing reported is ever echoed
+            OperatingSystemCommand::ProgramStatus(
+                crate::program_status::ProgramStatus::Query,
+            ) => {
+                write!(self.writer, "{}", wezterm_escape_parser::program_status::REPLY).ok();
+                self.writer.flush().ok();
+            }
+            OperatingSystemCommand::ProgramStatus(
+                crate::program_status::ProgramStatus::Report(report),
+            ) => {
+                let changed = self
+                    .program_status
+                    .apply(report, std::time::SystemTime::now());
+                self.program_status_changed(changed);
+            }
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {
@@ -1086,7 +1132,7 @@ impl<'a> Performer<'a> {
                     TProg::SetPercentage(p) => Progress::Percentage(p),
                     TProg::SetError(p) => Progress::Error(p),
                     TProg::SetIndeterminate => Progress::Indeterminate,
-                    TProg::Paused => Progress::None,
+                    TProg::Paused => Progress::Paused,
                 };
                 if prog != self.progress {
                     self.progress = prog.clone();

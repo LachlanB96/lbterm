@@ -31,6 +31,7 @@ mod font;
 mod frontend;
 pub mod keyassignment;
 mod keys;
+pub mod lbterm;
 pub mod lua;
 pub mod meta;
 mod scheme_data;
@@ -382,20 +383,28 @@ pub fn create_user_owned_dirs(p: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn xdg_config_home() -> PathBuf {
-    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("wezterm")) {
+fn xdg_config_home(name: &str) -> PathBuf {
+    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join(name)) {
         Some(p) => p,
-        None => HOME_DIR.join(".config").join("wezterm"),
+        None => HOME_DIR.join(".config").join(name),
     }
 }
 
+/// LBTerm's config dirs, then WezTerm's.
 fn config_dirs() -> Vec<PathBuf> {
+    lbterm::CONFIG_NAMES
+        .iter()
+        .flat_map(|name| config_dirs_for(name))
+        .collect()
+}
+
+pub(crate) fn config_dirs_for(name: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    dirs.push(xdg_config_home());
+    dirs.push(xdg_config_home(name));
 
     #[cfg(unix)]
     if let Some(d) = std::env::var_os("XDG_CONFIG_DIRS") {
-        dirs.extend(std::env::split_paths(&d).map(|s| PathBuf::from(s).join("wezterm")));
+        dirs.extend(std::env::split_paths(&d).map(|s| PathBuf::from(s).join(name)));
     }
 
     dirs

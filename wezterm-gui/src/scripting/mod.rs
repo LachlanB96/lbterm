@@ -78,6 +78,13 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         })?,
     )?;
 
+    // LBTerm: an image on the clipboard, asked of Windows at once, so a paste binding can tell
+    // an image (Claude Code attaches one on Alt+V) from text without starting a program to look
+    window_mod.set(
+        "clipboard_has_image",
+        lua.create_function(|_, _: ()| Ok(clipboard_has_image()))?,
+    )?;
+
     window_mod.set(
         "enumerate_gpus",
         lua.create_function(|_, _: ()| {
@@ -99,4 +106,20 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+/// LBTerm: whether the clipboard holds a bitmap, in any of the formats Windows converts between
+/// (what `Get-Clipboard -Format Image` reads). Asking doesn't open the clipboard, so it never
+/// waits on a program holding it open.
+#[cfg(windows)]
+fn clipboard_has_image() -> bool {
+    use winapi::um::winuser::{IsClipboardFormatAvailable, CF_BITMAP, CF_DIB, CF_DIBV5};
+    [CF_DIB, CF_DIBV5, CF_BITMAP]
+        .iter()
+        .any(|format| unsafe { IsClipboardFormatAvailable(*format) } != 0)
+}
+
+#[cfg(not(windows))]
+fn clipboard_has_image() -> bool {
+    false
 }

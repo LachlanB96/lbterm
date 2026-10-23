@@ -2,6 +2,7 @@ use crate::termwindow::{RenderFrame, TermWindowNotif};
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
 use anyhow::Context;
+use lbterm_motion::Target;
 use smol::Timer;
 use std::time::{Duration, Instant};
 use wezterm_font::ClearShapeCache;
@@ -34,6 +35,10 @@ impl crate::TermWindow {
             }
         }
 
+        // LBTerm: the slow-frame log times building the frame and drawing it apart, by window,
+        // and with the compositor presenting too (render/composited.rs; lbterm_extras::slow)
+        let slow_pass =
+            lbterm_extras::slow::paint(self.mux_window_id, lbterm_extras::slow::Part::Pass);
         'pass: for pass in 0.. {
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
@@ -103,9 +108,13 @@ impl crate::TermWindow {
                 }
             }
         }
+        drop(slow_pass);
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
+        let slow_draw =
+            lbterm_extras::slow::paint(self.mux_window_id, lbterm_extras::slow::Part::Draw);
         self.call_draw(frame).ok();
+        drop(slow_draw);
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
@@ -144,6 +153,8 @@ impl crate::TermWindow {
                 }
             }
         }
+        // LBTerm: what this frame shows, to a test window's state file (termwindow/state.rs)
+        self.lbterm_state_frame();
     }
 
     pub fn paint_modal(&mut self) -> anyhow::Result<()> {
@@ -172,6 +183,18 @@ impl crate::TermWindow {
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
 
+        // LBTerm: the strip's words follow the active tab and its summary (render/strip.rs)
+        self.lbterm_strip_refresh();
+
+        // LBTerm: the fancy tab bar is laid out before the panes, whose cards
+        // sit a gutter under it as it's drawn (render/card.rs); built when
+        // it's painted, a pane painted first would see last frame's or none
+        if self.show_tab_bar && self.config.use_fancy_tab_bar && self.fancy_tab_bar.is_none() {
+            let palette = self.palette().clone();
+            let tab_bar = self.build_fancy_tab_bar(&palette)?;
+            self.fancy_tab_bar.replace(tab_bar);
+        }
+
         let panes = self.get_panes_to_render();
         let focused = self.focused.is_some();
         let window_is_transparent =
@@ -185,6 +208,9 @@ impl crate::TermWindow {
         let mut layers = layer.quad_allocator();
         log::trace!("quad map elapsed {:?}", start.elapsed());
         metrics::histogram!("quad.map").record(start.elapsed());
+        // LBTerm: mark which visual each quad goes to (lbterm/COMPOSITOR.md),
+        // starting with the window background
+        self.lbterm_spans.reset(layers.quad_counts());
 
         let mut paint_terminal_background = false;
 
@@ -257,9 +283,15 @@ impl crate::TermWindow {
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
             }
+            self.lbterm_spans
+                .switch(Target::Pane(pos.pane.pane_id()), layers.quad_counts());
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
+        // LBTerm: what the panes' lines showed that's new plays its effect (render/triggers.rs)
+        self.lbterm_triggers_fire();
 
+        self.lbterm_spans
+            .switch(Target::Splits, layers.quad_counts());
         if let Some(pane) = self.get_active_pane_or_overlay() {
             let splits = self.get_splits();
             for split in &splits {
@@ -268,6 +300,7 @@ impl crate::TermWindow {
             }
         }
 
+        self.lbterm_spans.switch(Target::Over, layers.quad_counts());
         if self.show_tab_bar {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
@@ -275,7 +308,31 @@ impl crate::TermWindow {
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+        // LBTerm: what the panes' outlines are cut from, with the compositor (render/card.rs)
+        self.lbterm_cards = self
+            .paint_lbterm_card_templates()
+            .context("paint_lbterm_card_templates")?;
+        // LBTerm: in z-layers of their own, over all but modals
+        self.paint_lbterm_hearts().context("paint_lbterm_hearts")?;
+        self.paint_lbterm_strip_card()
+            .context("paint_lbterm_strip_card")?;
+        self.paint_lbterm_readout().context("paint_lbterm_readout")?;
+        self.paint_lbterm_strip_swap()
+            .context("paint_lbterm_strip_swap")?;
+        self.paint_lbterm_prompt_mark()
+            .context("paint_lbterm_prompt_mark")?;
+        self.paint_lbterm_questions()
+            .context("paint_lbterm_questions")?;
+        self.paint_tab_panel().context("paint_tab_panel")?;
         self.paint_modal().context("paint_modal")?;
+        // LBTerm: over the panel too (render/tab_menu.rs)
+        self.paint_lbterm_tab_menu().context("paint_lbterm_tab_menu")?;
+        // LBTerm: the list of prompts, beside it (render/prompt.rs)
+        self.paint_lbterm_prompt_list()
+            .context("paint_lbterm_prompt_list")?;
+        // LBTerm: and the Conductor's menu (render/conductor.rs)
+        self.paint_lbterm_conductor_menu()
+            .context("paint_lbterm_conductor_menu")?;
 
         Ok(())
     }

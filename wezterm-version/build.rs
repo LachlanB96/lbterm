@@ -15,16 +15,26 @@ fn main() {
         if let Ok(repo) = git2::Repository::discover(".") {
             if let Ok(ref_head) = repo.find_reference("HEAD") {
                 let repo_path = repo.path().to_path_buf();
-
+                // LBTerm: HEAD too, which a checkout changes, and the branch
+                // in the common dir as well, where a worktree's branches live
+                // (its own repo.path() is .git/worktrees/<name>), packed or
+                // not. Watching only <repo.path()>/refs/heads/<branch>, a
+                // worktree's build kept the commit it was first built at.
+                let common = repo.commondir().to_path_buf();
+                let mut watch = vec![repo_path.join("HEAD"), common.join("packed-refs")];
                 if let Ok(resolved) = ref_head.resolve() {
                     if let Some(name) = resolved.name() {
-                        let path = repo_path.join(name);
-                        if path.exists() {
-                            println!(
-                                "cargo:rerun-if-changed={}",
-                                path.canonicalize().unwrap().display()
-                            );
-                        }
+                        watch.push(repo_path.join(name));
+                        watch.push(common.join(name));
+                    }
+                }
+                watch.dedup();
+                for path in watch {
+                    if path.exists() {
+                        println!(
+                            "cargo:rerun-if-changed={}",
+                            path.canonicalize().unwrap().display()
+                        );
                     }
                 }
             }

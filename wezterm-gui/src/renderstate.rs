@@ -478,6 +478,12 @@ impl RenderLayer {
         }
     }
 
+    /// LBTerm: the compositor draws layers below 0 under the panes and
+    /// layers above 0 over them.
+    pub fn zindex(&self) -> i8 {
+        self.zindex
+    }
+
     pub fn quad_allocator(&self) -> TripleLayerQuadAllocator<'_> {
         // We're creating a self-referential struct here to manage the lifetimes
         // of these related items.  The transmutes are safe because we're only
@@ -567,6 +573,13 @@ impl TripleLayerQuadAllocatorTrait for BorrowedLayers {
 
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
         self.layers[layer_num].extend_with(vertices)
+    }
+}
+
+impl BorrowedLayers {
+    /// LBTerm: see `TripleLayerQuadAllocator::quad_counts`.
+    pub fn quad_counts(&self) -> [usize; 3] {
+        [0, 1, 2].map(|i| *self.layers[i].next)
     }
 }
 

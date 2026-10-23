@@ -240,6 +240,10 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_progress(&self) -> Progress {
         Progress::None
     }
+    /// LBTerm: what the programs in this pane say they're doing (OSC 7501)
+    fn get_program_status(&self) -> Vec<wezterm_term::program_status::ProgramStatusRecord> {
+        vec![]
+    }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn send_composed_text(&self, text: &str) -> anyhow::Result<()> {
         self.writer().write_all(text.as_bytes())?;

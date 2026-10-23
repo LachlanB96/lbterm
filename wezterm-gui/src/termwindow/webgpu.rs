@@ -1,4 +1,5 @@
 use crate::quad::Vertex;
+use crate::termwindow::compositor::Compositor;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::RefCell;
@@ -35,8 +36,16 @@ pub struct WebGpuState {
     pub texture_nearest_sampler: wgpu::Sampler,
     pub texture_linear_sampler: wgpu::Sampler,
     pub handle: RawHandlePair,
+    /// LBTerm: kept so the compositor can make a surface for each pane
+    pub instance: wgpu::Instance,
+    /// LBTerm: the window's visual tree when `lbterm_compositor` is on.
+    /// Declared after `surface`, which holds a reference to its visual.
+    pub compositor: Option<Compositor>,
+    /// LBTerm: set when wgpu says the device has gone (gpu_lost.rs)
+    pub lost: crate::termwindow::gpu_lost::Lost,
 }
 
+#[derive(Clone, Copy)]
 pub struct RawHandlePair {
     window: RawWindowHandle,
     display: RawDisplayHandle,
@@ -47,6 +56,15 @@ impl RawHandlePair {
         Self {
             window: window.window_handle().expect("window handle").as_raw(),
             display: window.display_handle().expect("display handle").as_raw(),
+        }
+    }
+
+    /// The window's HWND, for DirectComposition and the taskbar button; null off Windows.
+    pub fn hwnd(&self) -> *mut std::ffi::c_void {
+        match self.window {
+            #[cfg(windows)]
+            RawWindowHandle::Win32(h) => h.hwnd.get() as *mut std::ffi::c_void,
+            _ => std::ptr::null_mut(),
         }
     }
 }
@@ -215,21 +233,48 @@ impl WebGpuState {
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
         let handle = RawHandlePair::new(window);
-        Self::new_impl(handle, dimensions, config).await
+        if config::lbterm::uses_compositor(config) {
+            match Self::new_impl(handle, dimensions, config, true).await {
+                Ok(state) => return Ok(state),
+                // The window has no redirection bitmap, but a flip-model
+                // swapchain on the HWND presents without one
+                Err(err) => log::error!(
+                    "lbterm_compositor: {err:#}; drawing to the window directly instead"
+                ),
+            }
+        }
+        Self::new_impl(handle, dimensions, config, false).await
     }
 
     pub async fn new_impl(
         handle: RawHandlePair,
         dimensions: Dimensions,
         config: &ConfigHandle,
+        use_compositor: bool,
     ) -> anyhow::Result<Self> {
-        let backends = wgpu::Backends::all();
+        let compositor = if use_compositor {
+            Some(Compositor::new(handle.hwnd())?)
+        } else {
+            None
+        };
+        // A DComp visual takes a DXGI swapchain, so only DX12 will do
+        let backends = if compositor.is_some() {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::all()
+        };
+        // LBTerm: WGPU_VALIDATION=1 and WGPU_DEBUG=1 turn on the D3D12 debug
+        // layer and validation, which log the call behind a failed submit
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
             ..Default::default()
         });
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
+        let surface = match &compositor {
+            Some(compositor) => compositor.create_under_surface(&instance)?,
+            None => unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
+            },
         };
 
         let mut adapter: Option<wgpu::Adapter> = None;
@@ -336,6 +381,10 @@ impl WebGpuState {
             })
             .await?;
 
+        // LBTerm: a lost device or an error nobody captured is noted, not a panic (gpu_lost.rs)
+        let lost = crate::termwindow::gpu_lost::Lost::default();
+        crate::termwindow::gpu_lost::watch(&device, &lost);
+
         let queue = Arc::new(queue);
 
         // Explicitly request an SRGB format, if available
@@ -360,12 +409,26 @@ impl WebGpuState {
         };
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // LBTerm: copyable with the compositor, for LBTERM_DUMP_FRAMES
+            usage: if compositor.is_some() {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format,
             width: dimensions.pixel_width as u32,
             height: dimensions.pixel_height as u32,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: if caps
+            // Composition swapchains take premultiplied alpha or none; DXGI
+            // refuses straight alpha. Rendering onto a cleared, transparent
+            // target leaves premultiplied pixels behind.
+            alpha_mode: if compositor.is_some() {
+                if config.window_background_opacity < 1.0 {
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                } else {
+                    wgpu::CompositeAlphaMode::Opaque
+                }
+            } else if caps
                 .alpha_modes
                 .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
             {
@@ -382,8 +445,17 @@ impl WebGpuState {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        if let Some(compositor) = &compositor {
+            // configure made the swapchain the visual's content
+            compositor.commit()?;
+            log::info!(
+                "lbterm_compositor: drawing through DirectComposition on {} ({:?})",
+                adapter_info.name,
+                adapter_info.backend
+            );
+        }
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
+        let shader =device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
 
         let shader_uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -506,6 +578,9 @@ impl WebGpuState {
             texture_bind_group_layout,
             texture_nearest_sampler,
             texture_linear_sampler,
+            instance,
+            compositor,
+            lost,
         })
     }
 

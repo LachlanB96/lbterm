@@ -41,7 +41,9 @@ impl crate::TermWindow {
 
         let num_cols = params.dims.cols;
 
-        let hsv = if params.is_active {
+        // LBTerm: with the compositor a pane without the keyboard is its
+        // visual at 85%, so its text draws undimmed (render/card.rs)
+        let hsv = if params.is_active || self.lbterm_composited() {
             None
         } else {
             Some(params.config.inactive_pane_hsb)
@@ -665,6 +667,17 @@ impl crate::TermWindow {
                             );
                             quad.set_fg_color(glyph_color);
                             quad.set_alt_color_and_mix_value(fg_color_alt, fg_color_mix);
+                            // LBTerm: a rainbow trigger shades its glyphs across the whole
+                            // match, not one colour per letter (render/triggers.rs)
+                            if !is_cursor && !selected {
+                                if let Some((left, right)) = self.lbterm_rainbow_gradient(
+                                    phys_cell_idx,
+                                    range.start - params.left_pixel_x,
+                                    range.end - params.left_pixel_x,
+                                ) {
+                                    quad.set_fg_gradient(left, right);
+                                }
+                            }
                             quad.set_texture(texture_rect);
                             quad.set_hsv(if glyph.brightness_adjust != 1.0 {
                                 let hsv = hsv.unwrap_or_else(|| HsbTransform::default());

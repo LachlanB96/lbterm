@@ -565,6 +565,12 @@ pub enum KeyAssignment {
         confirm: bool,
     },
     ReloadConfiguration,
+    /// LBTerm: start the installed GUI and end this one; the tabs live on in the mux server
+    /// (wezterm-gui/src/restart.rs)
+    LbtermRestart,
+    /// LBTerm: the question colours on the pane, shown while the right button's held
+    /// (wezterm-gui/src/termwindow/render/questions.rs)
+    LbtermQuestions(crate::lbterm::LbtermQuestions),
     MoveTabRelative(isize),
     MoveTab(usize),
     ScrollByPage(NotNan<f64>),

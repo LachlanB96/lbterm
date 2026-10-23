@@ -1,0 +1,10 @@
+[package]
+name = "lbterm-triggers"
+version = "0.1.0"
+edition = "2021"
+description = "LBTerm's triggers: rules that watch the text panes show, colour what they match, play an effect and tell Lua"
+license = "MIT"
+publish = false
+
+[dependencies]
+regex.workspace = true

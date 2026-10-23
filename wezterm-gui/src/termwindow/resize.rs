@@ -67,6 +67,9 @@ impl super::TermWindow {
         if let Some(modal) = self.get_modal() {
             modal.reconfigure(self);
         }
+        // LBTerm: the active pane's size in cells, over the panes until a moment after the
+        // window is still (render/lights.rs)
+        self.lbterm_readout_resized();
         self.emit_window_event("window-resized", None);
     }
 
@@ -458,18 +461,22 @@ impl super::TermWindow {
         self.pending_scale_changes
             .push_back(ScaleChange::Relative(1.0 / 1.1));
         self.apply_pending_scale_changes();
+        // LBTerm: the readout says the font's size and the pane's (render/lights.rs)
+        self.lbterm_readout_font();
     }
 
     pub fn increase_font_size(&mut self) {
         self.pending_scale_changes
             .push_back(ScaleChange::Relative(1.1));
         self.apply_pending_scale_changes();
+        self.lbterm_readout_font();
     }
 
     pub fn reset_font_size(&mut self) {
         self.pending_scale_changes
             .push_back(ScaleChange::Absolute(1.0));
         self.apply_pending_scale_changes();
+        self.lbterm_readout_font();
     }
 
     pub fn set_window_size(&mut self, size: TerminalSize, window: &Window) -> anyhow::Result<()> {
@@ -560,9 +567,18 @@ impl super::TermWindow {
 /// enabled the scroll bar then they will expect it to have a reasonable
 /// size unless they've specified differently.
 pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext) -> usize {
-    if config.enable_scroll_bar && config.window_padding.right.is_zero() {
+    let padding = if config.enable_scroll_bar && config.window_padding.right.is_zero() {
         context.pixel_cell as usize
     } else {
         config.window_padding.right.evaluate_as_pixels(context) as usize
+    };
+    // LBTerm: the scrollbar lies inside the pane's card, clear of its outline,
+    // and clear of the text, so the padding is still all the thumb's
+    // (render/card.rs)
+    if config.enable_scroll_bar {
+        let shape = lbterm_panel::Shape::new(context.dpi / 96.0);
+        padding + (shape.scroll_inset() + shape.scroll_gap()) as usize
+    } else {
+        padding
     }
 }

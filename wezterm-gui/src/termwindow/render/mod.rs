@@ -35,14 +35,27 @@ use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::color::LinearRgba;
 
 pub mod borders;
+pub mod card;
+pub mod composited;
+pub mod conductor;
 pub mod corners;
 pub mod draw;
 pub mod fancy_tab_bar;
+pub mod hover_fade;
+pub mod lights;
+pub mod marks;
 pub mod paint;
+pub mod prompt;
 pub mod pane;
+pub mod questions;
 pub mod screen_line;
 pub mod split;
+pub mod strip;
+pub mod strip_swap;
 pub mod tab_bar;
+pub mod tab_menu;
+pub mod tab_panel;
+pub mod triggers;
 pub mod window_buttons;
 
 /// The data that we associate with a line; we use this to cache it shape hash
@@ -355,7 +368,6 @@ impl crate::TermWindow {
             .window_padding
             .left
             .evaluate_as_pixels(h_context);
-        let padding_right = self.config.window_padding.right;
         let padding_top = self.config.window_padding.top.evaluate_as_pixels(v_context);
         let padding_bottom = self
             .config
@@ -363,15 +375,21 @@ impl crate::TermWindow {
             .bottom
             .evaluate_as_pixels(v_context);
 
+        // LBTerm: the border is room the terminal never had, as in
+        // apply_dimensions: leaving it in shifted centred content by half of
+        // it, which with the tab panel's strip put the right-hand columns off
+        // the window (lbterm/TAB-PANEL.md). The right padding is the one
+        // apply_dimensions kept, the scrollbar's room inside the card
+        // included: the padding alone left that room in the gap, so
+        // centring pushed the last column under the thumb.
+        let border = self.get_os_border();
         let horizontal_gap = self.dimensions.pixel_width as f32
+            - (border.left + border.right).get() as f32
             - self.terminal_size.pixel_width as f32
             - padding_left
-            - if self.show_scroll_bar && padding_right.is_zero() {
-                h_context.pixel_cell
-            } else {
-                padding_right.evaluate_as_pixels(h_context)
-            };
+            - self.effective_right_padding(&self.config) as f32;
         let vertical_gap = self.dimensions.pixel_height as f32
+            - (border.top + border.bottom).get() as f32
             - self.terminal_size.pixel_height as f32
             - padding_top
             - padding_bottom

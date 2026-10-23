@@ -20,6 +20,11 @@ impl crate::TermWindow {
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
+        // LBTerm: each pane its own visual (lbterm/COMPOSITOR.md)
+        if self.webgpu.as_ref().map_or(false, |w| w.compositor.is_some()) {
+            return self.call_draw_composited();
+        }
+
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
 

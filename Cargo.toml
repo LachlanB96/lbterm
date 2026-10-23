@@ -5,6 +5,11 @@ members = [
   "strip-ansi-escapes",
   "sync-color-schemes",
   "deps/cairo",
+  "lbterm-extras",
+  "lbterm-motion",
+  "lbterm-notify",
+  "lbterm-panel",
+  "lbterm-triggers",
   "wezterm",
   "wezterm-blob-leases",
   "wezterm-cell",
@@ -124,6 +129,11 @@ image = "0.25"
 intrusive-collections = "0.9"
 k9 = "0.12.0"
 lazy_static = "1.4"
+lbterm-extras = { path = "lbterm-extras" }
+lbterm-motion = { path = "lbterm-motion" }
+lbterm-notify = { path = "lbterm-notify" }
+lbterm-panel = { path = "lbterm-panel" }
+lbterm-triggers = { path = "lbterm-triggers" }
 leb128 = "0.2"
 lfucache = { path = "lfucache" }
 libc = "0.2"

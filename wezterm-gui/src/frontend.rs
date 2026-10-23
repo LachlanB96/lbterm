@@ -134,7 +134,11 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::Alert {
                     pane_id: _,
-                    alert: Alert::Bell | Alert::Progress(_),
+                    alert:
+                        Alert::Bell
+                        | Alert::Progress(_)
+                        | Alert::ProgramStatus
+                        | Alert::KittyNotification(_),
                 } => {
                     // Handled via TermWindowNotif; NOP it here.
                 }
@@ -542,6 +546,34 @@ impl Drop for WorkspaceSwitcher {
 
 pub fn shutdown() {
     FRONT_END.with(|f| drop(f.borrow_mut().take()));
+}
+
+/// LBTerm: quit, ending every tab. Local panes end with the GUI, but panes
+/// in a mux server would live on there, so close the windows first: that
+/// kills their panes (Mux::remove_window_internal), and ClientPane::kill
+/// holds an Activity until the server has each kill. The message loop ends
+/// when those are done, or after a few seconds if the server stops answering.
+pub fn quit_application() {
+    let mux = Mux::get();
+    let in_mux_server = mux.iter_panes().iter().any(|pane| {
+        mux.get_domain(pane.domain_id())
+            .map_or(false, |domain| domain.detachable())
+    });
+    if !in_mux_server {
+        Connection::get().unwrap().terminate_message_loop();
+        return;
+    }
+    for window_id in mux.iter_windows() {
+        mux.kill_window(window_id);
+    }
+    promise::spawn::spawn(async move {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while mux::activity::Activity::count() > 0 && std::time::Instant::now() < give_up {
+            smol::Timer::after(std::time::Duration::from_millis(50)).await;
+        }
+        Connection::get().unwrap().terminate_message_loop();
+    })
+    .detach();
 }
 
 pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {

@@ -830,11 +830,22 @@ impl super::TermWindow {
         gl_state: &RenderState,
         inherited_colors: Option<&ElementColors>,
     ) -> anyhow::Result<()> {
+        // LBTerm: with the compositor, a window button's or the restart pill's look under the
+        // pointer goes on the hover slots showing it, which DWM fades; here it keeps its
+        // resting look, its parts too (render/hover_fade.rs)
+        let fading = self.lbterm_hover_fades(element);
+        if fading {
+            self.lbterm_render_hover_slots(element, gl_state, inherited_colors)?;
+            if let Some(rest) = crate::termwindow::render::hover_fade::at_rest(element) {
+                return self.render_element(&rest, gl_state, inherited_colors);
+            }
+        }
+
         let layer = gl_state.layer_for_zindex(element.zindex)?;
         let mut layers = layer.quad_allocator();
 
         let colors = match &element.hover_colors {
-            Some(hc) => {
+            Some(hc) if !fading => {
                 let hovering =
                     match &self.current_mouse_event {
                         Some(event) => {
@@ -853,7 +864,7 @@ impl super::TermWindow {
                     &element.colors
                 }
             }
-            None => &element.colors,
+            _ => &element.colors,
         };
 
         self.render_element_background(element, colors, &mut layers, inherited_colors)?;

@@ -15,6 +15,7 @@ use std::time::Instant;
 use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_term::terminal::Alert;
+use wezterm_term::Progress;
 use wezterm_term::StableRowIndex;
 
 #[derive(Clone)]
@@ -44,6 +45,9 @@ pub(crate) struct PerPane {
     mouse_grabbed: bool,
     alt_screen_active: bool,
     sent_initial_palette: bool,
+    /// LBTerm: whether this client has been sent what the pane already had
+    /// before it attached
+    sent_initial_state: bool,
     seqno: SequenceNo,
     config_generation: usize,
     pub(crate) notifications: Vec<Alert>,
@@ -179,8 +183,45 @@ fn maybe_push_pane_changes(
         per_pane.notifications.push(Alert::PaletteChanged);
         per_pane.sent_initial_palette = true;
     }
+
+    if !per_pane.sent_initial_state {
+        // LBTerm: a client hears only of changes, so one that attaches to a
+        // running pane (a GUI started again while its panes live on here)
+        // would have none of its user vars (Claude Code's claude_status and
+        // claude_session), progress or OSC 7501 records until each next
+        // changed. Send what the pane has, ahead of anything queued.
+        per_pane.sent_initial_state = true;
+        let mut initial: Vec<Alert> = pane
+            .copy_user_vars()
+            .into_iter()
+            .map(|(name, value)| Alert::SetUserVar { name, value })
+            .collect();
+        let progress = pane.get_progress();
+        if progress != Progress::None {
+            initial.push(Alert::Progress(progress));
+        }
+        initial.push(Alert::ProgramStatus);
+        per_pane.notifications.splice(0..0, initial);
+    }
+
+    let mut sent_program_status = false;
     for alert in per_pane.notifications.drain(..) {
         match alert {
+            Alert::ProgramStatus => {
+                // LBTerm: the alert only says the records changed, and a
+                // client can't read them from here, so send the records.
+                // Once per push: they're all of them each time.
+                if !sent_program_status {
+                    sent_program_status = true;
+                    sender.send(DecodedPdu {
+                        pdu: Pdu::SetProgramStatus(SetProgramStatus {
+                            pane_id: pane.pane_id(),
+                            records: pane.get_program_status(),
+                        }),
+                        serial: 0,
+                    })?;
+                }
+            }
             Alert::PaletteChanged => {
                 sender.send(DecodedPdu {
                     pdu: Pdu::SetPalette(SetPalette {
@@ -228,6 +269,25 @@ impl SessionHandler {
             client_id: None,
             proxy_client_id: None,
         }
+    }
+
+    /// LBTerm: when the cli types into `pane_id` (`cli send-text`, from the Conductor, Relay
+    /// or AI Dashboard), say so on the pane with the `lbterm_typed` user var, the time in
+    /// milliseconds: the tab rail lights the tab's pad. A GUI's own typing doesn't.
+    fn lbterm_mark_typed(&self, pane_id: PaneId) {
+        if !mux::lbterm_typed::by_a_program(self.client_id.as_deref()) {
+            return;
+        }
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        Mux::get().notify(MuxNotification::Alert {
+            pane_id,
+            alert: Alert::SetUserVar {
+                name: mux::lbterm_typed::USER_VAR.to_string(),
+                value: at.to_string(),
+            },
+        });
     }
 
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
@@ -441,6 +501,7 @@ impl SessionHandler {
             }
 
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
+                self.lbterm_mark_typed(pane_id);
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
@@ -499,6 +560,7 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendPaste(SendPaste { pane_id, data }) => {
+                self.lbterm_mark_typed(pane_id);
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
@@ -721,7 +783,15 @@ impl SessionHandler {
             Pdu::SpawnV2(spawn) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_domain_spawn_v2(spawn, send_response, client_id);
+                    schedule_domain_spawn_v2(spawn, true, send_response, client_id);
+                })
+                .detach();
+            }
+
+            Pdu::SpawnNoActivate(SpawnNoActivate { spawn }) => {
+                let client_id = self.client_id.clone();
+                spawn_into_main_thread(async move {
+                    schedule_domain_spawn_v2(spawn, false, send_response, client_id);
                 })
                 .detach();
             }
@@ -1001,6 +1071,7 @@ impl SessionHandler {
             | Pdu::ListPanesResponse { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
+            | Pdu::SetProgramStatus { .. }
             | Pdu::SpawnResponse { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
             | Pdu::UnitResponse { .. }
@@ -1032,13 +1103,16 @@ impl SessionHandler {
 // analysis and allow things to compile.
 fn schedule_domain_spawn_v2<SND>(
     spawn: SpawnV2,
+    activate: bool,
     send_response: SND,
     client_id: Option<Arc<ClientId>>,
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(domain_spawn_v2(spawn, client_id).await) })
-        .detach();
+    promise::spawn::spawn(async move {
+        send_response(domain_spawn_v2(spawn, activate, client_id).await)
+    })
+    .detach();
 }
 
 fn schedule_split_pane<SND>(split: SplitPane, send_response: SND, client_id: Option<Arc<ClientId>>)
@@ -1078,12 +1152,16 @@ async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyho
     }))
 }
 
-async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
+async fn domain_spawn_v2(
+    spawn: SpawnV2,
+    activate: bool,
+    client_id: Option<Arc<ClientId>>,
+) -> anyhow::Result<Pdu> {
     let mux = Mux::get();
     let _identity = mux.with_identity(client_id);
 
     let (tab, pane, window_id) = mux
-        .spawn_tab_or_window(
+        .spawn_tab_or_window_activating(
             spawn.window_id,
             spawn.domain,
             spawn.command,
@@ -1092,6 +1170,7 @@ async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> an
             None, // optional current pane_id
             spawn.workspace,
             None, // optional gui window position
+            activate,
         )
         .await?;
 

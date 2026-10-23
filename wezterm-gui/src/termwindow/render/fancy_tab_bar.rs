@@ -71,14 +71,19 @@ impl crate::TermWindow {
         let mut left_status = vec![];
         let mut left_eles = vec![];
         let mut right_eles = vec![];
+        // LBTerm: with the tab panel listing the tabs, the bar keeps only
+        // the window's buttons, on a strip the panes' colour that the
+        // window is dragged by (lbterm/TAB-PANEL.md)
+        let hide_tabs = config::lbterm::hides_tabs(&self.config);
         let bar_colors = ElementColors {
             border: BorderColor::default(),
-            bg: if self.focused.is_some() {
-                self.config.window_frame.active_titlebar_bg
+            bg: if hide_tabs {
+                palette.background.to_linear()
+            } else if self.focused.is_some() {
+                self.config.window_frame.active_titlebar_bg.to_linear()
             } else {
-                self.config.window_frame.inactive_titlebar_bg
+                self.config.window_frame.inactive_titlebar_bg.to_linear()
             }
-            .to_linear()
             .into(),
             text: if self.focused.is_some() {
                 self.config.window_frame.active_titlebar_fg
@@ -118,7 +123,13 @@ impl crate::TermWindow {
             let is_bottom = self.config.tab_bar_at_bottom;
 
             match item.item {
-                TabBarItem::RightStatus | TabBarItem::LeftStatus | TabBarItem::None => element
+                TabBarItem::RightStatus
+                | TabBarItem::LeftStatus
+                | TabBarItem::None
+                | TabBarItem::LbtermRestart
+                | TabBarItem::LbtermSummary
+                | TabBarItem::LbtermPrompt
+                | TabBarItem::LbtermPromptList => element
                     .item_type(UIItemType::TabBar(TabBarItem::None))
                     .line_height(Some(1.75))
                     .margin(BoxDimension {
@@ -393,6 +404,14 @@ impl crate::TermWindow {
 
         for item in items {
             match item.item {
+                // Only the buttons: the statuses carry the bar's colours in
+                // their cells, and a status changing still rebuilds the bar
+                TabBarItem::Tab { .. }
+                | TabBarItem::NewTabButton
+                | TabBarItem::LeftStatus
+                | TabBarItem::RightStatus
+                | TabBarItem::None
+                    if hide_tabs => {}
                 TabBarItem::LeftStatus => left_status.push(item_to_elem(item)),
                 TabBarItem::None | TabBarItem::RightStatus => right_eles.push(item_to_elem(item)),
                 TabBarItem::WindowButton(_) => {
@@ -423,6 +442,17 @@ impl crate::TermWindow {
             }
         }
 
+        // LBTerm: "Restart to update" while another build is installed, left of the window
+        // buttons (restart.rs)
+        if crate::restart::other_build_installed() {
+            let surface = if hide_tabs {
+                palette.background
+            } else {
+                self.config.window_frame.active_titlebar_bg.into()
+            };
+            right_eles.insert(0, crate::restart::pill_element(&font, &metrics, surface));
+        }
+
         let mut children = vec![];
 
         if !left_status.is_empty() {
@@ -441,7 +471,52 @@ impl crate::TermWindow {
                 || self.config.integrated_title_button_style
                     == IntegratedTitleButtonStyle::MacOsNative);
 
-        let left_padding = if window_buttons_at_left {
+        let mut border = self.get_os_border();
+        // LBTerm: the tab panel's strip is border for the panes, not for the
+        // tab bar, which runs above the panel (lbterm/TAB-PANEL.md)
+        border.left -= ::window::ULength::new(super::tab_panel::rail_width(
+            &self.config,
+            &self.dimensions,
+            &self.render_metrics,
+        ) as usize);
+        let bounds = euclid::rect(
+            border.left.get() as f32,
+            0.,
+            self.dimensions.pixel_width as f32 - (border.left + border.right).get() as f32,
+            tab_bar_height,
+        );
+
+        // LBTerm: the active tab's title and its Claude summary where the tabs would be, and
+        // by the buttons when the summary was written; under them, with a second row, the last
+        // prompt (render/strip.rs)
+        let mut strip_indent = None;
+        let mut prompt_row = None;
+        if hide_tabs && !window_buttons_at_left {
+            let first_row = euclid::rect(
+                bounds.min_x(),
+                bounds.min_y(),
+                bounds.width(),
+                tab_bar_height - super::strip::prompt_row_height(&self.config, &self.fonts)?,
+            );
+            if let Some(strip) = self.lbterm_strip_elements(
+                &font,
+                &metrics,
+                palette.background,
+                &right_eles,
+                first_row,
+            )? {
+                if let Some(caption) = strip.caption {
+                    right_eles.insert(0, caption);
+                }
+                left_eles.push(strip.words);
+                strip_indent = Some(strip.indent);
+                prompt_row = strip.prompt_row;
+            }
+        }
+
+        let left_padding = if let Some(indent) = strip_indent {
+            Dimension::Pixels(indent)
+        } else if window_buttons_at_left {
             if self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
             {
                 if !self.window_state.contains(window::WindowState::FULL_SCREEN) {
@@ -458,7 +533,12 @@ impl crate::TermWindow {
 
         children.push(
             Element::new(&font, ElementContent::Children(left_eles))
-                .vertical_align(tab_vertical_alignment)
+                // LBTerm: in the first row, over the second
+                .vertical_align(if prompt_row.is_some() {
+                    VerticalAlign::Top
+                } else {
+                    tab_vertical_alignment
+                })
                 .colors(bar_colors.clone())
                 .padding(BoxDimension {
                     left: left_padding,
@@ -473,6 +553,10 @@ impl crate::TermWindow {
                 .colors(bar_colors.clone())
                 .float(Float::Right),
         );
+        // LBTerm: the second row, a line of its own under the first
+        if let Some(row) = prompt_row {
+            children.push(row);
+        }
 
         let content = ElementContent::Children(children);
 
@@ -483,8 +567,6 @@ impl crate::TermWindow {
             .min_height(Some(Dimension::Pixels(tab_bar_height)))
             .vertical_align(tab_vertical_alignment)
             .colors(bar_colors);
-
-        let border = self.get_os_border();
 
         let mut computed = self.compute_element(
             &LayoutContext {
@@ -498,12 +580,7 @@ impl crate::TermWindow {
                     pixel_max: self.dimensions.pixel_width as f32,
                     pixel_cell: metrics.cell_size.width as f32,
                 },
-                bounds: euclid::rect(
-                    border.left.get() as f32,
-                    0.,
-                    self.dimensions.pixel_width as f32 - (border.left + border.right).get() as f32,
-                    tab_bar_height,
-                ),
+                bounds,
                 metrics: &metrics,
                 gl_state: self.render_state.as_ref().unwrap(),
                 zindex: 10,
@@ -529,6 +606,8 @@ impl crate::TermWindow {
             anyhow::anyhow!("paint_fancy_tab_bar called but fancy_tab_bar is None")
         })?;
         let ui_items = computed.ui_items();
+        // LBTerm: which button the pointer is over, so its hover fades (render/hover_fade.rs)
+        self.lbterm_hover_frame(computed);
 
         let gl_state = self.render_state.as_ref().unwrap();
         self.render_element(&computed, gl_state, None)?;

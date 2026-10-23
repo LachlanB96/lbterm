@@ -2,13 +2,15 @@ use clap::*;
 use config::configuration;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
-use mux::Mux;
+use mux::{Mux, MuxNotification};
 use portable_pty::cmdbuilder::CommandBuilder;
 use std::ffi::OsString;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use wezterm_gui_subcommands::*;
 use wezterm_mux_server_impl::update_mux_domains_for_server;
 
@@ -16,7 +18,8 @@ mod daemonize;
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    name = config::lbterm::MUX_SERVER_EXE,
+    about = config::lbterm::ABOUT,
     version = config::wezterm_version(),
     trailing_var_arg = true,
 )]
@@ -227,6 +230,7 @@ fn run() -> anyhow::Result<()> {
     let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
     let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
     Mux::set_mux(&mux);
+    exit_after_last_pane(&mux);
 
     let executor = promise::spawn::SimpleExecutor::new();
 
@@ -298,6 +302,33 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
             .await?;
     }
     Ok(())
+}
+
+/// LBTerm: end the server once its last pane has gone (LBTerm closing its
+/// windows kills their panes here), rather than idling on and serving the
+/// next LBTerm from an older build. A second's grace, so a pane spawned
+/// straight after the last one closed keeps it.
+fn exit_after_last_pane(mux: &Arc<Mux>) {
+    let had_panes = Arc::new(AtomicBool::new(false));
+    mux.subscribe(move |n| {
+        match n {
+            MuxNotification::PaneAdded(_) => had_panes.store(true, Ordering::SeqCst),
+            MuxNotification::Empty if had_panes.load(Ordering::SeqCst) => {
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_secs(1));
+                    promise::spawn::spawn_into_main_thread(async {
+                        if Mux::get().is_empty() {
+                            log::info!("the last pane has gone; exiting");
+                            std::process::exit(0);
+                        }
+                    })
+                    .detach();
+                });
+            }
+            _ => {}
+        }
+        true
+    });
 }
 
 fn terminate_with_error(err: anyhow::Error) -> ! {

@@ -316,6 +316,11 @@ end
                     .ok_or_else(|| anyhow!("config dir path is not UTF-8"))?,
             )
             .context("set wezterm.config_dir")?;
+        // LBTerm: lets a config shared with WezTerm tell the two apart
+        // (nil in WezTerm)
+        wezterm_mod
+            .set("app_name", crate::lbterm::APP_NAME)
+            .context("set wezterm.app_name")?;
 
         lua.set_named_registry_value("wezterm-watch-paths", Vec::<String>::new())?;
         wezterm_mod.set(

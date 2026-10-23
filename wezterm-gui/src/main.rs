@@ -45,14 +45,24 @@ mod overlay;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;
+mod restart;
+mod restore;
 mod scripting;
 mod scrollbar;
 mod selection;
 mod shapecache;
 mod spawn;
+mod conductor_hub;
 mod stats;
+mod state_files;
+mod state_probe;
+mod summaries;
+mod summon;
 mod tabbar;
+mod tab_ghost;
+mod tabcolors;
 mod termwindow;
+mod toasts;
 mod unicode_names;
 mod uniforms;
 mod update;
@@ -67,7 +77,8 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
+    name = config::lbterm::GUI_EXE,
+    about = config::lbterm::ABOUT,
     version = config::wezterm_version()
 )]
 struct Opt {
@@ -777,6 +788,12 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     let gui = crate::frontend::try_new()?;
     let activity = Activity::new();
+    // LBTerm: read the note of tabs the last LBTerm left, before writing ours (restore.rs)
+    if config.lbterm_crash_restore {
+        crate::restore::startup();
+    }
+    // LBTerm: the "Restart to update" pill (restart.rs)
+    crate::restart::watch();
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
@@ -787,7 +804,10 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    let result = gui.run_forever();
+    // LBTerm: closed normally, so nothing to offer next time
+    crate::restore::clean_exit();
+    result
 }
 
 fn fatal_toast_notification(title: &str, message: &str) {
@@ -830,6 +850,8 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
+    // LBTerm: started by a GUI restarting into the installed build? Then wait for it to go
+    crate::restart::wait_for_predecessor();
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();
@@ -1172,7 +1194,7 @@ fn run() -> anyhow::Result<()> {
     {
         unsafe {
             ::windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                ::windows::core::PCWSTR(wide_string("org.wezfurlong.wezterm").as_ptr()),
+                ::windows::core::PCWSTR(wide_string(config::lbterm::APP_ID).as_ptr()),
             )
             .unwrap();
         }
@@ -1233,7 +1255,7 @@ fn run() -> anyhow::Result<()> {
         Some(sub) => sub,
         None => {
             // Need to fake an argv0
-            let mut argv = vec!["wezterm-gui".to_string()];
+            let mut argv = vec![config::lbterm::GUI_EXE.to_string()];
             for a in &config.default_gui_startup_args {
                 argv.push(a.clone());
             }
