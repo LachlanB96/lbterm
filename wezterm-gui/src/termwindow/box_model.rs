@@ -1026,6 +1026,16 @@ impl super::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         inherited_colors: Option<&ElementColors>,
     ) -> anyhow::Result<()> {
+        // LBTerm: an element with rounded corners on whole pixels. Its corners are sprites placed
+        // where its border box starts and its edges are filled rectangles, and at a fraction of a
+        // pixel the two land on different rows and columns: the strip's context pill, centred in
+        // its row at about 22.4 px tall, drew a tick or a gap at each corner where its edges
+        // missed its arcs (lbterm/PITFALLS.md, 260)
+        let border_rect = if element.border_corners.is_some() {
+            lbterm_whole_pixels(element.border_rect)
+        } else {
+            element.border_rect
+        };
         let mut top_left_width = 0.;
         let mut top_left_height = 0.;
         let mut top_right_width = 0.;
@@ -1051,7 +1061,7 @@ impl super::TermWindow {
                 self.poly_quad(
                     layers,
                     0,
-                    element.border_rect.origin,
+                    border_rect.origin,
                     c.top_left.poly,
                     element.border.top as isize,
                     euclid::size2(top_left_width, top_left_height),
@@ -1064,8 +1074,8 @@ impl super::TermWindow {
                     layers,
                     0,
                     euclid::point2(
-                        element.border_rect.max_x() - top_right_width,
-                        element.border_rect.min_y(),
+                        border_rect.max_x() - top_right_width,
+                        border_rect.min_y(),
                     ),
                     c.top_right.poly,
                     element.border.top as isize,
@@ -1079,8 +1089,8 @@ impl super::TermWindow {
                     layers,
                     0,
                     euclid::point2(
-                        element.border_rect.min_x(),
-                        element.border_rect.max_y() - bottom_left_height,
+                        border_rect.min_x(),
+                        border_rect.max_y() - bottom_left_height,
                     ),
                     c.bottom_left.poly,
                     element.border.bottom as isize,
@@ -1094,8 +1104,8 @@ impl super::TermWindow {
                     layers,
                     0,
                     euclid::point2(
-                        element.border_rect.max_x() - bottom_right_width,
-                        element.border_rect.max_y() - bottom_right_height,
+                        border_rect.max_x() - bottom_right_width,
+                        border_rect.max_y() - bottom_right_height,
                     ),
                     c.bottom_right.poly,
                     element.border.bottom as isize,
@@ -1122,9 +1132,9 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x() + top_left_width,
-                    element.border_rect.min_y(),
-                    element.border_rect.width() - (top_left_width + top_right_width) as f32,
+                    border_rect.min_x() + top_left_width,
+                    border_rect.min_y(),
+                    border_rect.width() - (top_left_width + top_right_width) as f32,
                     top_left_height.max(top_right_height),
                 ),
                 LinearRgba::TRANSPARENT,
@@ -1136,9 +1146,9 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x() + bottom_left_width,
-                    element.border_rect.max_y() - bottom_left_height.max(bottom_right_height),
-                    element.border_rect.width() - (bottom_left_width + bottom_right_width),
+                    border_rect.min_x() + bottom_left_width,
+                    border_rect.max_y() - bottom_left_height.max(bottom_right_height),
+                    border_rect.width() - (bottom_left_width + bottom_right_width),
                     bottom_left_height.max(bottom_right_height),
                 ),
                 LinearRgba::TRANSPARENT,
@@ -1150,10 +1160,10 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x(),
-                    element.border_rect.min_y() + top_left_height,
+                    border_rect.min_x(),
+                    border_rect.min_y() + top_left_height,
                     top_left_width.max(bottom_left_width),
-                    element.border_rect.height() - (top_left_height + bottom_left_height),
+                    border_rect.height() - (top_left_height + bottom_left_height),
                 ),
                 LinearRgba::TRANSPARENT,
             )?;
@@ -1164,10 +1174,10 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.max_x() - top_right_width.max(bottom_right_width),
-                    element.border_rect.min_y() + top_right_height,
+                    border_rect.max_x() - top_right_width.max(bottom_right_width),
+                    border_rect.min_y() + top_right_height,
                     top_right_width.max(bottom_right_width),
-                    element.border_rect.height() - (top_right_height + bottom_right_height),
+                    border_rect.height() - (top_right_height + bottom_right_height),
                 ),
                 LinearRgba::TRANSPARENT,
             )?;
@@ -1178,10 +1188,10 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x() + top_left_width,
-                    element.border_rect.min_y() + top_right_height.min(top_left_height),
-                    element.border_rect.width() - (top_left_width + top_right_width),
-                    element.border_rect.height()
+                    border_rect.min_x() + top_left_width,
+                    border_rect.min_y() + top_right_height.min(top_left_height),
+                    border_rect.width() - (top_left_width + top_right_width),
+                    border_rect.height()
                         - (top_right_height.min(top_left_height)
                             + bottom_right_height.min(bottom_left_height)),
                 ),
@@ -1204,9 +1214,9 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x() + top_left_width as f32,
-                    element.border_rect.min_y(),
-                    element.border_rect.width() - (top_left_width + top_right_width) as f32,
+                    border_rect.min_x() + top_left_width as f32,
+                    border_rect.min_y(),
+                    border_rect.width() - (top_left_width + top_right_width) as f32,
                     element.border.top,
                 ),
                 colors.border.top,
@@ -1217,9 +1227,9 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x() + bottom_left_width as f32,
-                    element.border_rect.max_y() - element.border.bottom,
-                    element.border_rect.width() - (bottom_left_width + bottom_right_width) as f32,
+                    border_rect.min_x() + bottom_left_width as f32,
+                    border_rect.max_y() - element.border.bottom,
+                    border_rect.width() - (bottom_left_width + bottom_right_width) as f32,
                     element.border.bottom,
                 ),
                 colors.border.bottom,
@@ -1230,10 +1240,10 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.min_x(),
-                    element.border_rect.min_y() + top_left_height as f32,
+                    border_rect.min_x(),
+                    border_rect.min_y() + top_left_height as f32,
                     element.border.left,
-                    element.border_rect.height() - (top_left_height + bottom_left_height) as f32,
+                    border_rect.height() - (top_left_height + bottom_left_height) as f32,
                 ),
                 colors.border.left,
             )?;
@@ -1243,15 +1253,42 @@ impl super::TermWindow {
                 layers,
                 0,
                 euclid::rect(
-                    element.border_rect.max_x() - element.border.right,
-                    element.border_rect.min_y() + top_right_height as f32,
+                    border_rect.max_x() - element.border.right,
+                    border_rect.min_y() + top_right_height as f32,
                     element.border.left,
-                    element.border_rect.height() - (top_right_height + bottom_right_height) as f32,
+                    border_rect.height() - (top_right_height + bottom_right_height) as f32,
                 ),
                 colors.border.right,
             )?;
         }
 
         Ok(())
+    }
+}
+
+/// LBTerm: `r` with each edge rounded to a whole pixel, for drawing an element whose corners are
+/// sprites beside filled edges (render_element_background; lbterm/PITFALLS.md, 260)
+fn lbterm_whole_pixels(r: RectF) -> RectF {
+    let (x0, y0) = (r.min_x().round(), r.min_y().round());
+    let (x1, y1) = (r.max_x().round(), r.max_y().round());
+    euclid::rect(x0, y0, x1 - x0, y1 - y0)
+}
+
+#[cfg(test)]
+mod lbterm_whole_pixels_test {
+    use super::*;
+
+    #[test]
+    fn a_rect_on_fractions_lands_on_whole_pixels_edge_by_edge() {
+        // The context pill as laid out: 22.4 px tall, centred in a 24 px row a fraction down
+        let r = lbterm_whole_pixels(euclid::rect(20.5, 30.8, 61.2, 22.4));
+        assert_eq!((r.min_x(), r.min_y(), r.max_x(), r.max_y()), (21., 31., 82., 53.));
+        // Each edge rounds on its own, so two touching rects still touch
+        let a = lbterm_whole_pixels(euclid::rect(0.0, 0.0, 10.4, 5.0));
+        let b = lbterm_whole_pixels(euclid::rect(10.4, 0.0, 10.0, 5.0));
+        assert_eq!(a.max_x(), b.min_x());
+        // Whole already: as it was
+        let w = euclid::rect(3.0, 4.0, 5.0, 6.0);
+        assert_eq!(lbterm_whole_pixels(w), w);
     }
 }

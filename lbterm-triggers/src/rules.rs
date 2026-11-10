@@ -2,6 +2,8 @@
 
 use crate::colour::Rgb;
 use regex::{Regex, RegexSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -92,6 +94,45 @@ pub struct Cell<'a> {
     pub width: usize,
 }
 
+/// A line's text as the rules read it, made once from its cells: their text run together, and
+/// where each cell starts in it, its column and how many columns it takes. Built straight from a
+/// terminal line's cells (one String for the line, where each cell's text was a String of its own)
+#[derive(Debug, Clone, Default)]
+pub struct LineText {
+    text: String,
+    /// (byte offset where the cell's text starts, its column, its width)
+    cells: Vec<(usize, usize, usize)>,
+}
+
+impl LineText {
+    pub fn with_capacity(cells: usize) -> Self {
+        Self {
+            text: String::with_capacity(cells),
+            cells: Vec::with_capacity(cells),
+        }
+    }
+
+    /// The next cell: its column, its text and how many columns it takes
+    pub fn push(&mut self, col: usize, text: &str, width: usize) {
+        self.cells.push((self.text.len(), col, width));
+        self.text.push_str(text);
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// A hash of the text, so the same line seen on another row is known as the same
+    /// ([`crate::Seen`]): what it says, without the blanks after it, which a terminal's line
+    /// holds as many of as it was last cleared or written with (conpty's first screen and its
+    /// redraws of the same rows end them differently)
+    pub fn hash(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.text.trim_end().hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
 /// Something a rule matched in a line
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
@@ -100,6 +141,9 @@ pub struct Hit {
     /// The columns it covers
     pub cols: Range<usize>,
     pub text: String,
+    /// A hash of the line's text up to the match's end: the same match in its row while what's
+    /// before it is the same, as a reply streams on after it ([`crate::Seen`])
+    pub prefix: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -191,36 +235,42 @@ impl Rules {
 
     /// Everything the rules match in a line, in the order of the rules and then of the line
     pub fn find(&self, cells: &[Cell]) -> Vec<Hit> {
-        if self.rules.is_empty() || cells.is_empty() {
+        let mut line = LineText::with_capacity(cells.len());
+        for cell in cells {
+            line.push(cell.col, cell.text, cell.width);
+        }
+        self.find_in(&line)
+    }
+
+    /// The same, of a line's text made once ([`LineText`])
+    pub fn find_in(&self, line: &LineText) -> Vec<Hit> {
+        if self.rules.is_empty() || line.cells.is_empty() {
             return vec![];
         }
-        let mut text = String::new();
-        // (byte offset where the cell's text starts, index into cells)
-        let mut starts = Vec::with_capacity(cells.len());
-        for cell in cells {
-            starts.push(text.len());
-            text.push_str(cell.text);
-        }
-        let matching = self.set.matches(&text);
+        let text = &line.text;
+        let matching = self.set.matches(text);
         if !matching.matched_any() {
             return vec![];
         }
-        let cell_at = |byte: usize| match starts.binary_search(&byte) {
+        let cell_at = |byte: usize| match line.cells.binary_search_by_key(&byte, |c| c.0) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
         };
         let mut hits = vec![];
         for rule in matching.iter() {
-            for m in self.rules[rule].regex.find_iter(&text) {
+            for m in self.rules[rule].regex.find_iter(text) {
                 if m.start() == m.end() {
                     continue;
                 }
-                let first = &cells[cell_at(m.start())];
-                let last = &cells[cell_at(m.end() - 1)];
+                let (_, first, _) = line.cells[cell_at(m.start())];
+                let (_, last, width) = line.cells[cell_at(m.end() - 1)];
+                let mut hasher = DefaultHasher::new();
+                text[..m.end()].hash(&mut hasher);
                 hits.push(Hit {
                     rule,
-                    cols: first.col..last.col + last.width.max(1),
+                    cols: first..last + width.max(1),
                     text: m.as_str().to_string(),
+                    prefix: hasher.finish(),
                 });
             }
         }
@@ -329,6 +379,40 @@ mod tests {
         // the regex that compiled is kept, without the style and effect it got wrong
         assert_eq!(found(&rules, "x"), vec![("odd".to_string(), 0..1)]);
         assert_eq!(rules.get(2).style, None);
+    }
+
+    #[test]
+    fn a_line_made_once_finds_what_its_cells_do() {
+        let r = eggs();
+        let text = "I love LBTerm";
+        let mut line = LineText::default();
+        for c in cells(text) {
+            line.push(c.col, c.text, c.width);
+        }
+        assert_eq!(line.text(), text);
+        assert_eq!(r.find_in(&line), r.find(&cells(text)));
+        // The same text, the same hash; other text, another
+        let mut again = LineText::default();
+        for c in cells(text) {
+            again.push(c.col, c.text, c.width);
+        }
+        assert_eq!(line.hash(), again.hash());
+        let mut other = LineText::default();
+        other.push(0, "x", 1);
+        assert_ne!(line.hash(), other.hash());
+        // The blanks after the text are no part of it
+        let mut padded = again.clone();
+        padded.push(13, " ", 1);
+        padded.push(14, " ", 1);
+        assert_eq!(padded.hash(), line.hash());
+        // A wide cell's columns, from where it starts in the text
+        let mut wide = LineText::default();
+        wide.push(0, "漢", 2);
+        wide.push(2, " ", 1);
+        for (i, ch) in "love".chars().enumerate() {
+            wide.push(3 + i, &ch.to_string(), 1);
+        }
+        assert_eq!(r.find_in(&wide)[0].cols, 3..7);
     }
 
     #[test]

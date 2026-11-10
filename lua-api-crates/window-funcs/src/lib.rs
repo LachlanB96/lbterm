@@ -3,11 +3,24 @@ use config::lua::mlua::{self, Lua};
 use luahelper::impl_lua_conversion_dynamic;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use window::{Appearance, Connection, ConnectionOps};
 
+/// LBTerm: a config run asked for the GUI (its appearance, its screens) where it had none, and
+/// got a guess or an error. The GUI's start runs the config before its connection is up, and ran
+/// it a second time once it was, on the GUI thread, for every config, for these two
+static ASKED_WITHOUT_GUI: AtomicBool = AtomicBool::new(false);
+
+/// LBTerm: whether a config run has asked for the GUI where it had none since this was last asked
+/// (GuiFrontEnd::try_new runs the config again only then)
+pub fn asked_without_gui() -> bool {
+    ASKED_WITHOUT_GUI.swap(false, Ordering::Relaxed)
+}
+
 fn get_conn() -> mlua::Result<Rc<Connection>> {
     Connection::get().ok_or_else(|| {
+        ASKED_WITHOUT_GUI.store(true, Ordering::Relaxed);
         mlua::Error::external("cannot get window Connection: not running on the gui thread?")
     })
 }
@@ -96,6 +109,7 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
                 Some(conn) => conn.get_appearance().to_string(),
                 None => {
                     // Gui hasn't started yet, assume light
+                    ASKED_WITHOUT_GUI.store(true, Ordering::Relaxed);
                     Appearance::Light.to_string()
                 }
             })

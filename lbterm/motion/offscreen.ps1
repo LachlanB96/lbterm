@@ -49,8 +49,14 @@ function Get-LookalikeConfig {
 # what reaches outside the window. No summon key, which a window in
 # the background holds with RegisterHotKey, so his PageUp would go to the test window while it
 # runs; no mux domain; and no Conductor, whose pad would move the rail's tabs down a slot and whose
-# window would subscribe to his real hub (perf/conductor.ps1 gives its window one of its own).
-# And no reloading: WezTerm watches a config's folder (all but the home folder) as well as its
+# window would subscribe to his real hub (perf/conductor.ps1 gives its window one of its own); no
+# InMail button, which would count his real InMail (perf/inbox.ps1 gives its window folders of its
+# own, and his `lbterm-inbox-open` handler leaves alone a message from a folder that isn't his); no
+# agenda button, which would show his real list and watch its folder, and whose presses would run
+# his real list's commands (perf/agenda.ps1 gives its window a file of its own, and the button sits
+# in the strip where other tests read it); no file for the new-tab picker's recent picks, which would
+# be his (the picks stay in the window's memory; his lbterm-project-action and lbterm-reopen-tab
+# handlers step aside in a test window themselves). And no reloading: WezTerm watches a config's folder (all but the home folder) as well as its
 # files, so captures saved beside the config, a state file written there, or Lachlan saving
 # lbterm.lua would reload the window mid-run, re-running his whole config and putting "Config
 # reloaded" in the strip. A test of reloading turns it back on and gives its config a folder of
@@ -67,7 +73,16 @@ config.lbterm_summon = nil
 config.unix_domains = nil
 config.default_gui_startup_args = nil
 config.lbterm_crash_restore = false
+-- No WSL domains, whatever lbterm.lua says: unset, every spawn runs wsl.exe, which opens WSL's installer in front
+config.wsl_domains = {}
 rawset(config, 'lbterm_conductor', nil)
+rawset(config, 'lbterm_inbox', nil)
+rawset(config, 'lbterm_agenda', nil)
+rawset(config, 'lbterm_context', nil)
+rawset(config, 'lbterm_close_marks', nil)
+rawset(config, 'lbterm_links', nil)
+-- The new-tab picker's recent picks are his: a test window's stay in its memory (lbterm/NEW-TAB.md)
+if rawget(config, 'lbterm_projects') then config.lbterm_projects.recent_file = nil end
 config.automatically_reload_config = false
 $Lua
 return config

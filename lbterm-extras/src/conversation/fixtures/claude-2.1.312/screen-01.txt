@@ -1,0 +1,52 @@
+[38:2::80:80:80m[48:2::55:55:55m❯ List 30 animals, one per line, numbered, nothing else.[39m[K
+[49m  Chimpanzee
+  Dolphin
+  Eagle
+  Elephant
+  Falcon
+  Ferret
+  Flamingo
+  Giraffe
+  Gorilla
+  Hedgehog
+  Hippopotamus
+  Jaguar
+  Kangaroo
+  Koala
+  Lemur
+  Lion
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mSautéed for 2s · done 15:06[39m
+
+[38:2::153:153:153m[48:2::55:55:55m❯ [38:2::255:255:255mWrite a 12-line poem about terminals.[39m[K
+
+[38:2::255:255:255m[49m●[39m Blinking cursor, black glass, waiting still,
+  A single line of light on the dark screen.
+  Each command typed is a small, deliberate will,
+  And every answer scrolls in clean, green sheen.
+
+  Old commands ride the history like rails,
+  Piped and chained through pipes that never end,
+  Where a stray semicolon or a missing quote derails
+  The work, and sends you back to find the bend.
+
+  Yet here the tired hands can build and mend,
+  Each script a bridge across the glowing void,
+  And when the window closes, nothing's gone to end:
+  The session's saved, the work is safely deployed.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mCooked for 2s · done 15:06
+
+[48:2::55:55:55m❯ [38:2::255:255:255mRun the shell command: echo scroll probe[39m[K
+
+[49m  [38:2::153:153:153mRan (B[0;1m[38:2::153:153:153m1(B[0m[38:2::153:153:153m shell command 
+[39m                                    [38:2::255:255:255m[48:2::55:55:55m Jump to bottom (ctrl+End) ↓ 
+
+[38:2::136:136:136m[49m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m▸ probe summary line
+[39m  [38:2::153:153:153mhaiku | probe | main
+[39m  [38:2::153:153:153mtoggles line
+[39m  [38:2::175:135:255m⏵⏵ accept edits on[38:2::153:153:153m (shift+tab to cycle) · ← 2 agents
+[39m

@@ -21,7 +21,16 @@ fn main() {
                 // not. Watching only <repo.path()>/refs/heads/<branch>, a
                 // worktree's build kept the commit it was first built at.
                 let common = repo.commondir().to_path_buf();
-                let mut watch = vec![repo_path.join("HEAD"), common.join("packed-refs")];
+                // And HEAD's reflog, which every commit, checkout and reset in this worktree
+                // writes to: once git's housekeeping packs the refs (a commit's `gc --auto`
+                // can), the branch's loose ref is gone at the first build, so it isn't
+                // watched, and the next commit writes it anew without packed-refs changing
+                // (2026-10-25: a check's build stamped the commit before HEAD)
+                let mut watch = vec![
+                    repo_path.join("HEAD"),
+                    repo_path.join("logs").join("HEAD"),
+                    common.join("packed-refs"),
+                ];
                 if let Ok(resolved) = ref_head.resolve() {
                     if let Some(name) = resolved.name() {
                         watch.push(repo_path.join(name));

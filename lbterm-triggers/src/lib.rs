@@ -21,5 +21,5 @@ pub mod rules;
 pub mod seen;
 
 pub use colour::Rgb;
-pub use rules::{easter_eggs, Cell, Effect, Hit, Rule, Rules, Spec, Style};
+pub use rules::{easter_eggs, Cell, Effect, Hit, LineText, Rule, Rules, Spec, Style};
 pub use seen::{Fire, Seen};

@@ -11,6 +11,7 @@ use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use lazy_static::lazy_static;
+use lbterm_extras::placement::Placement;
 use promise::Future;
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
@@ -47,8 +48,6 @@ use winapi::um::uxtheme::{
 use winapi::um::wingdi::{LOGFONTW, MAKEPOINTS};
 use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
-use windows::UI::Color as WUIColor;
-use windows::UI::ViewManagement::{UIColorType, UISettings};
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
@@ -115,6 +114,15 @@ pub(crate) struct WindowInner {
 
     last_size: Option<Dimensions>,
     in_size_move: bool,
+    /// LBTerm: the size changed inside the sizing loop (WM_ENTERSIZEMOVE to WM_EXITSIZEMOVE), so
+    /// the window's tabs out of view, which take only the size a drag of the frame ends at, are
+    /// behind it (lbterm_extras::resize)
+    lbterm_sized_in_move: bool,
+    /// LBTerm: a drag of the frame that changed the size just ended (WM_EXITSIZEMOVE): the next
+    /// size check says so even when the size is the one the drag's last step gave, so the tabs
+    /// left behind get it. A move by the title bar, which changes no size, says nothing, as
+    /// upstream's said nothing
+    lbterm_size_move_ended: bool,
     dead_pending: Option<(Modifiers, u32)>,
     saved_placement: Option<WINDOWPLACEMENT>,
     track_mouse_leave: bool,
@@ -125,16 +133,28 @@ pub(crate) struct WindowInner {
     appearance: Appearance,
 
     config: ConfigHandle,
-    paint_throttled: bool,
+    /// LBTerm: until when the next frame is held back for max_fps, in place of upstream's
+    /// paint_throttled flag and its async-io timer (os/windows/pace.rs)
+    paint_held_until: Option<std::time::Instant>,
     invalidated: bool,
+    /// LBTerm: the screen the window was last painted on and its refresh rate, for the frame
+    /// pacing (os/windows/pace.rs)
+    lbterm_screen: Option<super::pace::Screen>,
+    /// LBTerm: whether the last paint's hold was for a window that couldn't be seen, a second
+    /// long, which ends as soon as it can be again; and what it's told of the session's lock and
+    /// the screens (os/windows/work.rs)
+    lbterm_unseen: bool,
+    lbterm_watch: super::work::Watch,
+
+    /// LBTerm: where the window opens and is kept (lbterm_extras::placement): the place to show
+    /// it at the first time it's shown, the place last reported, and who's told when it moves
+    lbterm_restore: Option<Placement>,
+    lbterm_placement: Option<Placement>,
+    lbterm_on_placement: Option<Box<dyn Fn(Placement)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct Window(HWindow);
-
-fn wuicolor_to_linearrgba(color: WUIColor) -> LinearRgba {
-    LinearRgba::with_srgba(color.R, color.G, color.B, 255)
-}
 
 fn rect_width(r: &RECT) -> i32 {
     r.right - r.left
@@ -326,8 +346,15 @@ impl WindowInner {
             .map(|&dims| dims == current_dims)
             .unwrap_or(false);
         self.last_size.replace(current_dims);
+        // LBTerm: the end of a drag of the frame that changed the size is said even at the same
+        // size, for the tabs it left behind, with no paint for it: the window's own layout is
+        // as the drag's last step left it
+        let ended = std::mem::take(&mut self.lbterm_size_move_ended);
+        if !same && self.in_size_move {
+            self.lbterm_sized_in_move = true;
+        }
 
-        if !same {
+        if !same || ended {
             self.set_ime_window_position(Rect::default());
 
             self.events.dispatch(WindowEvent::Resized {
@@ -416,6 +443,114 @@ impl Window {
     pub fn lbterm_hwnd(&self) -> isize {
         (self.0).0 as isize
     }
+
+    /// LBTerm: show the window at `restore` the first time it's shown, when that's on a screen
+    /// still there, and tell `changed` its place whenever it moves, is resized, maximised,
+    /// restored or snapped (lbterm_extras::placement). Call before `show`.
+    pub fn lbterm_keep_placement(&self, restore: Option<Placement>, changed: Box<dyn Fn(Placement)>) {
+        if let Some(inner) = rc_from_hwnd((self.0).0) {
+            let mut inner = inner.borrow_mut();
+            inner.lbterm_restore = restore.filter(|p| unsafe { on_a_screen(p) });
+            inner.lbterm_on_placement = Some(changed);
+        }
+    }
+}
+
+/// LBTerm: a window's place as Windows keeps it
+unsafe fn current_placement(hwnd: HWND) -> Option<Placement> {
+    let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    if GetWindowPlacement(hwnd, &mut placement) == 0 {
+        return None;
+    }
+    let r = placement.rcNormalPosition;
+    let maximized = placement.showCmd as i32 == SW_SHOWMAXIMIZED
+        || (placement.showCmd as i32 == SW_SHOWMINIMIZED
+            && placement.flags & WPF_RESTORETOMAXIMIZED != 0);
+    Some(Placement {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+        maximized,
+    })
+}
+
+/// LBTerm: whether a saved place is on a screen that's still there
+unsafe fn on_a_screen(p: &Placement) -> bool {
+    let rect = RECT {
+        left: p.left,
+        top: p.top,
+        right: p.right,
+        bottom: p.bottom,
+    };
+    !MonitorFromRect(&rect, MONITOR_DEFAULTTONULL).is_null()
+}
+
+/// LBTerm: shows the window at the place it was given to open at, once; false when it has none
+unsafe fn show_at_placement(hwnd: HWND, quiet: bool) -> bool {
+    let restore = match rc_from_hwnd(hwnd) {
+        Some(inner) => inner
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut inner| inner.lbterm_restore.take()),
+        None => None,
+    };
+    let Some(p) = restore else {
+        return false;
+    };
+    let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+    placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    let show = if p.maximized {
+        SW_SHOWMAXIMIZED
+    } else if quiet {
+        SW_SHOWNOACTIVATE
+    } else {
+        SW_SHOWNORMAL
+    };
+    placement.showCmd = show as u32;
+    placement.ptMinPosition = POINT { x: -1, y: -1 };
+    placement.ptMaxPosition = POINT { x: -1, y: -1 };
+    placement.rcNormalPosition = RECT {
+        left: p.left,
+        top: p.top,
+        right: p.right,
+        bottom: p.bottom,
+    };
+    log::info!("placement: shown where it was, {}", p.format().trim());
+    SetWindowPlacement(hwnd, &placement);
+    true
+}
+
+/// LBTerm: tells whoever keeps the window's place that it changed, once it's shown
+unsafe fn placement_changed(hwnd: HWND) {
+    if IsWindowVisible(hwnd) == 0 {
+        return;
+    }
+    let Some(inner) = rc_from_hwnd(hwnd) else {
+        return;
+    };
+    // Held already further up (a message sent from inside a change to the window): the next
+    // one tells
+    let Ok(mut inner) = inner.try_borrow_mut() else {
+        return;
+    };
+    if inner.lbterm_on_placement.is_none() || inner.lbterm_restore.is_some() {
+        return;
+    }
+    let Some(now) = current_placement(hwnd) else {
+        return;
+    };
+    if inner.lbterm_placement == Some(now) {
+        return;
+    }
+    inner.lbterm_placement = Some(now);
+    if let Some(changed) = inner.lbterm_on_placement.as_ref() {
+        changed(now);
+    }
+}
+
+impl Window {
 
     fn create_window(
         config: ConfigHandle,
@@ -554,14 +689,22 @@ impl Window {
             keyboard_info: KeyboardLayoutInfo::new(),
             last_size: None,
             in_size_move: false,
+            lbterm_sized_in_move: false,
+            lbterm_size_move_ended: false,
             dead_pending: None,
             saved_placement: None,
             track_mouse_leave: false,
             window_drag_position: None,
             maximize_button_position: None,
             config: config.clone(),
-            paint_throttled: false,
+            paint_held_until: None,
             invalidated: true,
+            lbterm_screen: None,
+            lbterm_unseen: false,
+            lbterm_watch: Default::default(),
+            lbterm_restore: None,
+            lbterm_placement: None,
+            lbterm_on_placement: None,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -620,15 +763,19 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
             // of the z-order, so closing the window in use never hands them
             // the keyboard either
             let quiet = std::env::var_os("LBTERM_NO_ACTIVATE").is_some();
-            ShowWindow(
-                hwnd.0,
-                match show {
-                    ShowWindowCommand::Normal if quiet => SW_SHOWNOACTIVATE,
-                    ShowWindowCommand::Normal => SW_NORMAL,
-                    ShowWindowCommand::Minimize => SW_MINIMIZE,
-                    ShowWindowCommand::Maximize => SW_MAXIMIZE,
-                },
-            );
+            // LBTerm: the first time, where the window was (lbterm_extras::placement)
+            let placed = matches!(show, ShowWindowCommand::Normal) && show_at_placement(hwnd.0, quiet);
+            if !placed {
+                ShowWindow(
+                    hwnd.0,
+                    match show {
+                        ShowWindowCommand::Normal if quiet => SW_SHOWNOACTIVATE,
+                        ShowWindowCommand::Normal => SW_NORMAL,
+                        ShowWindowCommand::Minimize => SW_MINIMIZE,
+                        ShowWindowCommand::Maximize => SW_MAXIMIZE,
+                    },
+                );
+            }
             if quiet && matches!(show, ShowWindowCommand::Normal) {
                 SetWindowPos(
                     hwnd.0,
@@ -657,6 +804,9 @@ impl WindowInner {
     }
 
     fn set_cursor(&mut self, cursor: Option<CursorIcon>) {
+        // LBTerm: the shape given last, so it's given again only when it changes
+        // (os/windows/work.rs)
+        super::work::cursor_given(self.hwnd.0, cursor);
         apply_mouse_cursor(cursor);
     }
 
@@ -703,6 +853,8 @@ impl WindowInner {
     }
 
     fn set_ime_window_position(&mut self, cursor: Rect) {
+        // LBTerm: counted (lbterm_extras::work)
+        lbterm_extras::work::WORK.ime();
         let imc = ImmContext::get(self.hwnd.0);
         match self.config.ime_preedit_rendering {
             ImePreeditRendering::Builtin => imc.set_candidate_window_position(cursor),
@@ -894,14 +1046,29 @@ impl WindowOps for Window {
     }
 
     fn set_cursor(&self, cursor: Option<CursorIcon>) {
+        // LBTerm: on the GUI thread, which asks for every pointer move over a pane, the shape
+        // goes to Windows only when it isn't the one given last; it went in a task of its own
+        // each time, unchanged (os/windows/work.rs)
+        if Connection::get().is_some() && !super::work::tell_cursor(self.0 .0, cursor) {
+            return;
+        }
         Connection::with_window_inner(self.0, move |inner| {
             inner.set_cursor(cursor);
             Ok(())
         });
     }
 
+    // LBTerm: who asked for the frame, by the caller's line, for the counters
+    // (lbterm_extras::counters); through a `dyn WindowOps`, lib.rs's inherent invalidate hands
+    // its caller to lbterm_invalidate_at
+    #[track_caller]
     fn invalidate(&self) {
+        self.lbterm_invalidate_at(std::panic::Location::caller())
+    }
+
+    fn lbterm_invalidate_at(&self, at: &'static std::panic::Location<'static>) {
         let hwnd = self.0 .0;
+        lbterm_extras::counters::request(hwnd as usize, at);
         log::trace!("WindowOps::invalidate calling InvalidateRect");
         unsafe {
             InvalidateRect(hwnd, null(), 0);
@@ -1027,14 +1194,12 @@ impl WindowOps for Window {
         let has_focus = unsafe { GetFocus() } == hwnd;
         let is_full_screen = window_state.contains(WindowState::FULL_SCREEN);
 
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let use_accent = hkcu
-            .open_subkey("SOFTWARE\\Microsoft\\Windows\\DWM")?
-            .get_value::<u32, _>("ColorPrevalence")?;
-        let settings = UISettings::new()?;
+        // LBTerm: ColorPrevalence and the accent colour as last read: every focus change read
+        // them again, the registry and a UISettings object (os/windows/work.rs)
+        let use_accent = super::work::accent_prevalence()?;
         let top_border_color = if has_focus {
             if use_accent == 1 {
-                wuicolor_to_linearrgba(settings.GetColorValue(UIColorType::Accent)?)
+                super::work::accent_colour()?
             } else {
                 if *IS_WIN10 {
                     LinearRgba(0.01, 0.01, 0.01, 0.67)
@@ -1136,6 +1301,9 @@ unsafe fn wm_nccreate(hwnd: HWND, _msg: UINT, _wparam: WPARAM, lparam: LPARAM) -
     let inner = rc_from_pointer(create.lpCreateParams);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as _);
     inner.borrow_mut().hwnd = HWindow(hwnd);
+    // LBTerm: told when the session locks and the screens go off, when it paints once a second
+    // (os/windows/work.rs)
+    inner.borrow_mut().lbterm_watch = super::work::watch(hwnd);
 
     None
 }
@@ -1153,6 +1321,8 @@ unsafe fn wm_ncdestroy(
     if !raw.is_null() {
         let inner = take_rc_from_pointer(raw);
         let mut inner = inner.borrow_mut();
+        // LBTerm: (os/windows/work.rs)
+        super::work::unwatch(hwnd, inner.lbterm_watch);
         inner.events.dispatch(WindowEvent::Destroyed);
         inner.hwnd = HWindow(null_mut());
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1578,9 +1748,15 @@ unsafe fn wm_enter_exit_size_move(
         let mut inner = inner.borrow_mut();
         inner.in_size_move = msg == WM_ENTERSIZEMOVE;
         should_size = !inner.in_size_move;
+        // LBTerm: the end of a drag that changed the size is said to the window even when the
+        // size is the drag's last (lbterm_extras::resize); a move that changed none, nothing
+        let sized = std::mem::take(&mut inner.lbterm_sized_in_move);
+        inner.lbterm_size_move_ended = should_size && sized;
     }
 
     if should_size {
+        // LBTerm: a move or resize by the frame is over: its new place is kept
+        placement_changed(hwnd);
         wm_size(hwnd, 0, 0, 0)?;
     }
 
@@ -1597,6 +1773,14 @@ unsafe fn wm_windowposchanged(
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
     // let pos = &*(lparam as *const WINDOWPOS);
+    // LBTerm: maximised, restored, snapped or moved by a key: its new place is kept. Not
+    // during a drag of the frame, which ends with WM_EXITSIZEMOVE
+    let dragging = rc_from_hwnd(hwnd).map_or(false, |inner| {
+        inner.try_borrow().map_or(false, |inner| inner.in_size_move)
+    });
+    if !dragging {
+        placement_changed(hwnd);
+    }
     wm_size(hwnd, 0, 0, 0)?;
     Some(0)
 }
@@ -1647,13 +1831,42 @@ unsafe fn wm_kill_focus(
     None
 }
 
+/// LBTerm: `inner`'s hold, due at `due` and asked for a frame during it, is up at `now`: it
+/// repaints, as upstream's timer task did (os/windows/pace.rs)
+pub(crate) fn end_paint_hold(
+    inner: &mut WindowInner,
+    due: std::time::Instant,
+    now: std::time::Instant,
+) {
+    if inner.invalidated && !inner.hwnd.0.is_null() {
+        lbterm_extras::pace::PACE.hold_ended(now.saturating_duration_since(due));
+        unsafe {
+            InvalidateRect(inner.hwnd.0, null(), 0);
+        }
+    }
+}
+
 unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    if inner.paint_throttled {
-        inner.invalidated = true;
-        return Some(0);
+    // LBTerm: held back for max_fps, the window is validated, or Windows would send this
+    // WM_PAINT again every time the queue is empty until the hold ended, and the loop would go
+    // round on it; the hold's end repaints, as it was asked (os/windows/pace.rs)
+    if let Some(until) = inner.paint_held_until {
+        // LBTerm: a hold for a window that couldn't be seen ends as soon as it can be again:
+        // restored, or the session unlocked or the screens on, which invalidate it
+        // (os/windows/work.rs)
+        let seen_again = inner.lbterm_unseen && !super::work::unseen(hwnd);
+        if !seen_again && lbterm_extras::pace::holding(Some(until), std::time::Instant::now()) {
+            inner.invalidated = true;
+            ValidateRect(hwnd, null());
+            if let Some(conn) = Connection::get() {
+                conn.paint_holds.wake(inner.hwnd, until);
+            }
+            lbterm_extras::pace::PACE.held();
+            return Some(0);
+        }
     }
 
     let mut ps = PAINTSTRUCT {
@@ -1673,24 +1886,32 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     // Do nothing right now
     EndPaint(hwnd, &mut ps);
 
+    // LBTerm: this paint is the frame asked for during the hold before it
+    let waited = inner.invalidated;
     inner.invalidated = false;
+    // LBTerm: the next frame is held back a period, a frame of max_fps and never less than a
+    // refresh of the window's screen, from this paint's start, or from the end of the hold it
+    // waited for. The message loop ends the hold on a high-resolution timer; upstream's async-io
+    // timer ended on Windows' 15.6 ms tick, counting from the paint's end in whole milliseconds
+    // (os/windows/pace.rs)
+    let started = std::time::Instant::now();
+    let refresh = super::pace::refresh_period(hwnd, &mut inner.lbterm_screen);
+    let period = lbterm_extras::pace::period(inner.config.max_fps, refresh);
+    // LBTerm: and a second while it can't be seen: minimized, the session locked or the screens
+    // off, when a frame shows nowhere and DWM takes few or none (os/windows/work.rs)
+    let unseen = super::work::unseen(hwnd);
+    if unseen {
+        lbterm_extras::work::WORK.unseen();
+    }
+    let period = lbterm_extras::work::period(period, unseen);
+    inner.lbterm_unseen = unseen;
+    let held = inner.paint_held_until.filter(|_| waited);
+    inner.paint_held_until = Some(lbterm_extras::pace::hold_until(started, held, period));
     // Ask the app to repaint in a bit
+    // LBTerm: what the paint cost the thread, counted (lbterm_extras::pace)
+    let cycles = super::pace::thread_cycles();
     inner.events.dispatch(WindowEvent::NeedRepaint);
-
-    inner.paint_throttled = true;
-    let window_id = inner.hwnd;
-    let max_fps = inner.config.max_fps;
-    promise::spawn::spawn(async move {
-        async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
-        Connection::with_window_inner(window_id, move |inner| {
-            inner.paint_throttled = false;
-            if inner.invalidated {
-                InvalidateRect(inner.hwnd.0, null(), 0);
-            }
-            Ok(())
-        });
-    })
-    .detach();
+    lbterm_extras::pace::PACE.painted(super::pace::thread_cycles().saturating_sub(cycles));
 
     Some(0)
 }
@@ -1716,7 +1937,12 @@ fn mods_and_buttons(wparam: WPARAM) -> (Modifiers, MouseButtons) {
     if wparam & MK_RBUTTON != 0 {
         buttons |= MouseButtons::RIGHT;
     }
-    // TODO: XBUTTON1 and XBUTTON2?
+    if wparam & MK_XBUTTON1 != 0 {
+        buttons |= MouseButtons::X1;
+    }
+    if wparam & MK_XBUTTON2 != 0 {
+        buttons |= MouseButtons::X2;
+    }
     (modifiers, buttons)
 }
 
@@ -1750,6 +1976,8 @@ fn client_to_screen(hwnd: HWND, point: Point) -> ScreenPoint {
 }
 
 fn apply_mouse_cursor(cursor: Option<CursorIcon>) {
+    // LBTerm: counted (lbterm_extras::work)
+    lbterm_extras::work::WORK.cursor();
     match cursor {
         None => unsafe {
             SetCursor(null_mut());
@@ -1812,6 +2040,19 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
             WM_RBUTTONUP => MouseEventKind::Release(MousePress::Right),
             WM_MBUTTONDOWN => MouseEventKind::Press(MousePress::Middle),
             WM_MBUTTONUP => MouseEventKind::Release(MousePress::Middle),
+            WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                // LBTerm: the side buttons, which upstream left to DefWindowProc
+                let press = if GET_XBUTTON_WPARAM(wparam) == XBUTTON1 {
+                    MousePress::Back
+                } else {
+                    MousePress::Forward
+                };
+                if msg == WM_XBUTTONDOWN {
+                    MouseEventKind::Press(press)
+                } else {
+                    MouseEventKind::Release(press)
+                }
+            }
             _ => return None,
         },
         coords,
@@ -1823,7 +2064,8 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
         .borrow_mut()
         .events
         .dispatch(WindowEvent::MouseEvent(event));
-    Some(0)
+    // An X button handled says TRUE, so Windows doesn't also send WM_APPCOMMAND's back or forward
+    Some(if matches!(msg, WM_XBUTTONDOWN | WM_XBUTTONUP) { 1 } else { 0 })
 }
 
 unsafe fn nc_mouse_button(
@@ -1919,7 +2161,8 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    if !inner.track_mouse_leave {
+    // LBTerm: a posted move hovers until a posted WM_NCMOUSELEAVE, as mouse_move's does
+    if !inner.track_mouse_leave && !lbterm_posted_pointer() {
         inner.track_mouse_leave = true;
 
         let mut trk = TRACKMOUSEEVENT {
@@ -1948,7 +2191,9 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
-    inner.events.dispatch(WindowEvent::NeedRepaint);
+    // LBTerm: no NeedRepaint after it, which painted a whole frame at once for every move over
+    // the button, around wm_paint's max_fps hold: the move's hover change asks for its frame
+    // through invalidate, as any move does (wezterm-gui's mouse_event_impl)
 
     Some(0)
 }
@@ -3030,6 +3275,8 @@ unsafe fn drop_files(hwnd: HWND, _msg: UINT, wparam: WPARAM, _lparam: LPARAM) ->
 }
 
 unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    // LBTerm: whether the mouse cursor's shape may be another's now (os/windows/work.rs)
+    super::work::cursor_message(hwnd, msg, wparam, lparam);
     match msg {
         WM_NCCREATE => wm_nccreate(hwnd, msg, wparam, lparam),
         WM_NCDESTROY => wm_ncdestroy(hwnd, msg, wparam, lparam),
@@ -3045,9 +3292,36 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_SIZING => {
             // Allow events to be processed during live resize
             crate::spawn::SPAWN_QUEUE.run();
+            // LBTerm: and the holds that are up to end, as their timer task did
+            // (os/windows/pace.rs)
+            if let Some(conn) = Connection::get() {
+                conn.end_paint_holds();
+            }
             None
         }
-        WM_SETTINGCHANGE | WM_DWMCOMPOSITIONCHANGED => apply_theme(hwnd),
+        // LBTerm: the screens' refresh rates may have changed, which the frame pacing reads
+        // (os/windows/pace.rs)
+        WM_DISPLAYCHANGE => {
+            super::pace::displays_changed();
+            None
+        }
+        WM_SETTINGCHANGE | WM_DWMCOMPOSITIONCHANGED => {
+            // LBTerm: the accent colour is read again when next asked (os/windows/work.rs)
+            super::work::accent_changed();
+            apply_theme(hwnd)
+        }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            super::work::accent_changed();
+            None
+        }
+        // LBTerm: the session locked or unlocked, or the screens went off or on: the next paint
+        // goes by it (os/windows/work.rs)
+        WM_WTSSESSION_CHANGE | WM_POWERBROADCAST => {
+            if super::work::session_message(msg, wparam, lparam) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            None
+        }
         WM_IME_SETCONTEXT => ime_set_context(hwnd, msg, wparam, lparam),
         WM_IME_COMPOSITION => ime_composition(hwnd, msg, wparam, lparam),
         WM_IME_ENDCOMPOSITION => ime_end_composition(hwnd, msg, wparam, lparam),
@@ -3055,7 +3329,8 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_MOUSELEAVE => mouse_leave(hwnd, msg, wparam, lparam),
         WM_MOUSEHWHEEL | WM_MOUSEWHEEL => mouse_wheel(hwnd, msg, wparam, lparam),
         WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK | WM_LBUTTONDOWN | WM_LBUTTONUP
-        | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP => {
+        | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN
+        | WM_XBUTTONUP => {
             mouse_button(hwnd, msg, wparam, lparam)
         }
         WM_DROPFILES => drop_files(hwnd, msg, wparam, lparam),
@@ -3104,6 +3379,11 @@ unsafe extern "system" fn wnd_proc(
         // (lbterm_extras::slow)
         let handled = {
             let _slow = lbterm_extras::slow::message(msg);
+            // A key or click that waited in the queue is timed from Windows' stamp on it
+            if lbterm_extras::slow::is_cause(msg) {
+                let waited = GetTickCount().wrapping_sub(GetMessageTime() as u32);
+                lbterm_extras::slow::queued(msg, std::time::Duration::from_millis(waited as u64));
+            }
             do_wnd_proc(hwnd, msg, wparam, lparam)
         };
         handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))

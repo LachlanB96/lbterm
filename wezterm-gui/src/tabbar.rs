@@ -40,6 +40,15 @@ pub enum TabBarItem {
     LbtermPrompt,
     /// LBTerm: the arrow before it, which lists the session's prompts (render/prompt.rs)
     LbtermPromptList,
+    /// LBTerm: the InMail button, over the tab rail, which lists the messages waiting
+    /// (render/inbox.rs)
+    LbtermInbox,
+    /// LBTerm: the agenda's button beside it, which lists what's to do, coming up and failing
+    /// (render/agenda.rs)
+    LbtermAgenda,
+    /// LBTerm: the pill under the InMail button, with what the open tab's Claude conversation has
+    /// cost, which lists the files in its context (render/context.rs)
+    LbtermContext,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,7 +77,9 @@ fn call_format_tab_title(
     tab_max_width: usize,
 ) -> Option<TitleText> {
     match config::run_immediate_with_lua_config(|lua| {
-        if let Some(lua) = lua {
+        // LBTerm: the arguments only for a handler, which is all that reads them
+        if let Some(lua) = lua.filter(|lua| config::lua::has_event_handler(lua, "format-tab-title"))
+        {
             let tabs = lua.create_sequence_from(tab_info.iter().cloned())?;
             let panes = lua.create_sequence_from(pane_info.iter().cloned())?;
 
@@ -476,7 +487,11 @@ impl TabBarState {
 
         let mut active_tab_no = 0;
 
-        let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
+        // LBTerm: not while the tab panel hides the bar's tabs (fancy_tab_bar.rs draws none then):
+        // each title is a format-tab-title call with every tab, pane and the whole config
+        let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar
+            && !config::lbterm::hides_tabs(config)
+        {
             tab_info
                 .iter()
                 .map(|tab| {

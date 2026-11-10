@@ -10,6 +10,7 @@ members = [
   "lbterm-notify",
   "lbterm-panel",
   "lbterm-triggers",
+  "lbterm-unify",
   "wezterm",
   "wezterm-blob-leases",
   "wezterm-cell",
@@ -292,3 +293,6 @@ zvariant = "4.0"
 # We use our own vendored cairo, which has minimal deps and should just
 # build via cargo.
 cairo-sys-rs = {path="deps/cairo", version="0.18.0"}
+# LBTerm: notify with its Windows watcher's thread asleep until something changes, where it woke
+# ten times a second (deps/notify/LBTERM.md)
+notify = {path="deps/notify", version="5.2.0"}

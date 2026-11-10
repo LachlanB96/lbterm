@@ -197,7 +197,17 @@ impl Inner {
             },
         ];
 
+        // LBTerm: asleep while periodic_stat_logging is off (its default), until a config reload
+        // may have turned it on; it woke every second to find it off
+        let (reloaded, reloads) = std::sync::mpsc::channel();
+        let _subscription = config::subscribe_to_config_reload(move || reloaded.send(()).is_ok());
         loop {
+            if configuration().periodic_stat_logging == 0 {
+                if reloads.recv().is_err() {
+                    break;
+                }
+                continue;
+            }
             std::thread::sleep(Duration::from_secs(1));
 
             if !ENABLE_STAT_PRINT.load(Ordering::Acquire) {
@@ -296,6 +306,32 @@ impl Stats {
     }
 }
 
+// LBTerm: each thread's handles, so a key it has recorded before costs no lock and no SipHash
+// lookup in the maps above (lbterm_extras::recorder; lbterm/PERF.md, "What upstream's metrics
+// cost"): metrics 0.23 asks for the handle again on every histogram! and counter!
+thread_local! {
+    static LBTERM_HISTOGRAMS: std::cell::RefCell<lbterm_extras::recorder::Handles<metrics::Histogram>> =
+        std::cell::RefCell::new(lbterm_extras::recorder::Handles::new());
+    static LBTERM_COUNTERS: std::cell::RefCell<lbterm_extras::recorder::Handles<Counter>> =
+        std::cell::RefCell::new(lbterm_extras::recorder::Handles::new());
+}
+
+/// The thread's handle for `key`, `register`'s the first time; as a thread ends, once its
+/// handles have gone, `register`'s each time
+fn lbterm_kept<V: Clone + 'static>(
+    kept: &'static std::thread::LocalKey<std::cell::RefCell<lbterm_extras::recorder::Handles<V>>>,
+    key: &Key,
+    register: impl FnOnce() -> V,
+) -> V {
+    let mut register = Some(register);
+    kept.try_with(|handles| {
+        handles
+            .borrow_mut()
+            .get(key, || (register.take().expect("registered once"))())
+    })
+    .unwrap_or_else(|_| (register.take().expect("registered once"))())
+}
+
 impl Recorder for Stats {
     fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
@@ -304,17 +340,19 @@ impl Recorder for Stats {
     fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata) -> Counter {
-        let mut inner = self.inner.lock();
-        match inner.counters.get(key) {
-            Some(existing) => Counter::from_arc(existing.clone()),
-            None => {
-                let counter = Arc::new(MyCounter {
-                    value: AtomicUsize::new(0),
-                });
-                inner.counters.insert(key.clone(), counter.clone());
-                metrics::Counter::from_arc(counter)
+        lbterm_kept(&LBTERM_COUNTERS, key, || {
+            let mut inner = self.inner.lock();
+            match inner.counters.get(key) {
+                Some(existing) => Counter::from_arc(existing.clone()),
+                None => {
+                    let counter = Arc::new(MyCounter {
+                        value: AtomicUsize::new(0),
+                    });
+                    inner.counters.insert(key.clone(), counter.clone());
+                    metrics::Counter::from_arc(counter)
+                }
             }
-        }
+        })
     }
 
     fn register_gauge(&self, _key: &Key, _metadata: &Metadata) -> Gauge {
@@ -322,35 +360,37 @@ impl Recorder for Stats {
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata) -> metrics::Histogram {
-        let mut inner = self.inner.lock();
-        if key.name().ends_with(".rate") {
-            match inner.throughput.get(key) {
-                Some(existing) => metrics::Histogram::from_arc(existing.clone()),
-                None => {
-                    let tput = Arc::new(Throughput::new());
-                    inner.throughput.insert(key.clone(), tput.clone());
+        lbterm_kept(&LBTERM_HISTOGRAMS, key, || {
+            let mut inner = self.inner.lock();
+            if key.name().ends_with(".rate") {
+                match inner.throughput.get(key) {
+                    Some(existing) => metrics::Histogram::from_arc(existing.clone()),
+                    None => {
+                        let tput = Arc::new(Throughput::new());
+                        inner.throughput.insert(key.clone(), tput.clone());
 
-                    metrics::Histogram::from_arc(tput)
+                        metrics::Histogram::from_arc(tput)
+                    }
+                }
+            } else {
+                match inner.histograms.get(key) {
+                    Some(existing) => metrics::Histogram::from_arc(existing.clone()),
+                    None => {
+                        let scale = if key.name().ends_with(".size") {
+                            1.0
+                        } else {
+                            // Assume seconds; convert to nanoseconds
+                            1_000_000_000.0
+                        };
+
+                        let histogram = ScaledHistogram::new(scale);
+                        inner.histograms.insert(key.clone(), histogram.clone());
+
+                        metrics::Histogram::from_arc(histogram)
+                    }
                 }
             }
-        } else {
-            match inner.histograms.get(key) {
-                Some(existing) => metrics::Histogram::from_arc(existing.clone()),
-                None => {
-                    let scale = if key.name().ends_with(".size") {
-                        1.0
-                    } else {
-                        // Assume seconds; convert to nanoseconds
-                        1_000_000_000.0
-                    };
-
-                    let histogram = ScaledHistogram::new(scale);
-                    inner.histograms.insert(key.clone(), histogram.clone());
-
-                    metrics::Histogram::from_arc(histogram)
-                }
-            }
-        }
+        })
     }
 }
 
@@ -435,4 +475,76 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         })?,
     )?;
     Ok(())
+}
+
+/// LBTerm: every histogram and counter, as the control pipe's `metrics` reports them
+/// (lbterm/PERF.md, crate::counters), each started again with `reset`
+pub fn lbterm_snapshot(
+    reset: bool,
+) -> (Vec<lbterm_extras::counters::Histogram>, Vec<(String, u64)>) {
+    use lbterm_extras::counters::{key_name, Histogram as Read, Unit};
+    let name = |key: &Key| key_name(key.name(), key.labels().map(|l| (l.key(), l.value())));
+    let read = |name: String, unit: Unit, h: &Histogram<u64>| Read {
+        name,
+        unit,
+        count: h.len(),
+        mean: h.mean(),
+        p50: h.value_at_quantile(0.50),
+        p95: h.value_at_quantile(0.95),
+        p99: h.value_at_quantile(0.99),
+        max: h.max(),
+    };
+    // The recorder's lock only long enough to take its lists: every histogram! on the GUI thread
+    // takes it to find its histogram, so the percentiles are worked out after it's let go, each
+    // histogram's own lock held only while it's read
+    let (scaled, throughput, counted) = {
+        let inner = INNER.lock();
+        let scaled: Vec<(Key, Arc<ScaledHistogram>)> =
+            inner.histograms.iter().map(|(k, h)| (k.clone(), Arc::clone(h))).collect();
+        let throughput: Vec<(Key, Arc<Throughput>)> =
+            inner.throughput.iter().map(|(k, t)| (k.clone(), Arc::clone(t))).collect();
+        let counted: Vec<(Key, Arc<MyCounter>)> =
+            inner.counters.iter().map(|(k, c)| (k.clone(), Arc::clone(c))).collect();
+        (scaled, throughput, counted)
+    };
+    let mut histograms = vec![];
+    for (key, histogram) in &scaled {
+        let mut h = histogram.hist.lock();
+        let unit = if key.name().ends_with(".size") {
+            Unit::Plain
+        } else {
+            Unit::Nanoseconds
+        };
+        histograms.push(read(name(key), unit, &h));
+        if reset {
+            h.reset();
+        }
+    }
+    for (key, tput) in &throughput {
+        let mut t = tput.inner.lock();
+        // The second under way is counted once it's over
+        t.current();
+        histograms.push(read(name(key), Unit::PerSecond, &t.hist));
+        if reset {
+            t.hist.reset();
+            t.count = 0;
+            t.last = None;
+        }
+    }
+    histograms.retain(|h| h.count > 0);
+    histograms.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut counters: Vec<(String, u64)> = counted
+        .iter()
+        .map(|(key, c)| {
+            let value = if reset {
+                c.value.swap(0, Ordering::Relaxed)
+            } else {
+                c.value.load(Ordering::Relaxed)
+            };
+            (name(key), value as u64)
+        })
+        .filter(|(_, v)| *v > 0)
+        .collect();
+    counters.sort();
+    (histograms, counters)
 }

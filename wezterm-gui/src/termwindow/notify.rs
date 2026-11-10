@@ -134,7 +134,7 @@ impl TermWindow {
         // w > 0: LBTerm takes it down itself, so it's sure to go
         if expire_ms > 0 {
             promise::spawn::spawn(async move {
-                smol::Timer::after(std::time::Duration::from_millis(expire_ms as u64)).await;
+                lbterm_extras::counters::timer(smol::Timer::after(std::time::Duration::from_millis(expire_ms as u64))).await;
                 toasts::hide(&toast_tag);
             })
             .detach();

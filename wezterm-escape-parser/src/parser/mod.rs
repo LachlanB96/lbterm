@@ -67,6 +67,9 @@ struct ParseState {
 pub struct Parser {
     state_machine: VTParser,
     state: RefCell<ParseState>,
+    /// LBTerm: a run of printable ASCII given to `parse`'s callback as one PrintString, not a
+    /// Print a character (lbterm_print_runs)
+    print_runs: bool,
 }
 
 impl Default for Parser {
@@ -80,7 +83,15 @@ impl Parser {
         Self {
             state_machine: VTParser::new(),
             state: RefCell::new(Default::default()),
+            print_runs: false,
         }
+    }
+
+    /// LBTerm: `parse` gives a run of printable ASCII to its callback as one
+    /// Action::PrintString, for a caller that takes PrintString as it takes Print (the terminal
+    /// model, the mux's parser thread); off, a Print a character, as upstream gives them
+    pub fn lbterm_print_runs(&mut self, on: bool) {
+        self.print_runs = on;
     }
 
     /// advance with tmux parser, bypass VTParse
@@ -111,6 +122,7 @@ impl Parser {
                     let mut perform = Performer {
                         callback: &mut callback,
                         state: &mut parser_state,
+                        print_runs: false,
                     };
                     self.state_machine
                         .parse(unparsed_str.as_bytes(), &mut perform);
@@ -122,6 +134,7 @@ impl Parser {
         let mut perform = Performer {
             callback: &mut callback,
             state: &mut self.state.borrow_mut(),
+            print_runs: self.print_runs,
         };
         self.state_machine.parse(bytes, &mut perform);
     }
@@ -147,6 +160,7 @@ impl Parser {
                     *first.borrow_mut() = Some(action);
                 },
                 state: &mut self.state.borrow_mut(),
+                print_runs: false,
             };
             for (idx, b) in bytes.iter().enumerate() {
                 self.state_machine.parse_byte(*b, &mut perform);
@@ -184,6 +198,7 @@ impl Parser {
                 &mut Performer {
                     callback: &mut |action| actions.push(action),
                     state: &mut self.state.borrow_mut(),
+                    print_runs: false,
                 },
             );
             if !actions.is_empty() && self.state_machine.is_ground() {
@@ -199,6 +214,8 @@ impl Parser {
 struct Performer<'a, F: FnMut(Action) + 'a> {
     callback: &'a mut F,
     state: &'a mut ParseState,
+    /// LBTerm: Parser::lbterm_print_runs
+    print_runs: bool,
 }
 
 fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
@@ -213,6 +230,16 @@ fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
 impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     fn print(&mut self, c: char) {
         (self.callback)(Action::Print(c));
+    }
+
+    fn print_ascii(&mut self, s: &str) {
+        if self.print_runs {
+            (self.callback)(Action::PrintString(s.to_string()));
+        } else {
+            for c in s.chars() {
+                (self.callback)(Action::Print(c));
+            }
+        }
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {

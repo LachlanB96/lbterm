@@ -26,3 +26,13 @@ then the files can be copied from `bin/x64/Release` to this location.
 It's possible that you'll need to download this runtime support package
 from MS in order for this to work:
 https://www.microsoft.com/en-us/download/details.aspx?id=53175
+
+LBTerm: since 2026-10-31 these are 1.25.2609.30003, the x64 files of
+Microsoft's `Microsoft.Windows.Console.ConPTY` package 1.25.260930003 from
+nuget.org (`runtimes/win-x64/native/conpty.dll` and
+`build/native/runtimes/x64/OpenConsole.exe`, both signed by Microsoft
+Corporation), where upstream's 1.22.2502.04002 came from the same package's
+1.22.250204002. Measured in the same LBTerm build, they take output with
+dense SGR colour 19 to 24% faster with about a quarter less of their own
+CPU, and everything else the same (lbterm/BENCH.md, "ConPTY 1.22, 1.24 and
+1.25").

@@ -10,8 +10,10 @@ use anyhow::Context;
 use config::{HsbTransform, TextStyle};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use termwiz::cell::{unicode_column_width, Blink};
+use termwiz::hyperlink::Hyperlink;
 use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
@@ -34,6 +36,7 @@ impl crate::TermWindow {
             // rendering the top row, so we have nothing more to do here.
             return Ok(RenderScreenLineResult {
                 invalidate_on_hover_change: false,
+                lbterm_links: vec![],
             });
         }
 
@@ -117,23 +120,25 @@ impl crate::TermWindow {
 
         let mut shaped = None;
         let mut invalidate_on_hover_change = false;
+        let mut lbterm_links = vec![];
 
         if let Some(shape_key) = &params.shape_key {
             let mut cache = self.line_to_ele_shape_cache.borrow_mut();
             if let Some(entry) = cache.get(shape_key) {
                 let expired = entry.expires.map(|i| Instant::now() >= i).unwrap_or(false);
-                let hover_changed = if entry.invalidate_on_hover_change {
-                    !same_hyperlink(
+                // LBTerm: only when which of its own links is under the pointer changes
+                // (lbterm_extras::link_looks::hover_changed)
+                let hover_changed = entry.invalidate_on_hover_change
+                    && lbterm_extras::link_looks::hover_changed(
+                        &entry.lbterm_links,
                         entry.current_highlight.as_ref(),
                         self.current_highlight.as_ref(),
-                    )
-                } else {
-                    false
-                };
+                    );
 
                 if !expired && !hover_changed {
                     self.update_next_frame_time(entry.expires);
                     shaped.replace(Rc::clone(&entry.shaped));
+                    lbterm_links = entry.lbterm_links.clone();
                 }
 
                 invalidate_on_hover_change = entry.invalidate_on_hover_change;
@@ -152,8 +157,11 @@ impl crate::TermWindow {
                 shape_key: &params.shape_key,
             };
 
-            let (shaped, invalidate_on_hover) = self.build_line_element_shape(params)?;
+            // LBTerm: a line shaped again, counted (lbterm_extras::work)
+            lbterm_extras::work::WORK.line_shape();
+            let (shaped, invalidate_on_hover, links) = self.build_line_element_shape(params)?;
             invalidate_on_hover_change = invalidate_on_hover;
+            lbterm_links = links;
             shaped
         };
 
@@ -304,6 +312,21 @@ impl crate::TermWindow {
         } else {
             0.0..0.0
         };
+
+        // LBTerm: a #RRGGBB code's bar in its colour along the foot of its cells, over the
+        // selection's background, found from the row's own cells so it's kept with these quads
+        // by what the row shows (render/hex.rs, lbterm/HEX.md)
+        if params.config.lbterm_hex_colours && !is_tab_bar {
+            self.lbterm_hex_bars(
+                &params,
+                &shaped,
+                layers,
+                bounding_rect,
+                cell_width,
+                direction,
+                hsv,
+            )?;
+        }
 
         // Render composition/IME preview background
         if composition_width > 0 {
@@ -747,13 +770,14 @@ impl crate::TermWindow {
 
         Ok(RenderScreenLineResult {
             invalidate_on_hover_change,
+            lbterm_links,
         })
     }
 
     fn build_line_element_shape(
         &self,
         params: LineToElementParams,
-    ) -> anyhow::Result<(Rc<Vec<LineToElementShape>>, bool)> {
+    ) -> anyhow::Result<(Rc<Vec<LineToElementShape>>, bool, Vec<Arc<Hyperlink>>)> {
         let (bidi_enabled, bidi_direction) = params.line.bidi_info();
         let bidi_hint = if bidi_enabled {
             Some(bidi_direction)
@@ -785,6 +809,8 @@ impl crate::TermWindow {
         let mut x_pos = 0.;
         let mut expires = None;
         let mut invalidate_on_hover_change = false;
+        // LBTerm: the links the line holds (lbterm_extras::link_looks::hover_changed)
+        let mut lbterm_links = vec![];
 
         for cluster in &cell_clusters {
             if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
@@ -792,18 +818,29 @@ impl crate::TermWindow {
                 let attrs = &cluster.attrs;
                 let style = self.fonts.match_style(params.config, attrs);
                 let hyperlink = attrs.hyperlink();
+                // LBTerm: a picture's rows aren't underlined; its hairline lights instead
+                // (render/thumbnails.rs)
                 let is_highlited_hyperlink =
-                    same_hyperlink(hyperlink, self.current_highlight.as_ref());
-                if hyperlink.is_some() {
+                    same_hyperlink(hyperlink, self.current_highlight.as_ref())
+                        && !hyperlink.is_some_and(|link| self.lbterm_thumbnail_row(link));
+                if let Some(link) = hyperlink {
                     invalidate_on_hover_change = true;
+                    lbterm_extras::link_looks::add_link(&mut lbterm_links, link);
                 }
+                // LBTerm: a link to an InMail message, in the waiting orange while it waits and
+                // grey, struck through, once it's gone (render/inbox.rs); an image's caption grey
+                // and struck through once its file has gone (render/thumbnails.rs)
+                let inbox_link = hyperlink.and_then(|link| {
+                    self.lbterm_inbox_link(link)
+                        .or_else(|| self.lbterm_thumbnail_link(link))
+                });
                 // underline and strikethrough
                 let underline_tex_rect = gl_state
                     .glyph_cache
                     .borrow_mut()
                     .cached_line_sprite(
                         is_highlited_hyperlink,
-                        attrs.strikethrough(),
+                        attrs.strikethrough() || matches!(inbox_link, Some((_, true))),
                         attrs.underline(),
                         attrs.overline(),
                         &self.render_metrics,
@@ -819,6 +856,7 @@ impl crate::TermWindow {
                     &params.config,
                     style,
                 );
+                let fg_color = inbox_link.map_or(fg_color, |(color, _)| color);
                 let (fg_color, bg_color, bg_is_default) = {
                     let mut fg = fg_color;
                     let mut bg = bg_color;
@@ -935,10 +973,11 @@ impl crate::TermWindow {
                     } else {
                         None
                     },
+                    lbterm_links: lbterm_links.clone(),
                 },
             );
         }
 
-        Ok((shaped, invalidate_on_hover_change))
+        Ok((shaped, invalidate_on_hover_change, lbterm_links))
     }
 }

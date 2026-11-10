@@ -12,9 +12,11 @@
 //! clicks (`prompts::Jump`). It runs between frames on the GUI thread's executor, a key and a
 //! look at a time, and marks the row it lands on for a moment.
 //!
-//! The list is drawn in z-layers 63 to 65, beside the tab menu's in the compositor's `top`
-//! visual, over the tab panel; the mark in z-layer 26, in `over`.
+//! The list is drawn in z-layers 63 to 65, its slot's in the menus' visuals over the tab panel,
+//! fading in and out with its highlight gliding between rows (render/menu_fade.rs,
+//! `Slot::Prompt`); the mark in z-layer 26, in `over`.
 
+use crate::termwindow::render::menu_fade::Slot;
 use crate::termwindow::box_model::{BorderColor, Element, ElementColors, ElementContent, LayoutContext};
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
@@ -36,12 +38,16 @@ use wezterm_term::{
 };
 use window::color::LinearRgba;
 
-/// The list's light, card and words: in the tab menu's range, so the compositor's `top`
-const GLOW_Z: i8 = 63;
-const CARD_Z: i8 = 64;
-const TEXT_Z: i8 = 65;
+/// The list's card and words, its slot's (render/menu_fade.rs): 63 is its glow's
+const CARD_Z: i8 = Slot::Prompt.card_z();
+const TEXT_Z: i8 = Slot::Prompt.text_z();
 /// The mark on the row a jump lands on, in `over`
 const MARK_Z: i8 = 26;
+
+/// Claude Code's history.jsonl as read so far (its path, and where each session's prompts are in
+/// it), for every window: each click reads only what was added since the last, and the prompts of
+/// the session it's for
+static HISTORY: std::sync::Mutex<Option<(String, prompts::History)>> = std::sync::Mutex::new(None);
 
 /// How long the mark and a note stay
 const MARK_FOR: Duration = Duration::from_millis(1600);
@@ -130,52 +136,85 @@ fn srgb(rgb: u32, alpha: f64) -> LinearRgba {
     LinearRgba::with_srgba(r, g, b, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-fn grow(r: Rect, by: f64) -> Rect {
-    Rect {
-        x: r.x - by,
-        y: r.y - by,
-        w: r.w + 2.0 * by,
-        h: r.h + 2.0 * by,
+/// A colour set as RGB, in bytes; `None` for the default or a palette colour
+fn rgb(colour: ColorAttribute) -> Option<(u8, u8, u8)> {
+    match colour {
+        ColorAttribute::TrueColorWithPaletteFallback(c, _) | ColorAttribute::TrueColorWithDefaultFallback(c) => {
+            let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            Some((byte(c.0), byte(c.1), byte(c.2)))
+        }
+        _ => None,
     }
 }
 
-/// The pane's screen as a jump reads it: each row's text, and whether the cell under the mark
-/// it starts with is on Claude Code's message band (any background but the default)
-fn read_rows(pane: &Arc<dyn Pane>) -> Vec<Row> {
+/// The pane's screen as a jump reads it: each row's text, whether the cell under the mark it
+/// starts with is on Claude Code's message band (any background but the default), and whether
+/// the words after it are dim there (the sticky header)
+pub(crate) fn read_rows(pane: &Arc<dyn Pane>) -> Vec<Row> {
     let dims = pane.get_dimensions();
     let top = dims.physical_top;
     let (_, lines) = pane.get_lines(top..top + dims.viewport_rows as StableRowIndex);
     lines
         .iter()
         .map(|line| {
-            let first = line.visible_cells().find(|c| !c.str().trim().is_empty());
-            let band = first.map_or(false, |c| {
+            let mut cells = line.visible_cells().filter(|c| !c.str().trim().is_empty());
+            let first = cells.next();
+            let band = first.as_ref().map_or(false, |c| {
                 c.str().starts_with(prompts::MARK) && c.attrs().background() != ColorAttribute::Default
             });
+            // Claude Code's sticky header is on the band too, its words grey on grey
+            let dim = band && {
+                let bg = first.as_ref().and_then(|c| rgb(c.attrs().background())).unwrap_or((0, 0, 0));
+                cells.next().map_or(false, |w| {
+                    let faint = w.attrs().intensity() == wezterm_term::Intensity::Half;
+                    let under = rgb(w.attrs().background()).unwrap_or(bg);
+                    prompts::dim_words(rgb(w.attrs().foreground()), under, faint)
+                })
+            };
             Row {
                 text: line.as_str().into_owned(),
                 band,
+                dim,
             }
         })
         .collect()
 }
 
+/// The pane's screen as [`read_rows`] reads it, and whether the pane had every row of it to
+/// give as it is (a mux pane's client may still be fetching one, render/questions.rs's
+/// `rows_held`)
+fn read_rows_held(pane: &Arc<dyn Pane>) -> (Vec<Row>, bool) {
+    let rows = read_rows(pane);
+    let dims = pane.get_dimensions();
+    let top = dims.physical_top;
+    let held = crate::termwindow::render::questions::rows_held(pane, top..top + dims.viewport_rows as StableRowIndex);
+    (rows, held)
+}
+
 /// The screen once Claude Code has drawn what the last key asked for: nothing new from the
-/// pane, and the same rows, for [`QUIET`]
-async fn settled(pane: &Arc<dyn Pane>) -> Vec<Row> {
+/// pane for [`QUIET`]. Its rows are read again only when it has something new (its sequence
+/// number moved), or the last read met a row a mux pane's client was still fetching, whose
+/// arrival moves no sequence number: every row a look reads is a copy of the line. A screen
+/// with a row still on its way isn't settled
+pub(crate) async fn settled(pane: &Arc<dyn Pane>) -> Vec<Row> {
     let start = Instant::now();
     let mut seqno = pane.get_current_seqno();
-    let mut rows = read_rows(pane);
+    let (mut rows, mut held) = read_rows_held(pane);
     let mut still = Instant::now();
     loop {
-        smol::Timer::after(POLL).await;
+        lbterm_extras::counters::timer(smol::Timer::after(POLL)).await;
         let now_seqno = pane.get_current_seqno();
-        let now_rows = read_rows(pane);
-        if now_seqno != seqno || now_rows != rows {
+        let mut changed = now_seqno != seqno;
+        if changed || !held {
             seqno = now_seqno;
-            rows = now_rows;
+            let (read, now_held) = read_rows_held(pane);
+            changed |= read != rows;
+            rows = read;
+            held = now_held;
+        }
+        if changed {
             still = Instant::now();
-        } else if still.elapsed() >= QUIET {
+        } else if held && still.elapsed() >= QUIET {
             return rows;
         }
         if start.elapsed() >= MAX_WAIT {
@@ -185,7 +224,7 @@ async fn settled(pane: &Arc<dyn Pane>) -> Vec<Row> {
 }
 
 /// A click on Claude Code's header at `row`, which jumps it to the prompt the header shows
-fn click(pane: &Arc<dyn Pane>, row: usize) {
+pub(crate) fn click(pane: &Arc<dyn Pane>, row: usize) {
     for kind in [TermMouseKind::Press, TermMouseKind::Release] {
         let _ = pane.mouse_event(TermMouseEvent {
             kind,
@@ -258,6 +297,21 @@ impl TermWindow {
         }
     }
 
+    /// Mark row `row` of `pane`'s screen for a moment: where the scroll strip's seek through
+    /// Claude Code's conversation landed (render/scroll_strip.rs)
+    pub(crate) fn lbterm_mark_landed_screen(&mut self, pane: PaneId, row: usize) {
+        let until = Instant::now() + MARK_FOR;
+        self.lbterm_prompts.mark = Some(Mark {
+            pane,
+            row: MarkRow::Screen(row),
+            until,
+        });
+        self.lbterm_strip_wake(Some(until));
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
     /// When the note goes, or the mark: a repaint then
     pub(crate) fn lbterm_prompt_note_due(&self) -> Option<Instant> {
         let now = Instant::now();
@@ -282,12 +336,23 @@ impl TermWindow {
         let spawned = std::thread::Builder::new()
             .name("lbterm-prompts".into())
             .spawn(move || {
-                let prompts = std::fs::read(&path)
-                    .map(|bytes| prompts::sent(&String::from_utf8_lossy(&bytes), &sid))
-                    .unwrap_or_else(|err| {
+                // Read on from where the last click's read stopped: the file is every session's
+                let mut kept = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+                if kept.as_ref().map_or(true, |(read, _)| *read != path) {
+                    *kept = Some((path.clone(), prompts::History::default()));
+                }
+                let Some((_, history)) = kept.as_mut() else {
+                    return;
+                };
+                let file = std::path::Path::new(&path);
+                let prompts = match history.read_on(file).and_then(|()| history.sent(file, &sid)) {
+                    Ok(prompts) => prompts,
+                    Err(err) => {
                         log::warn!("prompts: reading {path}: {err:#}");
                         vec![]
-                    });
+                    }
+                };
+                drop(kept);
                 window.notify(TermWindowNotif::Apply(Box::new(move |tw| then(tw, prompts))));
             });
         if let Err(err) = spawned {
@@ -447,6 +512,12 @@ impl TermWindow {
 
     /// Jump to the list's prompt `index`, closing it
     fn lbterm_prompt_list_pick(&mut self, index: usize) {
+        // Its row flashes white as the list goes (render/menu_fade.rs)
+        if let Some((laid, _)) = self.lbterm_prompt_list_layout().ok().flatten() {
+            if let Some((_, row)) = laid.rows.iter().find(|(i, _)| *i == index) {
+                self.lbterm_menu_flash(Slot::Prompt, *row);
+            }
+        }
         let Some(list) = self.lbterm_prompts.list.take() else {
             return;
         };
@@ -484,7 +555,7 @@ impl TermWindow {
                 if let Some(list) = self.lbterm_prompts.list.as_mut() {
                     if list.focus != hit && (hit.is_some() || layout.card.contains(x, y)) {
                         list.focus = hit;
-                        context.invalidate();
+                        context.lbterm_invalidate();
                     }
                 }
                 context.set_cursor(Some(if hit.is_some() {
@@ -506,7 +577,7 @@ impl TermWindow {
                     } else {
                         list.scroll + 3
                     };
-                    context.invalidate();
+                    context.lbterm_invalidate();
                 }
             }
             _ => {}
@@ -516,7 +587,7 @@ impl TermWindow {
 
     /// While the list's open it takes every key: up and down the list, Enter to jump, Esc to
     /// close. True when it did.
-    pub(crate) fn lbterm_prompt_list_key(&mut self, key: &KeyCode, _mods: KeyModifiers) -> bool {
+    pub(crate) fn lbterm_prompt_list_key(&mut self, key: &KeyCode, mods: KeyModifiers) -> bool {
         let Some(list) = self.lbterm_prompts.list.as_ref() else {
             return false;
         };
@@ -529,7 +600,8 @@ impl TermWindow {
         if count == 0 {
             return true;
         }
-        if *key == KeyCode::Enter {
+        // Enter picks the row lit; with none lit it lights the first, as Home does
+        if *key == KeyCode::Enter && focus.is_some() {
             if let Some(index) = focus {
                 self.lbterm_prompt_list_pick(index);
             }
@@ -547,9 +619,12 @@ impl TermWindow {
             KeyCode::DownArrow => Some(at.map_or(0, |p| (p + 1).min(count - 1))),
             KeyCode::PageUp => Some(at.map_or(0, |p| p.saturating_sub(shown))),
             KeyCode::PageDown => Some(at.map_or(0, |p| (p + shown).min(count - 1))),
-            KeyCode::Home => Some(0),
+            KeyCode::Home | KeyCode::Enter => Some(0),
             KeyCode::End => Some(count - 1),
-            _ => None,
+            _ => {
+                self.lbterm_menu_stray(Slot::Prompt, key, mods);
+                None
+            }
         };
         if let (Some(to), Some(list)) = (to, self.lbterm_prompts.list.as_mut()) {
             list.focus = Some(count - 1 - to);
@@ -578,10 +653,8 @@ impl TermWindow {
         let Some((layout, cell_w)) = self.lbterm_prompt_list_layout()? else {
             return Ok(());
         };
-        let card_rgb = {
-            let (r, g, b, _) = self.palette().background.to_srgb_u8();
-            palette::blend(((r as u32) << 16) | ((g as u32) << 8) | b as u32, palette::CHIP, 0.55)
-        };
+        let fill = self.lbterm_menu_fill();
+        let card_rgb = fill.card;
         let Some(list) = self.lbterm_prompts.list.as_ref() else {
             return Ok(());
         };
@@ -589,9 +662,6 @@ impl TermWindow {
         let scroll = layout.scroll;
         let focus = list.focus;
         let scale = self.dimensions.dpi as f64 / 96.0;
-        let shape = self.lbterm_shape();
-        let radius = shape.radius() as f64;
-        let stroke = shape.hairline() as f64;
         let now = chrono::Local::now().naive_local();
         let stamp = |at_ms: i64| {
             let at = SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms.max(0) as u64);
@@ -671,23 +741,14 @@ impl TermWindow {
             }
         }
 
-        // The light round it, fading out, as the tab menu's
-        {
-            let layer = gl_state.layer_for_zindex(GLOW_Z)?;
-            let mut quads = layer.quad_allocator();
-            for (i, alpha) in [0.16, 0.09, 0.05, 0.025].iter().enumerate() {
-                let by = (2.0 + 3.0 * i as f64) * scale;
-                self.lbterm_menu_rounded(&mut quads, grow(layout.card, by), radius + by, srgb(palette::GLOW, *alpha))?;
-            }
-        }
+        // The light round it, its ring and card, and the row lit, gliding between rows: every
+        // menu's (render/menu_fade.rs)
+        self.lbterm_menu_card(Slot::Prompt, layout.card, fill)?;
         let layer = gl_state.layer_for_zindex(CARD_Z)?;
         let mut quads = layer.quad_allocator();
-        self.lbterm_menu_rounded(&mut quads, grow(layout.card, stroke), radius + stroke, srgb(palette::RING_MIDDLE, 1.0))?;
-        self.lbterm_menu_rounded(&mut quads, layout.card, radius, srgb(card_rgb, 1.0))?;
-        let hover = srgb(palette::blend(card_rgb, palette::HOVER, palette::HOVER_ALPHA * 1.6), 1.0);
         for (r, _, _, lit) in &rows {
             if *lit {
-                self.lbterm_menu_rounded(&mut quads, *r, 6.0 * scale, hover)?;
+                self.lbterm_menu_light(Slot::Prompt, &mut quads, *r, card_rgb)?;
             }
         }
         drop(quads);
@@ -779,7 +840,10 @@ impl TermWindow {
         let item = |label: &str, index: usize| lbterm_extras::state::MenuItem {
             label: label.to_string(),
             checked: false,
+            key: None,
+            detail: None,
             rect: rect_of(index),
+            inert: false,
         };
         let (items, focus) = match &list.prompts {
             None => (vec![item("Reading your prompts\u{2026}", 0)], None),

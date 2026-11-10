@@ -38,25 +38,47 @@ pub mod borders;
 pub mod card;
 pub mod composited;
 pub mod conductor;
+pub mod conductor_hide;
+pub mod connections;
+pub mod conductor_view;
 pub mod corners;
+pub mod draft;
 pub mod draw;
 pub mod fancy_tab_bar;
+pub mod hex;
 pub mod hover_fade;
+pub mod inbox;
+pub mod agenda;
+pub mod context;
+pub mod kept;
+pub mod kept_quads;
 pub mod lights;
+pub mod line_key;
+pub mod link_drag;
 pub mod marks;
+pub mod menu_fade;
+pub mod new_tab;
+pub mod objectives;
 pub mod paint;
+pub mod projects;
 pub mod prompt;
 pub mod pane;
+pub mod pane_lines;
 pub mod questions;
 pub mod screen_line;
+pub mod scroll_strip;
+pub mod sides;
 pub mod split;
 pub mod strip;
 pub mod strip_swap;
 pub mod tab_bar;
 pub mod tab_menu;
 pub mod tab_panel;
+pub mod tasks_card;
+pub mod thumbnails;
 pub mod triggers;
 pub mod window_buttons;
+pub mod words;
 
 /// The data that we associate with a line; we use this to cache it shape hash
 #[derive(Debug)]
@@ -64,8 +86,20 @@ pub struct CachedLineState {
     pub id: u64,
     pub seqno: SequenceNo,
     pub shape_hash: [u8; 16],
+    /// LBTerm: it holds a link drawn by the state of what it points at
+    /// (lbterm_extras::link_looks)
+    pub by_state: bool,
 }
 
+/// LBTerm: what a pane's line shows, not where: no `top_pixel_y` or `phys_line_idx`. Its quads
+/// are laid out as if the line were at the window's top and kept so (`LineQuadCacheValue`), and
+/// moved to its row as they're copied into the layer, their hashes moved with them
+/// (render/pane.rs; quad.rs, `HeapQuadAllocator::lbterm_apply_moved`), so a line that only moved
+/// (a scroll, a program moving its rows) isn't laid out again, and lines that look the same share
+/// one entry. Everything a line's quads take from its row is in here (its cursor, the composing
+/// text and password input on the cursor's row, its selected columns) or drawn apart (a picture
+/// row's thumbnail); lbterm/FLOWS.md rows 85 to 93 list each. Made by render/line_key.rs's
+/// `LineFrame::line`, which gives the row's pixel y beside it
 #[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub struct LineQuadCacheKey {
     pub config_generation: usize,
@@ -75,11 +109,14 @@ pub struct LineQuadCacheKey {
     pub composing: Option<String>,
     pub selection: Range<usize>,
     pub shape_hash: [u8; 16],
-    pub top_pixel_y: NotNan<f32>,
     pub left_pixel_x: NotNan<f32>,
-    pub phys_line_idx: usize,
     pub pane_id: PaneId,
+    /// LBTerm: true for every line but the cursor's in a pane without the keyboard drawn by the
+    /// compositor, which looks the same either way (render/pane.rs)
     pub pane_is_active: bool,
+    /// LBTerm: on the cursor's line, whether the window has the keyboard, which changes the
+    /// cursor's look; false on the rest (render/pane.rs)
+    pub lbterm_focused: bool,
     /// A cursor position with the y value fixed at 0.
     /// Only is_some() if the y value matches this row.
     pub cursor: Option<CursorProperties>,
@@ -89,11 +126,15 @@ pub struct LineQuadCacheKey {
 
 pub struct LineQuadCacheValue {
     pub expires: Option<Instant>,
+    /// LBTerm: laid out at row 0, the vertices and their hashes, made the size they are
     pub layers: HeapQuadAllocator,
     // Only set if the line contains any hyperlinks, so
     // that we can invalidate when it changes
     pub current_highlight: Option<Arc<Hyperlink>>,
     pub invalidate_on_hover_change: bool,
+    /// LBTerm: the links the line holds, so it's laid out again only when which of them is under
+    /// the pointer changes (lbterm_extras::link_looks::hover_changed)
+    pub lbterm_links: Vec<Arc<Hyperlink>>,
 }
 
 pub struct LineToElementParams<'a> {
@@ -119,6 +160,8 @@ pub struct LineToElementShapeItem {
     // that we can invalidate when it changes
     pub current_highlight: Option<Arc<Hyperlink>>,
     pub invalidate_on_hover_change: bool,
+    /// LBTerm: the links the line holds (lbterm_extras::link_looks::hover_changed)
+    pub lbterm_links: Vec<Arc<Hyperlink>>,
 }
 
 pub struct LineToElementShape {
@@ -134,6 +177,8 @@ pub struct LineToElementShape {
 
 pub struct RenderScreenLineResult {
     pub invalidate_on_hover_change: bool,
+    /// LBTerm: the links the line holds (lbterm_extras::link_looks::hover_changed)
+    pub lbterm_links: Vec<Arc<Hyperlink>>,
 }
 
 pub struct RenderScreenLineParams<'a> {
@@ -833,6 +878,8 @@ impl crate::TermWindow {
             Some(Ok(info)) => info,
             Some(Err(err)) => return Err(err),
             None => {
+                // LBTerm: a run shaped again, counted (lbterm_extras::work)
+                lbterm_extras::work::WORK.shape();
                 let font = match font {
                     Some(f) => Rc::clone(f),
                     None => self.fonts.resolve_font(style)?,
@@ -898,6 +945,7 @@ impl crate::TermWindow {
     }
 
     pub fn recreate_texture_atlas(&mut self, size: Option<usize>) -> anyhow::Result<()> {
+        crate::counters::fonts::RESHAPES.one();
         self.shape_generation += 1;
         self.shape_cache.borrow_mut().clear();
         self.line_to_ele_shape_cache.borrow_mut().clear();
@@ -907,7 +955,22 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    fn shape_hash_for_line(&mut self, line: &Line) -> [u8; 16] {
+    /// LBTerm: the line's shape hash, and whether it holds a link drawn by the state of what it
+    /// points at (lbterm_extras::link_looks::by_state), which is shaped again when those states
+    /// change; every other line keeps its shapes
+    fn lbterm_shape_hash_for_line(&mut self, line: &Line) -> ([u8; 16], bool) {
+        let (shape_hash, by_state) = self.line_shape_hash(line);
+        if by_state {
+            (
+                lbterm_extras::link_looks::shape_hash(shape_hash, self.lbterm_link_states),
+                true,
+            )
+        } else {
+            (shape_hash, false)
+        }
+    }
+
+    fn line_shape_hash(&mut self, line: &Line) -> ([u8; 16], bool) {
         let seqno = line.current_seqno();
         let mut id = None;
         if let Some(cached_arc) = line.get_appdata() {
@@ -915,7 +978,7 @@ impl crate::TermWindow {
                 if line_state.seqno == seqno {
                     // Touch the LRU
                     self.line_state_cache.borrow_mut().get(&line_state.id);
-                    return line_state.shape_hash;
+                    return (line_state.shape_hash, line_state.by_state);
                 }
                 id.replace(line_state.id);
             }
@@ -928,17 +991,23 @@ impl crate::TermWindow {
         });
 
         let shape_hash = line.compute_shape_hash();
+        let by_state = line.visible_cells().any(|cell| {
+            cell.attrs()
+                .hyperlink()
+                .is_some_and(|link| lbterm_extras::link_looks::by_state(link.uri()))
+        });
 
         let state = Arc::new(CachedLineState {
             id,
             seqno,
             shape_hash,
+            by_state,
         });
 
         line.set_appdata(Arc::clone(&state));
 
         self.line_state_cache.borrow_mut().put(id, state);
-        shape_hash
+        (shape_hash, by_state)
     }
 }
 
@@ -998,3 +1067,4 @@ fn same_hyperlink(a: Option<&Arc<Hyperlink>>, b: Option<&Arc<Hyperlink>>) -> boo
         _ => false,
     }
 }
+

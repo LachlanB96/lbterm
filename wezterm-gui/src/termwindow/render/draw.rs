@@ -96,7 +96,6 @@ impl crate::TermWindow {
             for idx in 0..3 {
                 let vb = &layer.vb.borrow()[idx];
                 let (vertex_count, index_count) = vb.vertex_index_count();
-                let vertex_buffer;
                 let uniforms;
                 if vertex_count > 0 {
                     let mut vertices = vb.current_vb_mut();
@@ -135,8 +134,10 @@ impl crate::TermWindow {
                     render_pass.set_bind_group(0, &uniforms, &[]);
                     render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
                     render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
-                    vertex_buffer = vertices.webgpu_mut().recreate();
-                    vertex_buffer.unmap();
+                    // LBTerm: the layer's own buffer, written from its quads only when it doesn't
+                    // hold them already (termwindow/gpu_work.rs, WebGpuVertexBuffer::upload)
+                    let key = vb.lbterm_key();
+                    let vertex_buffer = vertices.webgpu_mut().upload(vertex_count, key, &vb.hashes.borrow());
                     render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(vb.indices.webgpu().slice(..), wgpu::IndexFormat::Uint32);

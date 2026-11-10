@@ -96,20 +96,7 @@ impl crate::TermWindow {
     /// gutter short of the middle of the split's gap on its inner ones.
     pub(crate) fn lbterm_card(&self, pos: &PositionedPane) -> anyhow::Result<Area> {
         let room = self.lbterm_room()?;
-        let (padding_left, padding_top) = self.padding_left_top();
-        let (cell_w, cell_h) = (
-            self.render_metrics.cell_size.width as f32,
-            self.render_metrics.cell_size.height as f32,
-        );
-        let border = self.get_os_border();
-        let tab_bar = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.0
-        };
-        // Where the pane's cells start, as the text is drawn
-        let x0 = border.left.get() as f32 + padding_left;
-        let y0 = border.top.get() as f32 + tab_bar + padding_top;
+        let (x0, y0, cell_w, cell_h) = self.lbterm_cell_grid()?;
         let column = |c: usize| x0 + c as f32 * cell_w;
         let row = |r: usize| y0 + r as f32 * cell_h;
         let left = if pos.left == 0 {
@@ -133,6 +120,39 @@ impl crate::TermWindow {
             Side::Inner(row(pos.top + pos.height) + cell_h / 2.0)
         };
         Ok(self.lbterm_shape().card(left, top, right, bottom))
+    }
+
+    /// Where the window's first cell starts, as a pane's text is drawn (render/pane.rs's
+    /// `left_pixel_x` and `top_pixel_y`), and a cell's width and height: `(x0, y0, w, h)` in
+    /// window pixels.
+    fn lbterm_cell_grid(&self) -> anyhow::Result<(f32, f32, f32, f32)> {
+        let (padding_left, padding_top) = self.padding_left_top();
+        let border = self.get_os_border();
+        let tab_bar = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height()?
+        } else {
+            0.0
+        };
+        Ok((
+            border.left.get() as f32 + padding_left,
+            border.top.get() as f32 + tab_bar + padding_top,
+            self.render_metrics.cell_size.width as f32,
+            self.render_metrics.cell_size.height as f32,
+        ))
+    }
+
+    /// A pane's cells as its text is drawn: its first cell's top left, and its columns and rows
+    /// of whole cells. Its card (`lbterm_card`) is bigger: a lone pane's fills the room, padding
+    /// and the part of a cell left over at the edges included (the state file's `cells`,
+    /// lbterm/STATE.md).
+    pub(crate) fn lbterm_pane_cells(&self, pos: &PositionedPane) -> anyhow::Result<Area> {
+        let (x0, y0, cell_w, cell_h) = self.lbterm_cell_grid()?;
+        Ok(Area::new(
+            x0 + pos.left as f32 * cell_w,
+            y0 + pos.top as f32 * cell_h,
+            pos.width as f32 * cell_w,
+            pos.height as f32 * cell_h,
+        ))
     }
 
     /// Where the scrollbar's track runs, its top and height: down the
@@ -213,7 +233,9 @@ impl crate::TermWindow {
     /// The two template cards the panes' outlines are cut from, for the
     /// compositor: each the window's background outside the card, the
     /// outline at its brightest on it, and clear inside. `None` without the
-    /// compositor, which has panes draw their own.
+    /// compositor, which has panes draw their own. Made only when the window's
+    /// size, its DPI or its background changes (render/kept.rs): every frame
+    /// built them again, about 1,800 quads in a window 1,920 pixels tall
     pub(crate) fn paint_lbterm_card_templates(&mut self) -> anyhow::Result<Option<CardPlan>> {
         if !self.lbterm_composited() {
             return Ok(None);
@@ -232,30 +254,35 @@ impl crate::TermWindow {
         // At its brightest: the active outline's group shows it at the rest opacity, and
         // brighter as the keyboard arrives (compositor.rs, `FocusOutline`)
         let outline = palette::card_outline_lit(background);
-        let gl_state = self.render_state.as_ref().unwrap();
+        // The shape is the DPI's, which the key has already
+        let key = self.lbterm_template_key(&[background as u64, outline as u64]);
         for (zindex, part) in CARD_ZINDEX {
             let bounds = match part {
                 CardPart::MaskWide | CardPart::LineWide => wide,
                 CardPart::MaskTall | CardPart::LineTall => tall,
             };
-            let layer = gl_state.layer_for_zindex(zindex)?;
-            let mut quads = layer.quad_allocator();
+            let name = match part {
+                CardPart::MaskWide => "card-mask-wide",
+                CardPart::MaskTall => "card-mask-tall",
+                CardPart::LineWide => "card-line-wide",
+                CardPart::LineTall => "card-line-tall",
+            };
             let card = bounds.grow(-template.band);
-            match part {
+            self.lbterm_kept_layer(zindex, name, key, |quads| match part {
                 // Clear inside, so the pane shows through; the line alone
                 // glides over panes and gutters without covering either
                 CardPart::MaskWide | CardPart::MaskTall => {
-                    self.lbterm_outside(&mut quads, card, shape.radius(), bounds, srgb(background))?
+                    self.lbterm_outside(quads, card, shape.radius(), bounds, srgb(background))
                 }
                 CardPart::LineWide | CardPart::LineTall => self.lbterm_stroke(
-                    &mut quads,
+                    quads,
                     card,
                     shape.radius(),
                     shape.hairline(),
                     shape.feather(),
                     |_| outline,
-                )?,
-            }
+                ),
+            })?;
         }
         let pixels = |a: Area| PixelRect::new(a.x as i32, a.y as i32, a.w as u32, a.h as u32);
         Ok(Some(CardPlan {
@@ -263,6 +290,8 @@ impl crate::TermWindow {
             tall: pixels(tall),
             size: size as u32,
             corner: template.corner as u32,
+            line: template.line as u32,
+            reach: template.reach,
         }))
     }
 
@@ -388,9 +417,9 @@ impl crate::TermWindow {
     /// stroked `stroke` wide inward from its edge, soft `feather` pixels
     /// either side so its curves aren't stepped, its colour at each point
     /// `colour(y)`. Every pixel is drawn once: bands along the sides (in
-    /// short lengths where the colour changes down them) and fans round the
-    /// corners. The panes' cards and the tab panel's ring, grey at rest and
-    /// lit red, coral and pink top to bottom.
+    /// short lengths where the colour changes down them, one length as far as
+    /// it stays the same) and fans round the corners. The panes' cards and the
+    /// tab panel's ring, grey at rest and lit red, coral and pink top to bottom.
     pub(crate) fn lbterm_stroke(
         &self,
         quads: &mut TripleLayerQuadAllocator,
@@ -432,7 +461,21 @@ impl crate::TermWindow {
             )?;
             let mut y = top + r;
             while y < bottom - r {
-                let y1 = (y + step).min(bottom - r);
+                let mut y1 = (y + step).min(bottom - r);
+                // LBTerm: on down the side while the colour stays as it is: a length of one
+                // colour draws the same pixels as the short ones it's made of, and an outline of
+                // one colour is a quad a side, where it was one every 8 pixels (about 1,400 of
+                // them for the tall card template in a window 1,920 pixels tall)
+                let at_y = colour(y);
+                if colour(y1) == at_y {
+                    while y1 < bottom - r {
+                        let next = (y1 + step).min(bottom - r);
+                        if colour(next) != at_y {
+                            break;
+                        }
+                        y1 = next;
+                    }
+                }
                 quad(
                     [(left - far, y), (left - near, y), (left - far, y1), (left - near, y1)],
                     [outer, inner, outer, inner],

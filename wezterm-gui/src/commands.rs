@@ -1757,6 +1757,16 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         DisableDefaultAssignment => return None,
         // LBTerm: bound to a held button, not a command to pick (render/questions.rs)
         LbtermQuestions(_) => return None,
+        // LBTerm: the pad opens it (render/conductor_view.rs)
+        LbtermConductorView(_) => return None,
+        // LBTerm: for a voice draft, which only shows once one's said (termwindow/control.rs)
+        LbtermDraft(_) => return None,
+        // LBTerm: the + pad's (render/new_tab.rs)
+        LbtermNewTab(_) => return None,
+        // LBTerm: the tab menu's Park tab, and Ctrl+Alt+D in Lachlan's config (park.rs)
+        LbtermPark(_) => return None,
+        // LBTerm: the side buttons' hops in Lachlan's config (termwindow/hop.rs)
+        LbtermTab(_) => return None,
         SelectTextAtMouseCursor(mode) => CommandDef {
             brief: format!(
                 "Selects text at the mouse cursor \

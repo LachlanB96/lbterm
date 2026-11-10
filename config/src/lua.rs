@@ -354,6 +354,20 @@ end
                 Ok(KeyAssignment::variants().contains(&name.as_str()))
             })?,
         )?;
+        // LBTerm: whether `button = name` in a mouse binding is a button this build knows (the
+        // side buttons, 'Back' and 'Forward', are LBTerm's), so a config shared with an older
+        // build binds them only where they work
+        wezterm_mod.set(
+            "has_mouse_button",
+            lua.create_function(|_lua, name: String| {
+                use wezterm_dynamic::FromDynamic;
+                Ok(wezterm_term::input::MouseButton::from_dynamic(
+                    &wezterm_dynamic::Value::String(name),
+                    Default::default(),
+                )
+                .is_ok())
+            })?,
+        )?;
 
         lua.set_named_registry_value(LUA_REGISTRY_USER_CALLBACK_COUNT, 0)?;
         wezterm_mod.set("action_callback", lua.create_function(action_callback)?)?;
@@ -794,6 +808,16 @@ pub async fn emit_event<'lua>(
             Ok(true)
         }
         _ => Ok(true),
+    }
+}
+
+/// LBTerm: whether `name` has a handler (wezterm.on), so a caller can skip building arguments
+/// that only a handler reads: format-tab-title and format-window-title were handed every tab,
+/// every pane and a clone of the whole config on every title update, with no handler to read them
+pub fn has_event_handler(lua: &Lua, name: &str) -> bool {
+    match lua.named_registry_value::<mlua::Value>(&format!("wezterm-event-{}", name)) {
+        Ok(mlua::Value::Table(tbl)) => tbl.raw_len() > 0,
+        _ => false,
     }
 }
 

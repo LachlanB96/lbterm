@@ -425,6 +425,132 @@ Describe 'Group-LbtermSlowFrames' {
   }
 }
 
+Describe 'ConvertFrom-LbtermBudgetLine' {
+  # Each shape as lbterm-extras/src/budget.rs's tests write it
+  It 'reads a window painting at rest, who asked first' {
+    $b = ConvertFrom-LbtermBudgetLine 'window-0 painted 312 frames in 10 s at rest, asked by wezterm-gui/src/termwindow/render/conductor_view.rs:338 (300), wezterm-gui/src/termwindow/render/lights.rs:120 (12)'
+    $b.Kind | Should -Be 'frames'
+    $b.What | Should -Be 'window-0'
+    $b.Count | Should -Be 312
+    $b.Spans | Should -Be 1
+    $b.Top | Should -Be 'wezterm-gui/src/termwindow/render/conductor_view.rs:338'
+    @($b.Sites).Count | Should -Be 2
+    $b.Sites[1].Site | Should -Be 'wezterm-gui/src/termwindow/render/lights.rs:120'
+    $b.Sites[1].Count | Should -Be 12
+  }
+
+  It 'reads the spans held and said together, and the notes after the sites' {
+    $b = ConvertFrom-LbtermBudgetLine 'window-2 painted 1560 frames at rest in 5 more spans of 10 s in the last 60 s, asked by a.rs:1 (1500), b.rs:2 (60), and 3 more (9); and 4 nobody asked for; on purpose, allowed: clock 11'
+    $b.What | Should -Be 'window-2'
+    $b.Count | Should -Be 1560
+    $b.Spans | Should -Be 5
+    @($b.Sites | ForEach-Object Site) | Should -Be @('a.rs:1', 'b.rs:2', '(3 more)')
+    $b.Sites[2].Count | Should -Be 9
+  }
+
+  It 'reads Windows'' own WM_PAINT as a site, and the news''s notes' {
+    $b = ConvertFrom-LbtermBudgetLine 'window-0 painted 20 frames in 10 s at rest, asked by WM_PAINT (20); 20 of them nobody asked for, Windows'' own WM_PAINT'
+    $b.Count | Should -Be 20
+    $b.Top | Should -Be 'WM_PAINT'
+    $n = ConvertFrom-LbtermBudgetLine 'window-1 painted 9 frames in 10 s at rest, asked by wezterm-gui/src/termwindow/render/tab_panel.rs:845 (9); 9 of them after background tabs'' news, past the 30 it may bring in 10 s; on purpose, allowed: news 30'
+    $n.Top | Should -Be 'wezterm-gui/src/termwindow/render/tab_panel.rs:845'
+    @($n.Sites).Count | Should -Be 1
+  }
+
+  It 'reads timers and tasks at rest, with the tasks'' time' {
+    $t = ConvertFrom-LbtermBudgetLine 'timers fired 400 times in 10 s at rest: wezterm-gui/src/termwindow/render/tab_panel.rs:2550 (400)'
+    $t.Kind | Should -Be 'timers'
+    $t.Count | Should -Be 400
+    $t.Top | Should -Be 'wezterm-gui/src/termwindow/render/tab_panel.rs:2550'
+    $k = ConvertFrom-LbtermBudgetLine 'tasks ran 812 times in 10 s at rest, 34.2 ms in all: a.rs:1 (400, 20.1 ms), b.rs:2 (412, 14.1 ms)'
+    $k.Kind | Should -Be 'tasks'
+    $k.Count | Should -Be 812
+    $k.Ms | Should -Be 34.2
+    $k.Sites[0].Ms | Should -Be 20.1
+    $h = ConvertFrom-LbtermBudgetLine 'tasks ran 4000 times at rest in 1 more span of 10 s in the last 60 s, 160.0 ms in all: a.rs:1 (4000, 160.0 ms)'
+    $h.Spans | Should -Be 1
+    $h.Ms | Should -Be 160
+  }
+
+  It 'reads an action over its time and what the time went on' {
+    $b = ConvertFrom-LbtermBudgetLine 'tab took 84.0 ms, 54.0 ms over its 30 ms: task wezterm-gui/src/termwindow/mod.rs:1867 51.2 ms, paint window-0/pass 20.1 ms (2), message WM_PAINT 2.0 ms, the rest 10.7 ms'
+    $b.Kind | Should -Be 'action'
+    $b.What | Should -Be 'tab'
+    $b.Ms | Should -Be 84
+    $b.Budget | Should -Be 30
+    $b.Top | Should -Be 'task wezterm-gui/src/termwindow/mod.rs:1867'
+    $b.Sites[1].Count | Should -Be 2
+    $b.Sites[-1].Site | Should -Be 'the rest'
+    $b.Sites[-1].Ms | Should -Be 10.7
+  }
+
+  It 'reads the rest of an action''s 10 s, less the first said already' {
+    $b = ConvertFrom-LbtermBudgetLine 'conductor-view: 3 times over its 100 ms in the last 10 s, max 190.5 ms'
+    $b.What | Should -Be 'conductor-view'
+    $b.Count | Should -Be 2
+    $b.Ms | Should -Be 190.5
+    $b.Budget | Should -Be 100
+  }
+
+  It 'says nothing of other messages' {
+    ConvertFrom-LbtermBudgetLine 'window-0 painted the town' | Should -BeNullOrEmpty
+    ConvertFrom-LbtermBudgetLine 'slow paint window.rs:812: 41 ms' | Should -BeNullOrEmpty
+    ConvertFrom-LbtermBudgetLine '' | Should -BeNullOrEmpty
+  }
+}
+
+Describe 'Group-LbtermBudgetLines' {
+  BeforeAll {
+    function Log($Name, $Kind, [string[]]$Lines, [datetime]$Written) {
+      [pscustomobject]@{ Name = $Name; Path = "C:\logs\$Name"; Process = 'gui'; Pid = ($Name -replace '\D', ''); Kind = $Kind; Written = $Written
+        Entries = @(ConvertFrom-LbtermLog ($Lines -join "`n") $Written) }
+    }
+    $a = Log 'lbterm-gui.exe-log-1.txt' 'daily' @(
+      (Line '10:00:00.000' 'WARN' 'lbterm::budget' 'window-0 painted 300 frames in 10 s at rest, asked by view.rs:338 (300)'),
+      (Line '10:01:00.000' 'WARN' 'lbterm::budget' 'window-0 painted 1800 frames at rest in 6 more spans of 10 s in the last 60 s, asked by view.rs:338 (1800)'),
+      (Line '10:02:00.000' 'WARN' 'lbterm::budget' 'tab took 84.0 ms, 54.0 ms over its 30 ms: task mod.rs:1867 51.2 ms, the rest 10.7 ms'),
+      (Line '10:02:10.000' 'WARN' 'lbterm::budget' 'tab: 3 times over its 30 ms in the last 10 s, max 120.0 ms'),
+      (Line '10:03:00.000' 'WARN' 'lbterm::budget' 'tasks ran 30 times in 10 s at rest, 3.0 ms in all: poll.rs:9 (30, 3.0 ms)'),
+      (Line '10:04:00.000' 'WARN' 'other' 'window-0 painted 999 frames in 10 s at rest, asked by x.rs:1 (999)'),
+      (Line '10:05:00.000' 'WARN' 'lbterm::budget' 'not a budget line')) $day.AddHours(10).AddMinutes(6)
+    $b = Log 'lbterm-gui.exe-log-2.txt' 'test' @(
+      (Line '11:00:00.000' 'WARN' 'lbterm::budget' 'tab took 40.0 ms, 10.0 ms over its 30 ms: paint window-0/present 30.0 ms, the rest 10.0 ms')) $day.AddHours(11).AddMinutes(1)
+    $groups = @(Group-LbtermBudgetLines @($a, $b))
+  }
+
+  It 'groups what ran at rest by its kind and who asked most, then actions by name' {
+    $groups.Count | Should -Be 3
+    $groups[0].Kind | Should -Be 'frames'
+    $groups[0].Site | Should -Be 'view.rs:338'
+    $groups[0].Count | Should -Be 2100
+    $groups[0].Lines | Should -Be 2
+    $groups[0].Worst | Should -Be 1800
+    $groups[1].Kind | Should -Be 'tasks'
+    $groups[1].Ms | Should -Be 3
+    $groups[2].Kind | Should -Be 'action'
+    $groups[2].Site | Should -Be 'tab'
+    $groups[2].Count | Should -Be 4 -Because 'the first, the two more in its 10 s, and the test window''s'
+    $groups[2].Worst | Should -Be 120
+    $groups[2].Budget | Should -Be 30
+    $groups[2].Logs.Count | Should -Be 2
+  }
+
+  It 'counts only what came since a time' {
+    $since = @(Group-LbtermBudgetLines @($a, $b) -Since $day.AddHours(10).AddMinutes(30))
+    $since.Count | Should -Be 1
+    $since[0].Count | Should -Be 1
+    $since[0].Top | Should -Be 'paint window-0/present'
+  }
+
+  It 'shows each with its count and who asked, or its worst time and what it went on' {
+    $out = @(Format-LbtermBudget $groups)
+    $out[0] | Should -Match '^\s+2100  frames  at rest, at most 1800 in a line, most asked by view\.rs:338$'
+    $out[1].Trim() | Should -Be '2 lines from 2026-10-21 10:00 to 2026-10-21 10:01 in 1 log (daily 1): gui 1'
+    $out[2] | Should -Match '^\s+30  tasks   at rest, 3 ms, at most 30 in a line, most spawned at poll\.rs:9$'
+    $out[4] | Should -Match '^\s+4  over    tab\s+worst\s+120 ms, its 30 ms; mostly '
+  }
+}
+
 Describe 'The views' {
   BeforeAll {
     function Log($Process, $Procid, $Kind, [datetime]$Written) {
@@ -471,7 +597,8 @@ Describe 'lbterm.ps1 logs' {
     New-Log $dir 'lbterm-gui.exe-log-910001.txt' @(
       (Line (& $at $t1) 'INFO' 'lbterm_gui::conductor_hub' 'conductor hub: listening on \\.\pipe\conductor-hub'),
       (Line (& $at $t1.AddSeconds(1)) 'ERROR' 'wgpu_hal::auxil::dxgi::result' 'GraphicsCommandList::close failed: The parameter is incorrect. (0x80070057)'),
-      (Line (& $at $t1.AddSeconds(2)) 'WARN' 'lbterm::slow' 'slow paint window.rs:812: 41 ms')) -Created $t1 -Written $t1.AddSeconds(2)
+      (Line (& $at $t1.AddSeconds(2)) 'WARN' 'lbterm::slow' 'slow paint window.rs:812: 41 ms'),
+      (Line (& $at $t1.AddSeconds(3)) 'WARN' 'lbterm::budget' 'window-0 painted 300 frames in 10 s at rest, asked by view.rs:338 (300)')) -Created $t1 -Written $t1.AddSeconds(3)
     $t2 = $now.AddMinutes(-20)
     New-Log $dir 'lbterm-gui.exe-log-910002.txt' @(
       (Line (& $at $t2) 'WARN' 'wezterm_client::client' 'Running: "C:/Code/LBTerm/target/release/lbterm-mux-server.exe" "--config-file" "C:/Code/LBTerm/target/perf/mux/mux.lua"'),
@@ -506,6 +633,8 @@ Describe 'lbterm.ps1 logs' {
     $out | Should -Match '(?m)^\s+2  ERROR  wgpu_hal::auxil::dxgi::result\r?$'
     $out | Should -Match 'in 2 logs \(daily 1, test 1\): gui 910002, gui 910001'
     $out | Should -Match 'Left out: 1 slow-frame lines'
+    $out | Should -Match 'Left out: 1 budget lines \(-Budget\)'
+    $out | Should -Not -Match 'painted 300 frames'
     $out = Invoke-Logs '-Errors', '-Kind', 'daily'
     $out | Should -Match '(?m)^\s+1  ERROR  wgpu_hal'
   }
@@ -513,6 +642,12 @@ Describe 'lbterm.ps1 logs' {
   It 'groups the slow frames, and narrows to a time' {
     Invoke-Logs '-Slow' | Should -Match '(?m)^\s+1  slow paint\s+worst\s+41 ms  window\.rs:812\r?$'
     Invoke-Logs '-Slow', '-Since', '30m' | Should -Match '(?m)^None\.\r?$'
+  }
+
+  It 'groups the budget''s lines, and narrows to a time' {
+    $out = Invoke-Logs '-Budget'
+    $out | Should -Match '(?m)^\s+300  frames  at rest, at most 300 in a line, most asked by view\.rs:338\r?$'
+    Invoke-Logs '-Budget', '-Since', '30m' | Should -Match '(?m)^None\.\r?$'
   }
 
   It 'says so when there are none, and when a pid has no log' {

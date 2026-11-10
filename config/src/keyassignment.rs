@@ -571,6 +571,19 @@ pub enum KeyAssignment {
     /// LBTerm: the question colours on the pane, shown while the right button's held
     /// (wezterm-gui/src/termwindow/render/questions.rs)
     LbtermQuestions(crate::lbterm::LbtermQuestions),
+    /// LBTerm: the Conductor's view in this window, opened, closed or either
+    /// (wezterm-gui/src/termwindow/render/conductor_view.rs)
+    LbtermConductorView(crate::lbterm::LbtermConductorView),
+    /// LBTerm: the voice draft over the pane, sent, typed in for editing, or let go
+    /// (wezterm-gui/src/termwindow/control.rs)
+    LbtermDraft(crate::lbterm::LbtermDraft),
+    /// LBTerm: the new-tab picker, a shell in the open pane's folder, or the tab closed last
+    /// (wezterm-gui/src/termwindow/render/new_tab.rs)
+    LbtermNewTab(crate::lbterm::LbtermNewTab),
+    /// LBTerm: the window's open tab parked or unparked (wezterm-gui/src/park.rs)
+    LbtermPark(crate::lbterm::LbtermPark),
+    /// LBTerm: a hop to another tab, parked ones passed by (wezterm-gui/src/termwindow/hop.rs)
+    LbtermTab(crate::lbterm::LbtermTab),
     MoveTabRelative(isize),
     MoveTab(usize),
     ScrollByPage(NotNan<f64>),

@@ -12,13 +12,22 @@ use crate::tabbar::TabBarItem;
 use crate::termwindow::render::tab_panel;
 use crate::termwindow::{TermWindow, TermWindowNotif, UIItemType};
 use lbterm_extras::state::{self, Animation, Wait};
+use mux::pane::{Pane, PaneId};
+use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::Mux;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use termwiz::surface::SequenceNo;
 use wezterm_term::Progress;
 use window::{IntegratedTitleButton, WindowOps};
 
-/// The frame asked for once DWM's animations end comes this long after, so they have
-const PAST_THE_END: Duration = Duration::from_millis(2);
+/// The frame asked for once DWM's animations end comes this long after, so they have; and after
+/// the compositor's own wake 2 ms past a fade's end (render/composited.rs, `lbterm_fading_wake`),
+/// which puts what faded away with a commit and no frame: were this frame first, its `prepare`
+/// would put them away, and no test could tell whether the wake did, which Lachlan's windows,
+/// with no state probe painting, rely on (the review of 2026-10-30)
+const PAST_THE_END: Duration = Duration::from_millis(20);
 
 /// A window's part in the state file.
 #[derive(Default)]
@@ -27,6 +36,19 @@ pub struct StateProbe {
     frames: u64,
     /// When a repaint is already on its way for the end of what DWM plays
     wake: Option<Instant>,
+    /// The visuals the last frame drew and kept (render/composited.rs)
+    visuals: std::cell::RefCell<Option<state::Visuals>>,
+    /// The templates this frame made again (render/kept.rs)
+    built: std::cell::RefCell<Vec<&'static str>>,
+    /// Each pane as the frame being painted drew it (`lbterm_state_drawn`)
+    drawn: HashMap<PaneId, Drawn>,
+}
+
+/// A pane as a frame drew it: its cursor, and its output so far (its seqno) as it was drawn
+#[derive(Clone, Copy)]
+struct Drawn {
+    cursor: state::Cell,
+    seqno: SequenceNo,
 }
 
 /// What `item` is called in the state file, and the window button it is, if one
@@ -47,6 +69,9 @@ fn item_name(item: &UIItemType) -> (&'static str, Option<String>) {
         UIItemType::TabBar(TabBarItem::LbtermSummary) => ("strip.words", Some("words".to_string())),
         UIItemType::TabBar(TabBarItem::LbtermPrompt) => ("strip.prompt", Some("prompt".to_string())),
         UIItemType::TabBar(TabBarItem::LbtermPromptList) => ("strip.arrow", Some("arrow".to_string())),
+        UIItemType::TabBar(TabBarItem::LbtermInbox) => ("strip.inbox", Some("inbox".to_string())),
+        UIItemType::TabBar(TabBarItem::LbtermAgenda) => ("strip.agenda", Some("agenda".to_string())),
+        UIItemType::TabBar(TabBarItem::LbtermContext) => ("strip.context", Some("context".to_string())),
         UIItemType::TabBar(TabBarItem::Tab { .. }) => ("tab", None),
         UIItemType::TabBar(_) => ("strip", None),
         UIItemType::CloseTab(_) => ("tab.close", None),
@@ -71,6 +96,9 @@ impl TermWindow {
     /// The window exists: it's in the file before its first frame
     pub(crate) fn lbterm_state_created(&mut self) {
         if state_probe::on() {
+            // The file's own wake after DWM's motion ends (lbterm_state_wake) is the measuring's,
+            // a test window's alone: not counted at rest by the budget
+            lbterm_extras::budget::own(file!());
             let window = self.lbterm_state_window(Instant::now());
             state_probe::publish(window);
         }
@@ -86,13 +114,60 @@ impl TermWindow {
         state_probe::painted();
         let now = Instant::now();
         let window = self.lbterm_state_window(now);
-        let settles = self
-            .webgpu
-            .as_ref()
-            .and_then(|w| w.compositor.as_ref())
-            .and_then(|c| c.settles());
-        self.lbterm_state_wake(settles.filter(|at| *at > now));
+        let compositor = self.webgpu.as_ref().and_then(|w| w.compositor.as_ref());
+        let settles = compositor.and_then(|c| c.settles());
+        // And when a suggested connection's light ends its laps, so a frame says its loop is
+        // gone (lbterm_extras::glow): whichever comes first, the frame then asking for the other
+        let laps = compositor.and_then(|c| c.loops_until());
+        let due = settles.into_iter().chain(laps).filter(|at| *at > now).min();
+        self.lbterm_state_wake(due);
         state_probe::publish(window);
+    }
+
+    /// The frames this window has painted, for what a frame is judged by (render/new_tab.rs)
+    pub(crate) fn lbterm_state_frames(&self) -> u64 {
+        self.lbterm_state.frames
+    }
+
+    /// A frame begins: what the last one drew of each pane is the last one's
+    pub(crate) fn lbterm_state_frame_start(&mut self) {
+        self.lbterm_state.drawn.clear();
+        self.lbterm_state.built.borrow_mut().clear();
+    }
+
+    /// This frame made the template `name` again (render/kept.rs)
+    pub(crate) fn lbterm_state_built(&self, name: &'static str) {
+        if state_probe::on() {
+            self.lbterm_state.built.borrow_mut().push(name);
+        }
+    }
+
+    /// `pane` as this frame draws it (render/pane.rs, with the cursor it draws): the state
+    /// file's `drawn_cursor`, and what a key's echo is judged by (budget.rs), so a frame that
+    /// began before a pane's output and ended after it isn't taken for one that shows it.
+    /// Kept only while something reads it: the state file, or a key waiting on its echo
+    pub(crate) fn lbterm_state_drawn(
+        &mut self,
+        pane: &Arc<dyn Pane>,
+        cursor: &StableCursorPosition,
+        dims: &RenderableDimensions,
+    ) {
+        if !state_probe::on() && !self.lbterm_budget_waits_on_output() {
+            return;
+        }
+        let drawn = Drawn {
+            cursor: state::Cell {
+                x: cursor.x,
+                y: (cursor.y - dims.physical_top) as i64,
+            },
+            seqno: pane.get_current_seqno(),
+        };
+        self.lbterm_state.drawn.insert(pane.pane_id(), drawn);
+    }
+
+    /// The output `pane` had when this frame drew it, if this frame drew it
+    pub(crate) fn lbterm_state_drawn_seqno(&self, pane: PaneId) -> Option<SequenceNo> {
+        self.lbterm_state.drawn.get(&pane).map(|d| d.seqno)
     }
 
     /// The window has gone
@@ -116,7 +191,7 @@ impl TermWindow {
         };
         self.lbterm_state.wake = Some(at);
         promise::spawn::spawn(async move {
-            smol::Timer::at(at).await;
+            lbterm_extras::counters::timer(smol::Timer::at(at)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 if tw.lbterm_state.wake == Some(at) {
                     tw.lbterm_state.wake = None;
@@ -129,7 +204,7 @@ impl TermWindow {
         .detach();
     }
 
-    fn lbterm_state_hwnd(&self) -> u64 {
+    pub(crate) fn lbterm_state_hwnd(&self) -> u64 {
         if let Some(webgpu) = self.webgpu.as_ref() {
             return webgpu.handle.hwnd() as u64;
         }
@@ -142,13 +217,44 @@ impl TermWindow {
         0
     }
 
+    /// The waits under way at `now`, soonest to end first: the state file's `waits`, and what
+    /// keeps a window from being at rest for the budget (termwindow/budget.rs)
+    pub(crate) fn lbterm_waits(&self, now: Instant) -> Vec<Wait> {
+        let mut waits: Vec<Wait> = vec![];
+        waits.extend(self.tab_panel_waits(now));
+        waits.extend(self.lbterm_strip_waits(now));
+        waits.extend(self.lbterm_objectives_waits(now));
+        waits.extend(self.lbterm_scroll_strip_waits(now));
+        waits.extend(self.lbterm_tasks_waits(now));
+        waits.extend(self.lbterm_prompt_note_wait(now));
+        waits.extend(self.lbterm_readout_wait(now));
+        waits.extend(self.lbterm_conductor_wait(now));
+        waits.extend(self.lbterm_view_wait(now));
+        // A prompt jump scrolls Claude Code's view until it lands; when isn't known ahead
+        if self.lbterm_prompt_jumping() {
+            waits.push(Wait {
+                name: "strip.jump".to_string(),
+                left_ms: 0,
+            });
+        }
+        if let Some(landed) = self.lbterm_state_landed(now) {
+            waits.push(Wait {
+                name: "landed".to_string(),
+                left_ms: landed.left_ms,
+            });
+        }
+        waits.sort_by(|a, b| a.left_ms.cmp(&b.left_ms).then_with(|| a.name.cmp(&b.name)));
+        waits
+    }
+
     /// Everything the file says about this window at `now`
     fn lbterm_state_window(&self, now: Instant) -> state::Window {
         let compositor = self.webgpu.as_ref().and_then(|w| w.compositor.as_ref());
         let focused = self.focused.is_some();
 
-        // What's moving: DWM's, the hearts the GUI draws frame by frame, and upstream's frames
-        // (a blinking cursor, an animated image), which it only asks for while focused
+        // What's moving: DWM's (the hearts too, with the compositor), the hearts the GUI draws
+        // frame by frame without it, and upstream's frames (a blinking cursor, an animated
+        // image), which it only asks for while focused
         let mut animations = compositor.map(|c| c.animations(now)).unwrap_or_default();
         let (hearts, flying) = self.lbterm_state_hearts(now);
         if let Some((from, to)) = flying {
@@ -157,6 +263,7 @@ impl TermWindow {
                 name: "hearts".to_string(),
                 progress: (now.saturating_duration_since(from).as_secs_f64() / whole.max(1e-9)).clamp(0.0, 1.0),
                 left_ms: state::millis(to.saturating_duration_since(now)),
+                played: vec![],
             });
         }
         if focused {
@@ -165,48 +272,20 @@ impl TermWindow {
                     name: "wezterm".to_string(),
                     progress: 0.0,
                     left_ms: state::millis(next.saturating_duration_since(now)),
+                    played: vec![],
                 });
             }
         }
         animations.sort_by(|a, b| a.left_ms.cmp(&b.left_ms).then_with(|| a.name.cmp(&b.name)));
 
-        let mut waits: Vec<Wait> = vec![];
-        waits.extend(self.tab_panel_waits(now));
-        waits.extend(self.lbterm_strip_waits(now));
-        waits.extend(self.lbterm_prompt_note_wait(now));
-        waits.extend(self.lbterm_readout_wait(now));
-        waits.extend(self.lbterm_conductor_wait(now));
-        // A prompt jump scrolls Claude Code's view until it lands; when isn't known ahead
-        if self.lbterm_prompt_jumping() {
-            waits.push(Wait {
-                name: "strip.jump".to_string(),
-                left_ms: 0,
-            });
-        }
+        let waits = self.lbterm_waits(now);
         let landed = self.lbterm_state_landed(now);
-        if let Some(landed) = &landed {
-            waits.push(Wait {
-                name: "landed".to_string(),
-                left_ms: landed.left_ms,
-            });
-        }
-        waits.sort_by(|a, b| a.left_ms.cmp(&b.left_ms).then_with(|| a.name.cmp(&b.name)));
 
-        let mut loops = vec![];
-        if let Some(plan) = self.lbterm_panel.plan.as_ref() {
-            if plan.spin && !plan.spinners.is_empty() {
-                loops.push("rail.spinner".to_string());
-            }
-            if plan.spin && !plan.rings.is_empty() {
-                loops.push("conductor.outline".to_string());
-            }
-            if plan.spin && plan.rings.iter().any(|r| r.light.is_some()) {
-                loops.push("conductor.light".to_string());
-            }
-        }
-        if compositor.is_some() && self.lbterm_conductor_spinning() {
-            loops.push("menu.spinner".to_string());
-        }
+        // What DWM was given to play for ever, from the compositor's own tree: the plan's `spin`
+        // would pass a check while the code applying it was broken (lbterm/PITFALLS.md, "Measuring")
+        let loops: Vec<String> = compositor
+            .map(|c| c.loops().into_iter().map(str::to_string).collect())
+            .unwrap_or_default();
 
         // The tabs, the window's lock let go before the panes are asked anything
         let (tabs, active_tab) = match Mux::get().get_window(self.mux_window_id) {
@@ -236,14 +315,20 @@ impl TermWindow {
             .collect();
 
         let active = self.get_active_pane_or_overlay();
+        // The panes this frame drew: the open tab's, or the ones kept in their place while a held
+        // pane's push hasn't come (frame_wait.rs)
         let panes: Vec<state::Pane> = self
-            .get_panes_to_render()
+            .lbterm_panes_to_paint()
             .iter()
             .map(|pos| {
                 let pane = &pos.pane;
                 let id = pane.pane_id();
                 let rect = self
                     .lbterm_card(pos)
+                    .map(|a| state::Rect::round(a.x as f64, a.y as f64, a.w as f64, a.h as f64))
+                    .unwrap_or_default();
+                let cells = self
+                    .lbterm_pane_cells(pos)
                     .map(|a| state::Rect::round(a.x as f64, a.y as f64, a.w as f64, a.h as f64))
                     .unwrap_or_default();
                 let dims = pane.get_dimensions();
@@ -253,6 +338,7 @@ impl TermWindow {
                     id: id as u64,
                     server_id: (server != id as u64).then_some(server),
                     rect,
+                    cells,
                     cols: pos.width,
                     rows: pos.height,
                     active: pos.is_active,
@@ -264,6 +350,7 @@ impl TermWindow {
                         x: cursor.x,
                         y: (cursor.y - dims.physical_top) as i64,
                     },
+                    drawn_cursor: self.lbterm_state.drawn.get(&id).map(|d| d.cursor),
                     scroll_top: self.get_viewport(id).map(|top| top as i64),
                     session: pane.copy_user_vars().get("claude_session").cloned(),
                     progress: progress(pane.get_progress()),
@@ -319,7 +406,11 @@ impl TermWindow {
         let menu = self
             .lbterm_state_tab_menu()
             .or_else(|| self.lbterm_state_prompt_list())
-            .or_else(|| self.lbterm_state_conductor_menu());
+            .or_else(|| self.lbterm_state_conductor_menu())
+            .or_else(|| self.lbterm_state_inbox_list())
+            .or_else(|| self.lbterm_state_agenda_list())
+            .or_else(|| self.lbterm_state_context_list())
+            .or_else(|| self.lbterm_state_plus_menu());
 
         let animating = !animations.is_empty();
         state::Window {
@@ -328,6 +419,8 @@ impl TermWindow {
             frame: self.lbterm_state.frames,
             focused,
             keyboard: focused || self.lbterm_keyboard_assumed,
+            held: self.lbterm_state_held(),
+            tint: self.lbterm_state_tint(),
             animating,
             animations,
             settled: !animating && waits.is_empty(),
@@ -345,16 +438,72 @@ impl TermWindow {
             active_tab: (!tabs.is_empty()).then_some(active_tab),
             active_pane: active.as_ref().map(|p| p.pane_id() as u64),
             tabs: said_tabs,
+            panes_tab: self.lbterm_painted_tab_id().map(|id| id as u64),
             panes,
+            fading_panes: compositor
+                .map(|c| c.fading_panes().0.into_iter().map(|id| id as u64).collect())
+                .unwrap_or_default(),
+            fading_sides: compositor.map_or(0, |c| c.fading_sides().0),
+            fading_swaps: compositor.map_or(0, |c| c.fading_swaps().0),
+            spare_panes: compositor.map_or(0, |c| c.spare_panes()),
             scrollbar,
             rail: self.lbterm_panel.said.clone(),
             strip: self.lbterm_state_strip(lit, items),
+            objectives: self.lbterm_state_objectives(),
+            scroll_strip: self.lbterm_state_scroll_strip(),
             menu,
             overlay,
             readout: self.lbterm_state_readout(),
             landed,
             questions: self.lbterm_state_questions(),
+            thumbnails: self.lbterm_state_thumbnails(),
             hearts,
+            conductor_view: self.lbterm_state_view(),
+            tasks: self.lbterm_tasks_said(),
+            drafts: self.lbterm_state_drafts(),
+            ticked: self.lbterm_drafts.ticked.clone(),
+            next: self.lbterm_drafts.next.clone(),
+            new_tab: self.lbterm_state_new_tab(),
+            copied: self.lbterm_menu.copied.borrow().clone(),
+            visuals: self.lbterm_state.visuals.borrow().clone(),
+        }
+    }
+
+    /// This frame drew the visuals `drawn` names and kept `kept` as they were
+    /// (render/composited.rs)
+    pub(crate) fn lbterm_state_visuals(
+        &self,
+        drawn: impl ExactSizeIterator<Item = lbterm_motion::Target<mux::pane::PaneId>>,
+        kept: usize,
+    ) {
+        if state_probe::on() {
+            *self.lbterm_state.visuals.borrow_mut() = Some(state::Visuals {
+                drawn: drawn.len(),
+                kept,
+                which: drawn.map(|target| format!("{target:?}")).collect(),
+                ..Default::default()
+            });
+        }
+    }
+
+    /// What drawing this frame made and wrote on the GPU (termwindow/gpu_work.rs), the passes it
+    /// recorded and the submits it made, and the templates it made again (render/kept.rs), beside
+    /// the visuals it drew, and the bind groups the window keeps after it
+    pub(crate) fn lbterm_state_work(&self, work: lbterm_motion::content::Work, bind_groups: usize) {
+        if state_probe::on() {
+            if let Some(v) = self.lbterm_state.visuals.borrow_mut().as_mut() {
+                v.made = work.made;
+                v.bind_groups = bind_groups;
+                v.uploads = work.uploads;
+                v.upload_bytes = work.upload_bytes;
+                v.built = self.lbterm_state.built.borrow().iter().map(|s| s.to_string()).collect();
+                v.passes = work.passes;
+                v.submits = work.submits;
+                v.upload_us = work.upload_us;
+                v.record_us = work.record_us;
+                v.submit_us = work.submit_us;
+                v.stale = crate::termwindow::gpu_work::checking().then_some(work.stale);
+            }
         }
     }
 
@@ -375,6 +524,9 @@ impl TermWindow {
             self.lbterm_tab_menu_under(fx, fy),
             self.lbterm_prompt_list_under(fx, fy),
             self.lbterm_conductor_menu_under(fx, fy),
+            self.lbterm_inbox_list_under(fx, fy),
+            self.lbterm_agenda_list_under(fx, fy),
+            self.lbterm_context_list_under(fx, fy),
         ] {
             if let Some(item) = under {
                 pointer.over = if item.is_some() { "menu.item" } else { "menu" }.to_string();
@@ -382,13 +534,48 @@ impl TermWindow {
                 return pointer;
             }
         }
+        // The new-tab picker and its + menu, over everything but the menus, and the pad's zone
+        // (render/new_tab.rs): "menu" or "menu.item" for the + menu, "picker" with its row,
+        // "rail.new_tab"
+        if let Some((over, item)) = self.lbterm_new_tab_under(fx, fy) {
+            match over {
+                "menu" => {
+                    pointer.over = if item.is_some() { "menu.item" } else { "menu" }.to_string();
+                    pointer.item = item;
+                }
+                _ => {
+                    pointer.over = over.to_string();
+                    pointer.row = item;
+                }
+            }
+            return pointer;
+        }
+        if self.lbterm_tasks_card_at(fx, fy) {
+            pointer.over = "rail.tasks".to_string();
+            return pointer;
+        }
         if let Some((over, row)) = self.tab_panel_under(x as f32, y as f32) {
             pointer.over = over.to_string();
             pointer.row = row;
             return pointer;
         }
+        // The Conductor's view, over the panes while it's open
+        if let Some((over, button)) = self.lbterm_view_under(fx, fy) {
+            pointer.over = over.to_string();
+            pointer.button = button;
+            return pointer;
+        }
         if self.lbterm_strip_card_at(fx, fy) {
             pointer.over = "strip.card".to_string();
+            return pointer;
+        }
+        if let Some((over, row)) = self.lbterm_objectives_under(fx, fy) {
+            pointer.over = over.to_string();
+            pointer.row = row;
+            return pointer;
+        }
+        if let Some(over) = self.lbterm_scroll_strip_under(fx, fy) {
+            pointer.over = over.to_string();
             return pointer;
         }
         if let Some(item) = self.ui_items.iter().rev().find(|item| item.hit_test(x, y)) {

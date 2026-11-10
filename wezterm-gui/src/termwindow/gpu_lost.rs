@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use lbterm_extras::gpu::{removed_message, wait_before, TRIES};
+use lbterm_extras::gpu::{removed_message, says, takes, wait_before};
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use window::WindowOps;
 
@@ -49,6 +50,8 @@ impl TermWindow {
         }
         self.lbterm_gpu.rebuilding = true;
         log::error!("GPU device lost: dropping this window's GPU state to build it again");
+        // The process's adapter may have gone with it (a driver update): made anew (gpu_warm.rs)
+        super::gpu_warm::forget();
         // The render state first: its buffers and atlas hold the WebGpuState too
         self.render_state = None;
         self.webgpu = None;
@@ -61,20 +64,54 @@ impl TermWindow {
         let config = self.config.clone();
         // The size it has now; a paint resizes the surfaces to whatever it has by then
         let dimensions = self.dimensions;
+        // Windows' software renderer is kept only when the config asks for it
+        let software_asked = config.webgpu_force_fallback_adapter
+            || config
+                .webgpu_preferred_adapter
+                .as_ref()
+                .map_or(false, |p| p.device_type == format!("{:?}", wgpu::DeviceType::Cpu));
         promise::spawn::spawn(async move {
-            for attempt in 1..=TRIES {
-                smol::Timer::after(wait_before(attempt)).await;
+            // Until the GPU answers: a reset is over in seconds, a driver install takes longer, and
+            // a window that stopped trying would never draw again
+            for attempt in 1.. {
+                lbterm_extras::counters::timer(smol::Timer::after(wait_before(attempt))).await;
+                if take_test_software() {
+                    super::gpu_warm::software_next_for_test();
+                }
                 match WebGpuState::new(&window, dimensions, &config).await {
                     Ok(state) => {
-                        log::warn!("GPU state built again (try {attempt})");
+                        let software = state.adapter_info.device_type == wgpu::DeviceType::Cpu;
+                        if !takes(software, software_asked) {
+                            // The hardware adapter didn't answer yet: wgpu handed back WARP, which
+                            // would draw on the CPU from now on. Dropped, and the adapter made
+                            // anew on the next try
+                            if says(attempt) {
+                                log::warn!(
+                                    "GPU state not back yet (try {attempt}): only {} answered, Windows' software renderer, so the GPU is still resetting",
+                                    state.adapter_info.name
+                                );
+                            }
+                            drop(state);
+                            super::gpu_warm::forget();
+                            continue;
+                        }
+                        log::warn!(
+                            "GPU state built again (try {attempt}) on {}",
+                            state.adapter_info.name
+                        );
                         REBUILT.with(|r| r.borrow_mut().insert(mux_window_id, Rc::new(state)));
                         window.notify(TermWindowNotif::Apply(Box::new(|tw| tw.lbterm_gpu_rebuilt())));
                         return;
                     }
-                    Err(err) => log::warn!("GPU state not back yet (try {attempt} of {TRIES}): {err:#}"),
+                    Err(err) => {
+                        if says(attempt) {
+                            log::warn!("GPU state not back yet (try {attempt}): {err:#}");
+                        }
+                        // A failed try may have made the adapter it failed on: made anew
+                        super::gpu_warm::forget();
+                    }
                 }
             }
-            log::error!("gave up building the GPU state again after {TRIES} tries");
         })
         .detach();
     }
@@ -103,6 +140,7 @@ impl TermWindow {
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
         self.lbterm_panel.forget_laid_out();
+        self.lbterm_forget_words();
     }
 }
 
@@ -154,8 +192,21 @@ pub fn removed(_: &wgpu::Device) -> bool {
     false
 }
 
+/// For tests only: how many more tries at building the GPU state again are handed Windows'
+/// software renderer, as while the GPU is still resetting (`LBTERM_TEST_REBUILD_SOFTWARE`)
+static TEST_SOFTWARE_TRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// For tests only: whether this try is one of them
+fn take_test_software() -> bool {
+    TEST_SOFTWARE_TRIES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        .is_ok()
+}
+
 /// For tests only: with `LBTERM_TEST_REMOVE_DEVICE=<seconds>`, the window's device is removed
-/// that long after it opens (lbterm\perf\gpu-lost.ps1)
+/// that long after it opens (lbterm\perf\gpu-lost.ps1), and with
+/// `LBTERM_TEST_REBUILD_SOFTWARE=<tries>` that many of the tries at building it again are handed
+/// Windows' software renderer first, as wgpu hands it back while the GPU is still resetting
 pub fn schedule_test_removal(window: &window::Window) {
     let Some(seconds) = std::env::var("LBTERM_TEST_REMOVE_DEVICE")
         .ok()
@@ -163,9 +214,15 @@ pub fn schedule_test_removal(window: &window::Window) {
     else {
         return;
     };
+    if let Some(tries) = std::env::var("LBTERM_TEST_REBUILD_SOFTWARE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        TEST_SOFTWARE_TRIES.store(tries, Ordering::Release);
+    }
     let window = window.clone();
     promise::spawn::spawn(async move {
-        smol::Timer::after(Duration::from_secs(seconds)).await;
+        lbterm_extras::counters::timer(smol::Timer::after(Duration::from_secs(seconds))).await;
         window.notify(TermWindowNotif::Apply(Box::new(|tw| {
             if let Some(webgpu) = tw.webgpu.as_ref() {
                 remove_for_test(&webgpu.device);

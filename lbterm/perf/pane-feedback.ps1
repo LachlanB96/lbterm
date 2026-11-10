@@ -13,7 +13,8 @@ input: focus, keys and clicks are posted messages, and the window never takes th
 3. Ripple: a posted right click lights a circle round where it landed, growing as it fades, and
    the pane ends as it was (press).
 4. Copy: a posted drag over the prompt, let go (bound to CompleteSelection 'PrimarySelection',
-   which never touches Lachlan's clipboard), lights the selection brighter than its highlight,
+   which with the state file on goes to its `copied`, never Lachlan's clipboard: on Windows every
+   kind of clipboard is his, and a build from before feat/new-tab-menus wrote it, PITFALLS 151), lights the selection brighter than its highlight,
    which it settles to (copy_in, copy_out).
 5. A link in a program that has the mouse: a posted click on a URL a program prints after turning
    on SGR mouse reporting opens it (the test config's open-uri handler logs it and opens nothing),
@@ -23,7 +24,9 @@ input: focus, keys and clicks are posted messages, and the window never takes th
 7. Landed mark: F7 opens a search for "needle", Enter moves to a match, which is marked in the
    panel's coral.
 
-Captures go to target\perf\pane-feedback.
+When the window has answered comes from its state file (lbterm/STATE.md): the keyboard's
+outline gone, an animation over, the search (its pane's title) and its landed mark, the readout. The
+pictures still say how each answer looks. Captures go to target\perf\pane-feedback.
 
   pwsh -File lbterm\perf\pane-feedback.ps1 [-Slowdown 4]
 #>
@@ -57,6 +60,7 @@ return {
   cursor_blink_rate = 0,
   default_cursor_style = 'SteadyBlock',
   lbterm_crash_restore = false,
+  wsl_domains = {},
   default_prog = { 'C:/Program Files/PowerShell/7/pwsh.exe', '-NoProfile' },
   default_cwd = 'C:/Windows',
   -- Selecting as WezTerm's defaults do, but copying where Lachlan's clipboard never sees it
@@ -92,7 +96,11 @@ function Move-Keyboard([int]$to) {
 $slow = { param($ms) [int]($ms * $Slowdown) }
 Invoke-Test {
   $w = Open-TestWindow -ConfigFile $cfg -SameProcess -Log 'warn'
-  Start-Sleep 2
+  $sw = Wait-State { param($s) $s.frame -gt 0 -and $s.panes.Count -eq 1 } -What 'the window'
+  # A build from before feat/new-tab-menus puts a selection's copy on Lachlan's clipboard (on
+  # Windows every kind of clipboard is his: lbterm/PITFALLS.md, 151); one whose state file has
+  # `copied` puts it there instead
+  if ($sw.PSObject.Properties.Name -notcontains 'copied') { throw "the build in $Bin writes no copied to its state file, so this script's selection would overwrite Lachlan's clipboard (lbterm/PITFALLS.md, 151): run it against a build from feat/new-tab-menus on" }
   $first = (Get-Panes)[0].pane_id
   Invoke-Cli send-text --pane-id $first --no-paste "echo needle`r" | Out-Null
   $second = [int](Invoke-Cli split-pane --pane-id $first --right -Program (New-PwshProgram))
@@ -105,7 +113,10 @@ Invoke-Test {
 
   # 1. Keyboard away and back
   Send-Focus $w -Off
-  Start-Sleep -Milliseconds (& $slow 900)
+  # The dim under way, then over: the frame that first says the keyboard has gone can come before
+  # the one that starts the outline going out, and says nothing is animating
+  Wait-State { param($s) -not $s.keyboard -and @($s.animations | Where-Object name -eq 'outline.dim').Count } -What 'the outline going out' | Out-Null
+  Wait-Settled -Animating -What 'the outline out' | Out-Null
   $off = Get-Shot $w -Name 'keyboard-away'
   $atRest = & $brighter $off $rest $lower
   "outline at rest: $('{0:N2}' -f $atRest) brighter than with no keyboard, over the lower half"
@@ -122,7 +133,7 @@ Invoke-Test {
 
   # 2. Arrival from outside, and a key's own move. The pane that has the keyboard after the split
   # is the new one; the key goes first, then the cli moves the keyboard back to the first pane.
-  Start-Sleep -Milliseconds 1200
+  Wait-Settled -Animating -What 'the pulse to end' | Out-Null
   Send-Key $w Shift
   Start-Sleep -Milliseconds 100
   Move-Keyboard $first
@@ -132,6 +143,8 @@ Invoke-Test {
   $keyedPeak = ($keyed | Measure-Object -Maximum).Maximum
   if ($keyedPeak -gt 1.8 * $atRest) { Add-Failure "a move just after a key pulsed (peak $('{0:N2}' -f $keyedPeak) against rest $('{0:N2}' -f $atRest)): it's the key's" }
   Remove-Frames $frames
+  # From outside: more than a second after the Shift (QUIET in lbterm-extras/src/arrival.rs), so
+  # the move isn't the key's. The clock is the point here, not a wait for the window.
   Start-Sleep -Milliseconds 1500
   Move-Keyboard $second
   $frames = Get-Frames $w (& $slow 600)
@@ -156,7 +169,7 @@ Invoke-Test {
   elseif ($lit[-1] -le $lit[0]) { Add-Failure "the ripple didn't grow: $(Trace $lit)" }
   if ($lit.Count) { Save-Shot $frames[[array]::IndexOf($reach, $lit[0])].Shot 'ripple' }
   Remove-Frames $frames
-  Start-Sleep -Milliseconds (& $slow 300)
+  Wait-Settled -Animating -What 'the ripple to end' | Out-Null
   $after = Get-Shot $w
   $whole = New-Rect 0 0 $winW $winH
   $left = [LbtermE2E.Px]::Changed($base, $after, $whole, 2)
@@ -182,23 +195,25 @@ Invoke-Test {
   Send-Click $w ([int]($winW / 4)) ([int]($winH * 0.8))
 
   # 7. Search's landed mark (before the link's tab: it searches the first pane)
-  Start-Sleep -Milliseconds 400
+  Wait-Settled -Animating -What 'the copy''s flash to end' | Out-Null
   Send-Key $w F7
-  Start-Sleep -Milliseconds 600
+  # The search, by its pane's title: the file's overlay stays null for it (STATE.md says it names it)
+  $searching = { param($s) @($s.panes | Where-Object { $_.active -and $_.title -like 'Copy mode*' }).Count -gt 0 }
+  Wait-State $searching -What 'the search' | Out-Null
   Send-Key $w Enter
-  Start-Sleep -Milliseconds 300
+  Wait-State { param($s) $s.landed } -What 'the landed mark' | Out-Null
   $marked = Get-Shot $w -Name 'search-mark'
   $n = [LbtermE2E.Px]::CountRange($marked, $whole, $coral)
   "search: $n coral pixels"
   if ($n -lt 10) { Add-Failure 'moving to a search match marked nothing in coral (search-mark.png)' }
   Send-Key $w Escape
-  Start-Sleep -Milliseconds 2000
+  Wait-State { param($s) -not (& $searching $s) -and $s.settled } -What 'the search gone and its mark with it' | Out-Null
 
   # 6. The readout: resized, then the font
   $before = Settled $w
   $wr = Get-WindowRect $w
   Set-WindowSize $w ($wr.Right - $wr.Left - 90) ($wr.Bottom - $wr.Top)
-  Start-Sleep -Milliseconds 250
+  Wait-State { param($s) $s.readout } -What 'the size readout' | Out-Null
   $shown = Get-Shot $w -Name 'readout'
   # Over the active pane, the first, on the left
   $middle = New-Rect ([int]($shown.Width / 4 - 50)) ([int]($shown.Height / 2 - 20)) 100 40
@@ -207,7 +222,7 @@ Invoke-Test {
   "readout after a resize: $readout pixels in the middle"
   if ($readout -lt 30) { Add-Failure 'resizing the window showed no readout in the middle (readout.png)' }
   Send-Key $w F5
-  Start-Sleep -Milliseconds 300
+  Wait-State { param($s) $s.readout -match '%' } -What 'the readout for the font' | Out-Null
   $font = Get-Shot $w -Name 'readout-font'
   Send-Key $w F6
   $settled2 = Settled $w

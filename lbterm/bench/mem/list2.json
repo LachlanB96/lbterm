@@ -1,0 +1,9 @@
+[
+  { "name": "c-tabs", "config": "bench", "lua": "lbterm_compositor = true,", "steps": ["tabs:8"] },
+  { "name": "c-sb9001", "config": "bench", "lua": "lbterm_compositor = true,", "scrollback": 9001, "steps": ["lines:100000:plain", "closefill"] },
+  { "name": "c-sb100k", "config": "bench", "lua": "lbterm_compositor = true,", "scrollback": 100000, "steps": ["lines:100000:plain", "closefill"] },
+  { "name": "c-sb100k-varied", "config": "bench", "lua": "lbterm_compositor = true,", "scrollback": 100000, "steps": ["lines:100000:varied", "closefill"] },
+  { "name": "c-cache16", "config": "bench", "lua": "lbterm_compositor = true,|line_quad_cache_size = 16,|line_to_ele_shape_cache_size = 16,|shape_cache_size = 16,|line_state_cache_size = 16,", "scrollback": 9001, "steps": ["lines:100000:plain"] },
+  { "name": "c-cache4096", "config": "bench", "lua": "lbterm_compositor = true,|line_quad_cache_size = 4096,|line_to_ele_shape_cache_size = 4096,|shape_cache_size = 4096,|line_state_cache_size = 4096,", "scrollback": 9001, "steps": ["lines:100000:plain"] },
+  { "name": "b-default-log", "config": "bench", "log": "wgpu_core=info,wgpu_hal=info,info", "steps": [] }
+]

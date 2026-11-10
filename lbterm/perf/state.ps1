@@ -16,8 +16,9 @@ posted messages. Each step waits on what the file says, not on a capture or a fi
    (rail.edge) and settles open, full, with the pointer on rail.row 0.
 5. The pointer leaving (a posted WM_MOUSELEAVE): the panel waits out its grace (rail.close),
    closes and settles closed.
-6. The tab menu: a posted right click on the second row's pad opens it for that tab, its six
-   items where the file says; a posted move onto Duplicate tab's rectangle picks it (focus, and
+6. The tab menu: a posted right click on the second row's pad opens it for that tab, a shell tab's
+   six items where the file says (and New session in <Project> when the folder is in one of the
+   config's projects, as Lachlan's puts the test's); a posted move onto Shell in its folder's rectangle picks it (focus, and
    the pointer over menu.item); a posted Esc closes it with nothing done.
 7. A second test window, with no config, so on the default front end (not WebGpu), and the
    variable set: it stays alive, and its file names it by its HWND. (Until 9fbea202d the GUI
@@ -160,7 +161,7 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   "   closed: animations seen $($names -join ', '); settled at frame $($w.frame)"
   if ($names -notcontains 'rail.edge') { Add-Failure "the panel's edge closing wasn't in the file: $($names -join ', ')" }
 
-  # 6. The tab menu: a right click on the second row's pad opens it, a move onto Duplicate tab,
+  # 6. The tab menu: a right click on the second row's pad opens it, a move onto Shell in its folder,
   # where the file says it is, picks it, and Esc closes it
   $row = $w.rail.rows[1]
   $x, $y = Get-RectCenter $row.pad
@@ -170,14 +171,20 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
     $labels = @($m.menu.items | ForEach-Object label)
     "6. tab menu for tab $($m.menu.tab): $($labels -join ', ')"
     if ($m.menu.kind -ne 'tab' -or $m.menu.tab -ne $row.tab) { Add-Failure "the menu is $($m.menu.kind) for tab $($m.menu.tab), not the tab menu for $($row.tab)" }
-    if ($labels.Count -ne 6 -or @($m.menu.items | Where-Object { -not $_.rect }).Count) { Add-Failure "the menu's items: $($m.menu.items | ConvertTo-Json -Compress -Depth 5)" }
-    $dup = [Array]::IndexOf($labels, 'Duplicate tab')
+    # A shell tab's six rows, Park tab too on a build that parks (Lachlan's 8a; its rows say
+    # `parked`), and New session in <Project> when the window's config (Lachlan's, with his
+    # projects) puts the tab's folder in one (lbterm/TAB-MOUSE.md, "The tab menu's model")
+    $shellRows = @('Rename tab', 'Colour', 'Shell in its folder', 'Move to new window', 'Close other tabs', 'Close tab')
+    if (@($m.rail.rows)[0].PSObject.Properties['parked']) { $shellRows += 'Park tab' }
+    $others = @($labels | Where-Object { $_ -notin $shellRows -and $_ -notlike 'New session in *' })
+    if (@($labels | Where-Object { $_ -in $shellRows }).Count -ne $shellRows.Count -or $others.Count -or @($m.menu.items | Where-Object { -not $_.rect }).Count) { Add-Failure "the menu's items: $($m.menu.items | ConvertTo-Json -Compress -Depth 5)" }
+    $dup = [Array]::IndexOf($labels, 'Shell in its folder')
     $x, $y = Get-RectCenter $m.menu.items[$dup].rect
     Set-PointerHold $win $x $y
-    $w = Watch { param($w) $w.menu.focus -eq $dup -and $w.pointer.over -eq 'menu.item' } 'the pointer on Duplicate tab'
+    $w = Watch { param($w) $w.menu.focus -eq $dup -and $w.pointer.over -eq 'menu.item' } 'the pointer on Shell in its folder'
     if ($w) {
       "   the pointer on item $($w.pointer.item), focus $($w.menu.focus)"
-      if ($w.pointer.item -ne $dup) { Add-Failure "the pointer is on item $($w.pointer.item), not Duplicate tab ($dup)" }
+      if ($w.pointer.item -ne $dup) { Add-Failure "the pointer is on item $($w.pointer.item), not Shell in its folder ($dup)" }
     }
     Clear-PointerHold
     Send-Key $win Escape

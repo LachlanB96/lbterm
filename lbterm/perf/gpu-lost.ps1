@@ -1,5 +1,6 @@
 #Requires -Version 7
-# Covers: wezterm-gui/src/termwindow/gpu_lost.rs, lbterm-extras/src/gpu.rs, wezterm-gui/src/termwindow/webgpu.rs
+# Variant: -SoftwareTries 2
+# Covers: wezterm-gui/src/termwindow/gpu_lost.rs, lbterm-extras/src/gpu.rs, wezterm-gui/src/termwindow/webgpu.rs, wezterm-gui/src/termwindow/gpu_warm.rs, wezterm-gui/src/main.rs
 <#
 Losing the GPU device and carrying on (lbterm/GPU-LOST.md): a test window with the compositor and
 the WebGpu front end (on the right-most screen, without focus) gets a pane that counts, and
@@ -7,9 +8,15 @@ LBTERM_TEST_REMOVE_DEVICE=3 makes LBTerm remove its own D3D12 device three secon
 driver reset would. The window must still be open after, its log must say the GPU state was
 built again, and the count must have gone on: gpu-before.png and gpu-after.png.
 
+-SoftwareTries N (LBTERM_TEST_REBUILD_SOFTWARE) hands the first N tries at building it again
+Windows' software renderer, as wgpu hands it back while the GPU is still resetting (ITMan's
+incident of 2026-11-07: the window kept it and drew on the CPU until restarted). Each of those
+must be refused in the log, and the state built again on try N+1, on a hardware adapter.
+
   pwsh -File lbterm\perf\gpu-lost.ps1
+  pwsh -File lbterm\perf\gpu-lost.ps1 -SoftwareTries 2
 #>
-param([string]$Bin)
+param([string]$Bin, [int]$SoftwareTries = 0)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test 'gpu-lost' -Bin $Bin
@@ -30,7 +37,7 @@ function Measure-Shot($w, [string]$name) {
 
 Invoke-Test {
   $w = Open-TestWindow -NoConfig -Set "front_end='WebGpu'", 'lbterm_compositor=true', 'initial_rows=20' -Program (New-PwshProgram $counter) `
-    -Log 'lbterm_gui::termwindow=info,warn' -Environment @{ LBTERM_TEST_REMOVE_DEVICE = '3' }
+    -Log 'lbterm_gui::termwindow=info,warn' -Environment @{ LBTERM_TEST_REMOVE_DEVICE = '3'; LBTERM_TEST_REBUILD_SOFTWARE = "$SoftwareTries" }
   $h = $w.Handle
   # Before the device goes, 3 s after the window started: a fixed time, since that's how the
   # GUI times it
@@ -73,4 +80,14 @@ Invoke-Test {
   $lines | Select-Object -Last 8
   if (-not ($lines -match 'GPU device lost')) { Add-Failure 'the log never says the device was lost' }
   if (-not ($lines -match 'GPU state built again')) { Add-Failure 'the log never says the GPU state was built again' }
-} -Passed 'gpu-lost: the device went, the window stayed, and the panes went on'
+  # Windows' software renderer is never kept: each try handed it is refused, and the state is
+  # built again on the next, on the hardware adapter
+  $refused = @($lines -match "only .+ answered, Windows' software renderer")
+  if ($refused.Count -ne $SoftwareTries) { Add-Failure "the log refuses the software renderer $($refused.Count) times, not $SoftwareTries" }
+  $built = @($lines -match 'GPU state built again \(try (\d+)\) on (.+)$') | Select-Object -Last 1
+  if ($built -and $built -match 'GPU state built again \(try (\d+)\) on (.+)$') {
+    "built again on try $($Matches[1]), on $($Matches[2])"
+    if ([int]$Matches[1] -ne $SoftwareTries + 1) { Add-Failure "built again on try $($Matches[1]), not $($SoftwareTries + 1)" }
+    if ($Matches[2] -match 'Basic Render') { Add-Failure "built again on Windows' software renderer: $($Matches[2])" }
+  }
+} -Passed $(if ($SoftwareTries) { "gpu-lost: the device went, $SoftwareTries tries handed the software renderer were refused, and the window came back on the GPU" } else { 'gpu-lost: the device went, the window stayed, and the panes went on' })

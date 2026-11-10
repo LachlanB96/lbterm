@@ -31,5 +31,9 @@ wezterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds.workspace = true
 
+[dev-dependencies]
+# LBTerm: a test pane's writer (lbterm_held_tests.rs), the Pane trait's guard
+parking_lot.workspace = true
+
 [target."cfg(windows)".dependencies]
-windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock", "Win32_Storage_FileSystem"] }

@@ -1,0 +1,52 @@
+[38:2::80:80:80m[48:2::55:55:55m❯ Create a file notes.txt containing three lines: alpha, beta, gamma.[39m[K
+[49m  [38:2::177:185:249mb15c-f1842da17891\scratchpad\probe\work\notes.txt[39m.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mCooked for 4s · done 15:07
+
+[48:2::55:55:55m❯ [38:2::255:255:255mExplain in 15 short numbered lines how a scrollbar works.[39m[K
+
+[38:2::255:255:255m[49m●[39m 1. A scrollbar is a control that shows which part of a longer document is visible.
+  2. The track is the full length of the scrollable area.
+  3. The thumb is the draggable piece inside the track.
+  4. Its size is the visible area divided by the total content height.
+  5. A large thumb means little content is hidden; a small one means a lot is.
+  6. Its position is the scroll offset divided by the scrollable range.
+  7. Dragging the thumb changes the scroll offset.
+  8. Clicking the track jumps one screen-height up or down.
+  9. Arrow buttons at each end scroll by a small fixed step.
+  10. The mouse wheel and trackpad send scroll events that change the same offset.
+  11. The app redraws only the lines that fall inside the new window.
+  12. The thumb is recalculated whenever the content or window size changes.
+  13. When content fits the window, the scrollbar is hidden or disabled.
+  14. Terminals keep a scrollback buffer of past lines so the bar has something to scroll through.
+  15. Scrolling changes which slice of that buffer is drawn, not the buffer itself.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mWorked for 3s · done 15:07
+
+[48:2::55:55:55m❯ [38:2::255:255:255mPrint the numbers 1 to 120, each on its own line as 'line N', nothing else.[39m[K
+
+[38:2::255:255:255m[49m●[39m line 1
+  line 2
+  line 3
+  line 4
+  line 5
+  line 6
+  line 7
+  line 8
+  line 9
+  line 10
+  line 11
+  line 12
+  line 13
+  line 14
+  line 15
+  line 16                           [38:2::255:255:255m[48:2::55:55:55m Jump to bottom (ctrl+End) ↓ 
+
+[38:2::136:136:136m[49m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m▸ probe summary line
+[39m  [38:2::153:153:153mhaiku | probe | main
+[39m  [38:2::153:153:153mtoggles line
+[39m  [38:2::175:135:255m⏵⏵ accept edits on[38:2::153:153:153m (shift+tab to cycle) · ← 2 agents
+[39m

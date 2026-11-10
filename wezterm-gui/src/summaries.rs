@@ -5,10 +5,14 @@
 //!
 //! A pane's session is its `claude_session` user var. [`get`] answers from
 //! memory; a session it hasn't seen is read off this thread, and every window
-//! repaints when it arrives or any summary asked for changes.
+//! repaints when it arrives or any summary asked for changes, except for a
+//! change to what a session has cost alone (`<sid>.usage.json`, which Terminal's
+//! statusline rewrites as often as a cent moves): only a window showing that
+//! session's dollars repaints, on the context pill or the open tab panel
+//! (render/context.rs, `lbterm_shows_usage`).
 
 use crate::termwindow::TermWindowNotif;
-use lbterm_extras::summaries::{Summaries, Summary};
+use lbterm_extras::summaries::{Changed, Summaries, Summary};
 use std::sync::{Arc, Mutex};
 use window::WindowOps;
 
@@ -26,27 +30,36 @@ pub fn store() -> Option<Arc<Summaries>> {
             return Some(Arc::clone(summaries));
         }
     }
-    let summaries = Arc::new(Summaries::start(dir.into(), || {
-        promise::spawn::spawn_into_main_thread(async move { repaint() }).detach();
+    let summaries = Arc::new(Summaries::start(dir.into(), |changed| {
+        promise::spawn::spawn_into_main_thread(async move { repaint_for(changed) }).detach();
     }));
     *store = Some((dir.to_string(), Arc::clone(&summaries)));
     Some(summaries)
 }
 
-/// What's known of session `sid`, if summaries are on.
-pub fn get(sid: &str) -> Option<Summary> {
+/// What's known of session `sid`, if summaries are on: shared, nothing of it copied (the rail
+/// asks for every tab's on every frame).
+pub fn get(sid: &str) -> Option<Arc<Summary>> {
     store()?.get(sid)
 }
 
-/// Every window draws again, with what's new
-fn repaint() {
+/// The windows that show what changed draw again: every one for anything a window may show, and
+/// for what sessions have cost alone, those showing one of them
+fn repaint_for(changed: Changed) {
     let Some(fe) = crate::frontend::try_front_end() else {
         return;
     };
+    let sessions = match changed {
+        Changed::Any => None,
+        Changed::Usage(sids) => Some(Arc::new(sids)),
+    };
     for win in fe.gui_windows() {
-        win.window.notify(TermWindowNotif::Apply(Box::new(|tw| {
-            if let Some(window) = tw.window.as_ref() {
-                window.invalidate();
+        let sessions = sessions.clone();
+        win.window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+            if sessions.as_deref().map_or(true, |sids| tw.lbterm_shows_usage(sids)) {
+                if let Some(window) = tw.window.as_ref() {
+                    window.invalidate();
+                }
             }
         })));
     }

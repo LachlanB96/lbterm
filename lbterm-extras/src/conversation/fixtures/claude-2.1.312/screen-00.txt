@@ -1,0 +1,52 @@
+
+[38:2::215:119:87m ▐[48:2::0:0:0m▛███▛█[39m[49m   (B[0;1mClaude Code(B[0m [38:2::153:153:153mv2.1.312[39m
+[38:2::215:119:87m▝▜[48:2::0:0:0m█████[49m█▀[39m  [38:2::153:153:153mHaiku 5.5 · Claude Max
+[38:2::215:119:87m ▝▝   ▝▝ [39m  [38:2::153:153:153m~\AppData\Local\Temp\claude\C--Users-DemoUser-my-projects\00000000-1111-2222-3333-44…
+
+
+[48:2::55:55:55m❯ [38:2::255:255:255mList 30 animals, one per line, numbered, nothing else.[39m[K
+
+[38:2::255:255:255m[49m●[39m Aardvark
+  Albatross
+  Alligator
+  Alpaca
+  Antelope
+  Armadillo
+  Badger
+  Bat
+  Bear
+  Beaver
+  Bison
+  Buffalo
+  Camel
+  Cheetah
+  Chimpanzee
+  Dolphin
+  Eagle
+  Elephant
+  Falcon
+  Ferret
+  Flamingo
+  Giraffe
+  Gorilla
+  Hedgehog
+  Hippopotamus
+  Jaguar
+  Kangaroo
+  Koala
+  Lemur
+  Lion
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mSautéed for 2s · done 15:06[39m
+
+[38:2::153:153:153m[48:2::55:55:55m❯ [38:2::255:255:255mWrite a 12-line poem about terminals.[39m[K
+[49m                                    [38:2::255:255:255m[48:2::55:55:55m Jump to bottom (ctrl+End) ↓ [39m[49m
+
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m▸ probe summary line
+[39m  [38:2::153:153:153mhaiku | probe | main
+[39m  [38:2::153:153:153mtoggles line
+[39m  [38:2::175:135:255m⏵⏵ accept edits on[38:2::153:153:153m (shift+tab to cycle) · ← 2 agents
+[39m

@@ -180,6 +180,10 @@ struct CommandBuilderFrag {
 }
 
 impl CommandBuilderFrag {
+    /// The command, when `args` names one, and the folder to start in. LBTerm: the folder goes
+    /// on the command and is the spawn's own too. Upstream gave it to the command alone, and the
+    /// mux starts a spawn with no folder of its own in the open pane's, over the command's, so
+    /// `spawn_tab { args = ..., cwd = ... }` started wherever the open pane was (2026-10-29)
     fn to_command_builder(&self) -> (Option<CommandBuilder>, Option<String>) {
         if let Some(args) = &self.args {
             let mut builder = CommandBuilder::from_argv(args.iter().map(Into::into).collect());
@@ -189,10 +193,60 @@ impl CommandBuilderFrag {
             if let Some(cwd) = self.cwd.clone() {
                 builder.cwd(cwd);
             }
-            (Some(builder), None)
+            (Some(builder), self.cwd.clone())
         } else {
             (None, self.cwd.clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn a_command_starts_in_the_folder_it_names() {
+        let frag = CommandBuilderFrag {
+            args: Some(vec!["pwsh".to_string()]),
+            cwd: Some("C:/work".to_string()),
+            ..Default::default()
+        };
+        let (builder, dir) = frag.to_command_builder();
+        // The spawn's own folder, which the open pane's doesn't override
+        assert_eq!(dir.as_deref(), Some("C:/work"));
+        let builder = builder.expect("args name a command");
+        assert_eq!(builder.get_cwd().and_then(|d| d.to_str()), Some("C:/work"));
+        assert_eq!(builder.get_argv(), &vec![std::ffi::OsString::from("pwsh")]);
+        // A folder alone, and neither (the mux finds one: the open pane's)
+        let frag = CommandBuilderFrag {
+            cwd: Some("C:/work".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(frag.to_command_builder(), (None, Some(d)) if d == "C:/work"));
+        assert!(matches!(CommandBuilderFrag::default().to_command_builder(), (None, None)));
+    }
+
+    #[test]
+    fn spawn_tab_switches_to_the_new_tab_unless_told_not_to() {
+        use std::collections::BTreeMap;
+        use wezterm_dynamic::Value;
+        let parse = |fields: Vec<(&str, Value)>| {
+            let map: BTreeMap<Value, Value> = fields
+                .into_iter()
+                .map(|(k, v)| (Value::String(k.to_string()), v))
+                .collect();
+            SpawnTab::from_dynamic(&Value::Object(map.into()), Default::default())
+                .expect("a spawn_tab table")
+        };
+        // As upstream's: the window goes to it
+        assert!(parse(vec![]).activate);
+        assert!(!parse(vec![("activate", Value::Bool(false))]).activate);
+        let t = parse(vec![
+            ("activate", Value::Bool(true)),
+            ("cwd", Value::String("C:/work".to_string())),
+        ]);
+        assert!(t.activate);
+        assert_eq!(t.cmd_builder.cwd.as_deref(), Some("C:/work"));
     }
 }
 
@@ -268,10 +322,19 @@ impl SpawnWindow {
 struct SpawnTab {
     #[dynamic(default)]
     domain: SpawnTabDomain,
+    /// LBTerm: false adds the tab without switching the window to it, its server's window on a
+    /// mux domain too (SpawnNoActivate, as `lbterm cli spawn --no-activate`): the new-tab
+    /// picker's Shift+Enter, from Lua (lbterm/NEW-TAB.md)
+    #[dynamic(default = "default_activate")]
+    activate: bool,
     #[dynamic(flatten)]
     cmd_builder: CommandBuilderFrag,
 }
 impl_lua_conversion_dynamic!(SpawnTab);
+
+fn default_activate() -> bool {
+    true
+}
 
 impl SpawnTab {
     async fn spawn(self, window: &MuxWindow) -> mlua::Result<(MuxTab, MuxPane, MuxWindow)> {
@@ -294,7 +357,7 @@ impl SpawnTab {
         let (cmd_builder, cwd) = self.cmd_builder.to_command_builder();
 
         let (tab, pane, window_id) = mux
-            .spawn_tab_or_window(
+            .spawn_tab_or_window_activating(
                 Some(window.0),
                 self.domain,
                 cmd_builder,
@@ -303,6 +366,7 @@ impl SpawnTab {
                 pane,
                 String::new(),
                 None, // optional gui window position
+                self.activate,
             )
             .await
             .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;

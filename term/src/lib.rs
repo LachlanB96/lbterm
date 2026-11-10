@@ -44,6 +44,9 @@ pub use crate::terminalstate::*;
 /// LBTerm: OSC 7501 program status
 pub mod program_status;
 
+/// LBTerm: where a screen's lines can have changed since a sequence number
+pub mod lbterm_changes;
+
 /// Represents the index into screen.lines.  Index 0 is the top of
 /// the scrollback (if any).  The index of the top of the visible screen
 /// depends on the terminal dimensions and the scrollback size.

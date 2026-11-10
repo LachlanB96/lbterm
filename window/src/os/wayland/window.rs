@@ -751,6 +751,8 @@ impl WaylandWindowInner {
                 MousePress::Left => MouseButtons::LEFT,
                 MousePress::Right => MouseButtons::RIGHT,
                 MousePress::Middle => MouseButtons::MIDDLE,
+                MousePress::Back => MouseButtons::X1,
+                MousePress::Forward => MouseButtons::X2,
             };
 
             if state == ButtonState::Pressed {

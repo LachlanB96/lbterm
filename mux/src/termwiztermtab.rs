@@ -243,7 +243,7 @@ impl Pane for TermWizTerminalPane {
             MouseButton::WheelDown(_) => Buttons::VERT_WHEEL,
             MouseButton::WheelLeft(_) => Buttons::HORZ_WHEEL | Buttons::WHEEL_POSITIVE,
             MouseButton::WheelRight(_) => Buttons::HORZ_WHEEL,
-            MouseButton::None => Buttons::NONE,
+            MouseButton::None | MouseButton::Back | MouseButton::Forward => Buttons::NONE,
         };
 
         let event = InputEvent::Mouse(TermWizMouseEvent {

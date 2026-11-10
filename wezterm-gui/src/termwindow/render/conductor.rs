@@ -12,9 +12,11 @@
 //! of their own, whose hues DWM turns and whose light DWM carries round (compositor.rs, `Ring`).
 //! Without it they're drawn still, in the panel's body.
 //!
-//! The menu is drawn in z-layers 66 to 68, beside the tab menu's and the prompt list's in the
-//! compositor's `top` visual, over the tab panel.
+//! The menu is drawn in z-layers 66 to 68, its slot's in the menus' visuals over the tab panel,
+//! fading in and out with its highlight gliding between rows (render/menu_fade.rs,
+//! `Slot::Conductor`).
 
+use crate::termwindow::render::menu_fade::Slot;
 use super::tab_panel::{light_bands, srgb};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::box_model::{BorderColor, Element, ElementColors, ElementContent, LayoutContext};
@@ -22,19 +24,19 @@ use crate::termwindow::{TermWindow, TermWindowNotif};
 use crate::utilsprites::RenderMetrics;
 use ::window::{CursorIcon, MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps};
 use config::DimensionContext;
-use lbterm_extras::conductor::{self, Level, Menu, Said};
+use lbterm_extras::conductor::{self, Hairline, Level, Menu, Outline, Said};
 use lbterm_extras::tabs::Rect;
 use lbterm_motion::PixelRect;
 use lbterm_panel::words::HeadSays;
 use lbterm_panel::{palette, Area, Layout};
+use std::sync::Arc;
 use std::time::Instant;
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
 
-/// The menu's light, card and words: in the tab menu's range, so the compositor's `top`
-const GLOW_Z: i8 = 66;
-const CARD_Z: i8 = 67;
-const TEXT_Z: i8 = 68;
+/// The menu's card and words, its slot's (render/menu_fade.rs): 66 is its glow's
+const CARD_Z: i8 = Slot::Conductor.card_z();
+const TEXT_Z: i8 = Slot::Conductor.text_z();
 
 /// The outlines' two looks (lbterm/DESIGN.md, picked 2026-10-21)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +62,7 @@ const RING_GLOW: f32 = 5.0;
 const LIGHT_REACH: f32 = 7.0;
 
 /// The turning arc on an item that waits for its answer: its template's z-layer, its visual
-/// over the menu in the compositor's `top` (compositor.rs, `MenuSpinner`), and drawn straight
+/// over the menus' visuals (compositor.rs, `MenuSpinner`), and drawn straight
 /// over the menu, still, without the compositor
 pub const MENU_SPIN_Z: i8 = 76;
 
@@ -82,7 +84,7 @@ struct Pending {
     /// Its place in `items`
     pos: usize,
     /// What the file said when it was picked
-    said: Said,
+    said: Arc<Said>,
     since: Instant,
 }
 
@@ -93,15 +95,6 @@ pub struct ConductorState {
     spinner: Option<PixelRect>,
     /// When a repaint is already on its way, to give up waiting
     wake: Option<Instant>,
-}
-
-fn grow(r: Rect, by: f64) -> Rect {
-    Rect {
-        x: r.x - by,
-        y: r.y - by,
-        w: r.w + 2.0 * by,
-        h: r.h + 2.0 * by,
-    }
 }
 
 fn srgb_alpha(rgb: u32, alpha: f32) -> LinearRgba {
@@ -127,7 +120,7 @@ pub fn light_path(layout: &Layout, pill: Area) -> (Area, f32) {
 impl TermWindow {
     /// What the Conductor's state file says now: nothing without the Conductor in the config;
     /// no file reads as off
-    pub(crate) fn lbterm_conductor_said(&self) -> Option<Said> {
+    pub(crate) fn lbterm_conductor_said(&self) -> Option<Arc<Said>> {
         let conductor = self.config.lbterm_conductor.as_ref()?;
         Some(crate::state_files::said(&conductor.state_file).unwrap_or_default())
     }
@@ -135,6 +128,11 @@ impl TermWindow {
     /// What its slot on the rail says, and how far it may act on its own
     pub(crate) fn lbterm_conductor_head(&self) -> Option<(HeadSays, Level)> {
         let conductor = self.config.lbterm_conductor.as_ref()?;
+        // With a seat in the config, LBTerm listens to it from the pad's first paint, view open or
+        // not: `seat.show` (`conductor open`, the dashboard) opens the view
+        if self.lbterm_view_on() {
+            crate::seat_client::listen();
+        }
         let said = self.lbterm_conductor_said()?;
         let pad = conductor::pad(&said);
         let (glyph_colour, label_colour) = match pad.level {
@@ -143,50 +141,81 @@ impl TermWindow {
             Level::AcceptMost => (palette::CONDUCTOR_ON, palette::MODE_MOST),
             Level::AcceptAll => (palette::CONDUCTOR_ON, palette::MODE_ALL),
         };
+        // Asks waiting on his Allow or Deny: its pad is a tab's blocked on him, orange
+        let glyph_colour = if self.lbterm_conductor_asks() > 0 {
+            palette::number(lbterm_panel::RowState::Waiting)
+        } else {
+            glyph_colour
+        };
         let says = HeadSays {
             glyph: conductor.glyph.clone(),
             glyph_colour,
             label: pad.label,
             label_colour,
             mark: pad.remote.then(|| conductor.remote_glyph.clone()),
+            // The tab connections suggested with a member on this rail, as this paint's
+            // tab_panel_links found them (lbterm/LINKS.md, "Connections"; his E8)
+            badge: lbterm_extras::links::badge(self.lbterm_panel.links.suggested),
             name: said.get("label").unwrap_or("Conductor").to_string(),
             says: said.tooltip().unwrap_or("").to_string(),
         };
         Some((says, pad.level))
     }
 
-    /// The Conductor's pad on the rail, under its words: the pad, the outline round its pill (the
-    /// spectrum's while it may act, or while it only reads and the pointer is on it, still when
-    /// there's no compositor to move it; grey while it only reads), its pill filled as the open
-    /// tab's while its tab is the open one (`open_fill`), and the hairline between it and the tabs
+    /// The Conductor's pad on the rail, under its words: the pad, the outline round its pill
+    /// (`conductor::outline`: grey while it only reads; in Accept most and Accept all a still
+    /// hairline in the mode's colour, yellow or red as its label, under the spectrum's ring
+    /// whenever that shows, which the compositor fades in and out over it (Lachlan's 7a); without
+    /// the compositor the spectrum drawn still in its place while it shows), its pill filled as
+    /// the open tab's while its tab is the open one (`open_fill`), the cyan badge on its corner
+    /// that its count of connections suggested on this rail goes on (`badge`: where, and the
+    /// colour under it for its rim; lbterm/LINKS.md, "Connections"), and the hairline between it
+    /// and the tabs
     pub(crate) fn tab_panel_conductor(
         &self,
         quads: &mut TripleLayerQuadAllocator,
         layout: &Layout,
         level: Level,
-        hovered: bool,
         open_fill: Option<u32>,
+        badge: Option<(Area, u32)>,
     ) -> anyhow::Result<()> {
         let pill = layout.head_pill();
         if let Some(fill) = open_fill {
             self.tab_panel_fill(quads, pill, layout.pill_radius(), srgb(fill))?;
         }
-        if conductor::spectrum(level, hovered) {
-            if !self.lbterm_composited() {
-                self.tab_panel_rainbow(quads, layout, pill, RingStyle::Spectrum)?;
-            }
-        } else if level == Level::ReadOnly {
+        let outline = self.tab_panel_head_outline(level);
+        if outline == Outline::Spectrum && !self.lbterm_composited() {
+            self.tab_panel_rainbow(quads, layout, pill, RingStyle::Spectrum)?;
+        } else if let Some(hairline) = conductor::hairline(level, outline) {
+            let colour = match hairline {
+                Hairline::Grey => palette::OUTLINE,
+                Hairline::Most => palette::MODE_MOST,
+                Hairline::All => palette::MODE_ALL,
+            };
             self.lbterm_stroke(
                 quads,
                 pill,
                 layout.pill_radius(),
                 layout.stroke(),
                 layout.px(lbterm_panel::layout::FEATHER),
-                |_| palette::OUTLINE,
+                |_| colour,
             )?;
         }
         let pad = layout.head_pad();
-        self.tab_panel_fill(quads, pad, layout.px(7.0), srgb(palette::CONDUCTOR_PAD))?;
+        // Orange while asks wait on him, as a tab blocked on him (render/conductor_view.rs)
+        let fill = if self.lbterm_conductor_asks() > 0 {
+            palette::pad(lbterm_panel::RowState::Waiting)
+        } else {
+            palette::CONDUCTOR_PAD
+        };
+        self.tab_panel_fill(quads, pad, layout.px(7.0), srgb(fill))?;
+        // Over the pad's corner: a pixel's rim of what's under the pad, so the badge reads apart
+        // from it, then the cyan (its count is drawn over it with the pads' numbers, in their font)
+        if let Some((area, under)) = badge {
+            let rim = layout.px(1.0);
+            self.tab_panel_fill(quads, area.grow(rim), area.h / 2.0 + rim, srgb(under))?;
+            self.tab_panel_fill(quads, area, area.h / 2.0, srgb(palette::CONNECTED))?;
+        }
         let rule = layout.head_rule();
         self.tab_panel_fill(quads, rule, 0.0, srgb_alpha(palette::OUTLINE, 0.6))
     }
@@ -419,6 +448,10 @@ impl TermWindow {
         let Some(&n) = self.lbterm_conductor.menu.as_ref().and_then(|o| o.items.get(pos)) else {
             return;
         };
+        // The row flashes white as the pick goes, or while it waits for its answer (render/menu_fade.rs)
+        if let Some(row) = self.lbterm_conductor_menu_layout().ok().flatten().and_then(|(menu, _)| menu.rows.get(pos).copied()) {
+            self.lbterm_menu_flash(Slot::Conductor, row);
+        }
         let item = self
             .config
             .lbterm_conductor
@@ -460,7 +493,7 @@ impl TermWindow {
         };
         self.lbterm_conductor.wake = Some(at);
         promise::spawn::spawn(async move {
-            smol::Timer::at(at).await;
+            lbterm_extras::counters::timer(smol::Timer::at(at)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 if tw.lbterm_conductor.wake == Some(at) {
                     tw.lbterm_conductor.wake = None;
@@ -510,7 +543,7 @@ impl TermWindow {
                 if let Some(open) = self.lbterm_conductor.menu.as_mut() {
                     if open.focus != hit && (hit.is_some() || layout.card.contains(x, y)) {
                         open.focus = hit;
-                        context.invalidate();
+                        context.lbterm_invalidate();
                     }
                 }
                 context.set_cursor(Some(if hit.is_some() {
@@ -533,7 +566,7 @@ impl TermWindow {
 
     /// While the menu's open it takes every key: up and down it, Enter to run the item, Esc to
     /// close it. True when it did.
-    pub(crate) fn lbterm_conductor_menu_key(&mut self, key: &KeyCode, _mods: KeyModifiers) -> bool {
+    pub(crate) fn lbterm_conductor_menu_key(&mut self, key: &KeyCode, mods: KeyModifiers) -> bool {
         let Some(open) = self.lbterm_conductor.menu.as_ref() else {
             return false;
         };
@@ -544,20 +577,21 @@ impl TermWindow {
         }
         match key {
             KeyCode::Escape => self.lbterm_conductor_menu_close(),
-            KeyCode::Enter => {
+            KeyCode::Enter if focus.is_some() => {
                 if let Some(pos) = focus {
                     self.lbterm_conductor_menu_pick(pos);
                 }
             }
-            KeyCode::UpArrow | KeyCode::DownArrow => {
+            // Enter with none lit lights the first, as Down does from nothing
+            KeyCode::UpArrow | KeyCode::DownArrow | KeyCode::Enter => {
                 if let Some(open) = self.lbterm_conductor.menu.as_mut() {
-                    open.focus = conductor::step(focus, count, *key == KeyCode::DownArrow);
+                    open.focus = conductor::step(focus, count, *key != KeyCode::UpArrow);
                 }
                 if let Some(window) = self.window.as_ref() {
                     window.invalidate();
                 }
             }
-            _ => {}
+            _ => self.lbterm_menu_stray(Slot::Conductor, key, mods),
         }
         true
     }
@@ -580,14 +614,9 @@ impl TermWindow {
             .menu
             .as_ref()
             .and_then(|o| o.pending.as_ref().map(|p| p.pos));
-        let card_rgb = {
-            let (r, g, b, _) = self.palette().background.to_srgb_u8();
-            palette::blend(((r as u32) << 16) | ((g as u32) << 8) | b as u32, palette::CHIP, 0.55)
-        };
+        let fill = self.lbterm_menu_fill();
+        let card_rgb = fill.card;
         let scale = self.dimensions.dpi as f64 / 96.0;
-        let shape = self.lbterm_shape();
-        let radius = shape.radius() as f64;
-        let stroke = shape.hairline() as f64;
         let font = self.fonts.title_font()?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let line_h = metrics.cell_size.height as f64;
@@ -655,22 +684,13 @@ impl TermWindow {
             }
         }
 
-        // The light round it, fading out, as the tab menu's
-        {
-            let layer = gl_state.layer_for_zindex(GLOW_Z)?;
-            let mut quads = layer.quad_allocator();
-            for (i, alpha) in [0.16f32, 0.09, 0.05, 0.025].iter().enumerate() {
-                let by = (2.0 + 3.0 * i as f64) * scale;
-                self.lbterm_menu_rounded(&mut quads, grow(layout.card, by), radius + by, srgb_alpha(palette::GLOW, *alpha))?;
-            }
-        }
+        // The light round it, its ring and card, and the row lit, gliding between rows: every
+        // menu's (render/menu_fade.rs)
+        self.lbterm_menu_card(Slot::Conductor, layout.card, fill)?;
         let layer = gl_state.layer_for_zindex(CARD_Z)?;
         let mut quads = layer.quad_allocator();
-        self.lbterm_menu_rounded(&mut quads, grow(layout.card, stroke), radius + stroke, srgb(palette::RING_MIDDLE))?;
-        self.lbterm_menu_rounded(&mut quads, layout.card, radius, srgb(card_rgb))?;
         if let Some(row) = focus.and_then(|pos| layout.rows.get(pos)) {
-            let hover = srgb(palette::blend(card_rgb, palette::HOVER, palette::HOVER_ALPHA * 1.6));
-            self.lbterm_menu_rounded(&mut quads, *row, 6.0 * scale, hover)?;
+            self.lbterm_menu_light(Slot::Conductor, &mut quads, *row, card_rgb)?;
         }
         drop(quads);
         for computed in &words {
@@ -698,7 +718,10 @@ impl TermWindow {
                 .map(|(i, (label, checked))| lbterm_extras::state::MenuItem {
                     label,
                     checked,
+                    key: None,
+                    detail: None,
                     rect: menu.rows.get(i).map(|r| rect(r)),
+                    inert: false,
                 })
                 .collect(),
             focus: open.focus,
@@ -722,10 +745,5 @@ impl TermWindow {
             name: "conductor.answer".to_string(),
             left_ms: lbterm_extras::state::millis(until.saturating_duration_since(now)),
         })
-    }
-
-    /// Whether a waiting item's arc is turning this frame
-    pub(crate) fn lbterm_conductor_spinning(&self) -> bool {
-        self.lbterm_conductor.spinner.is_some()
     }
 }

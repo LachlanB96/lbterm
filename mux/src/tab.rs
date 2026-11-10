@@ -48,10 +48,22 @@ struct TabInner {
     recency: Recency,
 }
 
+/// LBTerm: a tab's layout as a TabResized tells it (TabInner::layout_key)
+#[derive(PartialEq, Debug)]
+struct TabLayoutKey {
+    size: TerminalSize,
+    active: usize,
+    zoomed: Option<PaneId>,
+    /// each pane's id, then its left, top, width and height in cells and its pixel size
+    panes: Vec<(PaneId, [usize; 6])>,
+}
+
 /// A Tab is a container of Panes
 pub struct Tab {
     inner: Mutex<TabInner>,
     tab_id: TabId,
+    /// LBTerm: parked (Lachlan's 8a, lbterm/NEW-TAB.md, "Landing 4"): `lbterm_parked`
+    lbterm_parked: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -513,7 +525,35 @@ impl Tab {
         Self {
             inner: Mutex::new(inner),
             tab_id,
+            lbterm_parked: Default::default(),
         }
+    }
+
+    /// LBTerm: whether the tab is parked (Lachlan's 8a, lbterm/NEW-TAB.md, "Landing 4"): dimmed
+    /// on the rail, passed over by the side buttons' hops, and its panes named in the file its
+    /// process publishes beside its socket (lbterm_parked.rs). Kept by the process that holds the
+    /// tab's panes, and on a window's client tab as its server last said (codec's TabParked)
+    pub fn lbterm_parked(&self) -> bool {
+        self.lbterm_parked
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// LBTerm: park or unpark the tab, notifying `LbtermTabParked` when that changes it, with no
+    /// lock held. Not from inside a mux subscriber: `Mux::notify` holds its subscribers while it
+    /// calls them. Whether it changed
+    pub fn lbterm_set_parked(&self, parked: bool) -> bool {
+        let was = self
+            .lbterm_parked
+            .swap(parked, std::sync::atomic::Ordering::Relaxed);
+        if was != parked {
+            if let Some(mux) = Mux::try_get() {
+                mux.notify(MuxNotification::LbtermTabParked {
+                    tab_id: self.tab_id,
+                    parked,
+                });
+            }
+        }
+        was != parked
     }
 
     pub fn get_title(&self) -> String {
@@ -803,11 +843,14 @@ impl TabInner {
                 }
             }
         }
+        // LBTerm: the layout before the sync, so it says TabResized only when the sync changed it
+        let before = self.layout_key();
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
         self.size = size;
 
-        self.resize(size);
+        self.resize_panes(size);
+        self.notify_resized_if_changed(before);
 
         log::debug!(
             "sync tab: {:#?} zoomed: {} {:#?}",
@@ -1142,6 +1185,46 @@ impl TabInner {
             return;
         }
 
+        let before = self.layout_key();
+        self.resize_panes(size);
+        self.notify_resized_if_changed(before);
+    }
+
+    /// LBTerm: what a TabResized tells the tab's watchers (its size, the zoomed and active
+    /// panes, and where each pane is and how big), so resize and sync_with_pane_tree send one
+    /// only when it changed. Upstream sends one every time, and every resync syncs every tab:
+    /// with N tabs a resync was N TabResized, each a whole update_title in the GUI, and on a
+    /// mux server one more resync in every client.
+    fn layout_key(&mut self) -> TabLayoutKey {
+        TabLayoutKey {
+            size: self.size,
+            active: self.active,
+            zoomed: self.zoomed.as_ref().map(|pane| pane.pane_id()),
+            panes: self
+                .iter_panes_impl(true)
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.pane.pane_id(),
+                        [p.left, p.top, p.width, p.height, p.pixel_width, p.pixel_height],
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn notify_resized_if_changed(&mut self, before: TabLayoutKey) {
+        if self.layout_key() != before {
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
+    }
+
+    /// Sets the tab's size and fits its panes to it, saying nothing: the callers notify
+    fn resize_panes(&mut self, size: TerminalSize) {
+        if size.rows == 0 || size.cols == 0 {
+            return;
+        }
+
         if let Some(zoomed) = &self.zoomed {
             self.size = size;
             zoomed.resize(size).ok();
@@ -1178,8 +1261,6 @@ impl TabInner {
             // And then resize the individual panes to match
             apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
         }
-
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
     fn apply_pane_size(&mut self, pane_size: TerminalSize, cursor: &mut Cursor) {
@@ -1219,6 +1300,10 @@ impl TabInner {
         if self.zoomed.is_some() {
             return;
         }
+        // LBTerm: TabResized only when the layout moved (layout_key), as resize and
+        // sync_with_pane_tree say it: a mux server rebuilds the sizes after every Resize a client
+        // sends, and upstream told every client each time, each resyncing every tab
+        let before = self.layout_key();
 
         fn compute_size(node: &mut Tree) -> Option<TerminalSize> {
             match node {
@@ -1255,7 +1340,7 @@ impl TabInner {
                 self.size = size;
             }
         }
-        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        self.notify_resized_if_changed(before);
     }
 
     fn resize_split_by(&mut self, split_index: usize, delta: isize) {
@@ -2267,7 +2352,19 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
-            unimplemented!();
+            // LBTerm: its size, for rebuild_splits_sizes_from_contained_panes
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                reverse_video: false,
+            }
         }
 
         fn get_title(&self) -> String {
@@ -2314,6 +2411,118 @@ mod test {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
             None
         }
+    }
+
+    /// LBTerm: TabResized goes out only when the layout key moves (TabInner::layout_key), and a
+    /// resync or a resize that changes nothing leaves it where it was
+    #[test]
+    fn layout_key_moves_only_with_the_layout() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let leaf = |pane_id: PaneId, size: TerminalSize, is_active_pane: bool| {
+            PaneNode::Leaf(PaneEntry {
+                window_id: 0,
+                tab_id: 0,
+                pane_id,
+                title: String::new(),
+                size,
+                working_dir: None,
+                is_active_pane,
+                is_zoomed_pane: false,
+                workspace: String::new(),
+                cursor_pos: StableCursorPosition::default(),
+                physical_top: 0,
+                top_row: 0,
+                left_col: 0,
+                tty_name: None,
+            })
+        };
+        // a new pane object each time, as a client makes for what the server lists
+        let make = |e: PaneEntry| FakePane::new(e.pane_id, e.size);
+
+        let tab = Tab::new(&size);
+        tab.sync_with_pane_tree(size, leaf(1, size, true), make);
+        let key = || tab.inner.lock().layout_key();
+        let start = key();
+        assert_eq!(start.panes, vec![(1, [0, 0, 80, 24, 800, 600])]);
+
+        tab.sync_with_pane_tree(size, leaf(1, size, true), make);
+        assert_eq!(start, key(), "syncing the same tree changes nothing");
+        tab.resize(size);
+        assert_eq!(start, key(), "nor does a resize to the same size");
+
+        let bigger = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 750,
+            dpi: 96,
+        };
+        tab.resize(bigger);
+        assert_ne!(start, key(), "a new size moves it");
+
+        // the server split it: two panes where there was one
+        let half = TerminalSize {
+            cols: 49,
+            pixel_width: 490,
+            ..bigger
+        };
+        let split = |second_active: bool| PaneNode::Split {
+            left: Box::new(leaf(1, half, !second_active)),
+            right: Box::new(leaf(2, half, second_active)),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first: half,
+                second: half,
+            },
+        };
+        let one = key();
+        tab.sync_with_pane_tree(bigger, split(false), make);
+        let two = key();
+        assert_ne!(one, two, "a new pane moves it");
+        assert_eq!(two.panes.len(), 2);
+
+        tab.sync_with_pane_tree(bigger, split(false), make);
+        assert_eq!(two, key(), "the same split again changes nothing");
+        tab.sync_with_pane_tree(bigger, split(true), make);
+        assert_ne!(two, key(), "the other pane active moves it");
+    }
+
+    /// LBTerm: a mux server rebuilds a tab's split sizes after every Resize a client sends; the
+    /// layout key it tells TabResized by moves only when a pane's size did
+    #[test]
+    fn rebuilt_sizes_move_the_layout_key_only_when_a_pane_moved() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let pane = FakePane::new(1, size);
+        tab.assign_pane(&pane);
+        let key = || tab.inner.lock().layout_key();
+        let start = key();
+        tab.rebuild_splits_sizes_from_contained_panes();
+        assert_eq!(start, key(), "the pane at the tab's size: nothing to say");
+        pane.resize(TerminalSize {
+            cols: 79,
+            pixel_width: 790,
+            ..size
+        })
+        .unwrap();
+        tab.rebuild_splits_sizes_from_contained_panes();
+        let narrower = key();
+        assert_ne!(start, narrower, "the pane a column narrower moves it");
+        assert_eq!(narrower.size.cols, 79);
+        tab.rebuild_splits_sizes_from_contained_panes();
+        assert_eq!(narrower, key(), "rebuilt again, nothing moved");
     }
 
     #[test]

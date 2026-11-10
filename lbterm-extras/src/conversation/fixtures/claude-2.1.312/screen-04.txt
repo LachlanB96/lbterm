@@ -1,0 +1,52 @@
+[38:2::80:80:80m[48:2::55:55:55m❯ List 25 colours, one per line, numbered.[39m[K
+[49m  15. Brown
+  16. Tan
+  17. Beige
+  18. Ivory
+  19. White
+  20. Grey
+  21. Charcoal
+  22. Black
+  23. Teal
+  24. Turquoise
+  25. Lime
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mBaked for 1s · done 15:07
+
+[48:2::55:55:55m❯ [38:2::255:255:255mCreate a file notes.txt containing three lines: alpha, beta, gamma.[39m[K
+
+[49m  [38:2::153:153:153mMade (B[0;1m[38:2::153:153:153m1(B[0m[38:2::153:153:153m scratchpad edit [38:2::56:166:96m+4[38:2::153:153:153m 
+
+[38:2::255:255:255m●[39m I created [38:2::177:185:249mnotes.txt[39m with three lines: alpha, beta, gamma. It's at
+  [38:2::177:185:249mC:\Users\DemoUser\AppData\Local\Temp\claude\C--Users-DemoUser-AppData-Local-Temp-claude-C--Users-D
+[39m  [38:2::177:185:249memoUser-my-projects-]8;;lbterm://session/00000000-1111-2222-3333-444444444444\00000000-1111-2222-3333-444444444444]8;;\-scratchpad-probe-work\5eb47e20-9583-4af5-
+[39m  [38:2::177:185:249mb15c-f1842da17891\scratchpad\probe\work\notes.txt[39m.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mCooked for 4s · done 15:07
+
+[48:2::55:55:55m❯ [38:2::255:255:255mExplain in 15 short numbered lines how a scrollbar works.[39m[K
+
+[38:2::255:255:255m[49m●[39m 1. A scrollbar is a control that shows which part of a longer document is visible.
+  2. The track is the full length of the scrollable area.
+  3. The thumb is the draggable piece inside the track.
+  4. Its size is the visible area divided by the total content height.
+  5. A large thumb means little content is hidden; a small one means a lot is.
+  6. Its position is the scroll offset divided by the scrollable range.
+  7. Dragging the thumb changes the scroll offset.
+  8. Clicking the track jumps one screen-height up or down.
+  9. Arrow buttons at each end scroll by a small fixed step.
+  10. The mouse wheel and trackpad send scroll events that change the same offset.
+  11. The app redraws only the lines that fall inside the new window.
+  12. The thumb is recalculated whenever the content or window size changes.
+  13. When content fits the window, the scrollbar is hidden or disabled.
+  14. Terminals keep a scrollback buffer of past lines so the bar has something to scroll through.
+  15. Scrolling changes which slice [38:2::255:255:255m[48:2::55:55:55m Jump to bottom (ctrl+End) ↓ [39m[49mthe buffer itself.
+
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m▸ probe summary line
+[39m  [38:2::153:153:153mhaiku | probe | main
+[39m  [38:2::153:153:153mtoggles line
+[39m  [38:2::175:135:255m⏵⏵ accept edits on[38:2::153:153:153m (shift+tab to cycle) · ← 2 agents
+[39m

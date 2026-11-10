@@ -2,12 +2,19 @@ pub mod connection;
 pub mod event;
 mod extra_constants;
 mod keycodes;
+// LBTerm: frame pacing (lbterm_extras::pace)
+mod pace;
 mod wgl;
 pub mod window;
+// LBTerm: the GUI thread's work besides painting (lbterm_extras::work)
+pub(crate) mod work;
 
 pub use self::window::*;
 pub use connection::*;
 pub use event::*;
+// LBTerm: what's read from Windows' settings once is read again when they change; and whether a
+// window can be seen, which its loops go by
+pub use work::{settings_changes, window_unseen};
 
 /// Convert a rust string to a windows wide string
 pub fn wide_string(s: &str) -> Vec<u16> {

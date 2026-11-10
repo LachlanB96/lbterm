@@ -64,7 +64,10 @@ pub struct CellAttributes {
     /// Relatively rarely used attributes spill over to a heap
     /// allocated struct in order to keep CellAttributes
     /// smaller in the common case.
-    fat: Option<Box<FatAttributes>>,
+    /// LBTerm: shared, and copied only when one sharing it changes it (Arc::make_mut): every
+    /// cell a pen with a 24-bit colour or a link writes holds its block, where each held a copy
+    /// of its own, made for every character printed and again for every copy of its line
+    fat: Option<Arc<FatAttributes>>,
 }
 
 impl core::fmt::Debug for CellAttributes {
@@ -247,21 +250,26 @@ impl CellAttributes {
             ColorAttribute::Default => {
                 self.foreground = SmallColor::Default;
                 if let Some(fat) = self.fat.as_mut() {
-                    fat.foreground = ColorAttribute::Default;
+                    if fat.foreground != ColorAttribute::Default {
+                        Arc::make_mut(fat).foreground = ColorAttribute::Default;
+                    }
                 }
                 self.deallocate_fat_attributes_if_none();
             }
             ColorAttribute::PaletteIndex(idx) => {
                 self.foreground = SmallColor::PaletteIndex(idx);
                 if let Some(fat) = self.fat.as_mut() {
-                    fat.foreground = ColorAttribute::Default;
+                    if fat.foreground != ColorAttribute::Default {
+                        Arc::make_mut(fat).foreground = ColorAttribute::Default;
+                    }
                 }
                 self.deallocate_fat_attributes_if_none();
             }
             foreground => {
                 self.foreground = SmallColor::Default;
-                self.allocate_fat_attributes();
-                self.fat.as_mut().unwrap().foreground = foreground;
+                if self.fat.as_ref().map(|fat| fat.foreground) != Some(foreground) {
+                    self.fat_mut().foreground = foreground;
+                }
             }
         }
 
@@ -283,21 +291,26 @@ impl CellAttributes {
             ColorAttribute::Default => {
                 self.background = SmallColor::Default;
                 if let Some(fat) = self.fat.as_mut() {
-                    fat.background = ColorAttribute::Default;
+                    if fat.background != ColorAttribute::Default {
+                        Arc::make_mut(fat).background = ColorAttribute::Default;
+                    }
                 }
                 self.deallocate_fat_attributes_if_none();
             }
             ColorAttribute::PaletteIndex(idx) => {
                 self.background = SmallColor::PaletteIndex(idx);
                 if let Some(fat) = self.fat.as_mut() {
-                    fat.background = ColorAttribute::Default;
+                    if fat.background != ColorAttribute::Default {
+                        Arc::make_mut(fat).background = ColorAttribute::Default;
+                    }
                 }
                 self.deallocate_fat_attributes_if_none();
             }
             background => {
                 self.background = SmallColor::Default;
-                self.allocate_fat_attributes();
-                self.fat.as_mut().unwrap().background = background;
+                if self.fat.as_ref().map(|fat| fat.background) != Some(background) {
+                    self.fat_mut().background = background;
+                }
             }
         }
 
@@ -320,7 +333,7 @@ impl CellAttributes {
 
     fn allocate_fat_attributes(&mut self) {
         if self.fat.is_none() {
-            self.fat.replace(Box::new(FatAttributes {
+            self.fat.replace(Arc::new(FatAttributes {
                 hyperlink: None,
                 #[cfg(feature = "use_image")]
                 image: vec![],
@@ -329,6 +342,13 @@ impl CellAttributes {
                 background: ColorAttribute::Default,
             }));
         }
+    }
+
+    /// LBTerm: the fat attributes to change, made first if there are none, and copied first if
+    /// another holds them too
+    fn fat_mut(&mut self) -> &mut FatAttributes {
+        self.allocate_fat_attributes();
+        Arc::make_mut(self.fat.as_mut().unwrap())
     }
 
     fn deallocate_fat_attributes_if_none(&mut self) {
@@ -357,8 +377,7 @@ impl CellAttributes {
         if link.is_none() && self.fat.is_none() {
             self
         } else {
-            self.allocate_fat_attributes();
-            self.fat.as_mut().unwrap().hyperlink = link;
+            self.fat_mut().hyperlink = link;
             self.deallocate_fat_attributes_if_none();
             self
         }
@@ -369,15 +388,16 @@ impl CellAttributes {
 impl CellAttributes {
     /// Assign a single image to a cell.
     pub fn set_image(&mut self, image: Box<ImageCell>) -> &mut Self {
-        self.allocate_fat_attributes();
-        self.fat.as_mut().unwrap().image = vec![image];
+        self.fat_mut().image = vec![image];
         self
     }
 
     /// Clear all images from a cell
     pub fn clear_images(&mut self) -> &mut Self {
         if let Some(fat) = self.fat.as_mut() {
-            fat.image.clear();
+            if !fat.image.is_empty() {
+                Arc::make_mut(fat).image.clear();
+            }
         }
         self.deallocate_fat_attributes_if_none();
         self
@@ -385,8 +405,15 @@ impl CellAttributes {
 
     pub fn detach_image_with_placement(&mut self, image_id: u32, placement_id: Option<u32>) {
         if let Some(fat) = self.fat.as_mut() {
-            fat.image
-                .retain(|im| !im.matches_placement(image_id, placement_id));
+            if fat
+                .image
+                .iter()
+                .any(|im| im.matches_placement(image_id, placement_id))
+            {
+                Arc::make_mut(fat)
+                    .image
+                    .retain(|im| !im.matches_placement(image_id, placement_id));
+            }
         }
         self.deallocate_fat_attributes_if_none();
     }
@@ -394,8 +421,7 @@ impl CellAttributes {
     /// Add an image attachement, preserving any existing attachments.
     /// The list of images is maintained in z-index order
     pub fn attach_image(&mut self, image: Box<ImageCell>) -> &mut Self {
-        self.allocate_fat_attributes();
-        let fat = self.fat.as_mut().unwrap();
+        let fat = self.fat_mut();
         let z_index = image.z_index();
         match fat
             .image
@@ -416,8 +442,9 @@ impl CellAttributes {
         if underline_color == ColorAttribute::Default && self.fat.is_none() {
             self
         } else {
-            self.allocate_fat_attributes();
-            self.fat.as_mut().unwrap().underline_color = underline_color;
+            if self.underline_color() != underline_color {
+                self.fat_mut().underline_color = underline_color;
+            }
             self.deallocate_fat_attributes_if_none();
             self
         }
@@ -433,11 +460,18 @@ impl CellAttributes {
             fat: None,
         };
         if let Some(fat) = self.fat.as_ref() {
-            if fat.background != ColorAttribute::Default
+            // LBTerm: colours and nothing more are what the copy would hold, so it holds them
+            // too, rather than a copy of its own
+            #[cfg(feature = "use_image")]
+            let no_image = fat.image.is_empty();
+            #[cfg(not(feature = "use_image"))]
+            let no_image = true;
+            if fat.hyperlink.is_none() && no_image {
+                res.fat = Some(Arc::clone(fat));
+            } else if fat.background != ColorAttribute::Default
                 || fat.foreground != ColorAttribute::Default
             {
-                res.allocate_fat_attributes();
-                let new_fat = res.fat.as_mut().unwrap();
+                let new_fat = res.fat_mut();
                 new_fat.foreground = fat.foreground;
                 new_fat.background = fat.background;
             }

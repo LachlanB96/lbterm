@@ -603,6 +603,8 @@ impl GlyphCache {
     ) -> anyhow::Result<Self> {
         let surface = backend.allocate_texture_atlas(size)?;
         let atlas = Atlas::new(&surface).expect("failed to create new texture atlas");
+        // LBTerm: counted, with the largest a window's has been (counters.rs's fonts)
+        crate::counters::fonts::atlas_made(size);
 
         Ok(Self {
             fonts: Rc::clone(fonts),
@@ -646,11 +648,15 @@ impl GlyphCache {
             id: font.id(),
         };
 
+        // LBTerm: counted with the caches' counts (lfucache::counts), where each glyph took
+        // upstream's histogram! with its global lock and the clock
+        static COUNTS: LazyLock<&'static lfucache::Counts> =
+            LazyLock::new(|| lfucache::counts("glyph_cache"));
         if let Some(entry) = self.glyph_cache.get(&key as &dyn GlyphKeyTrait) {
-            metrics::histogram!("glyph_cache.glyph_cache.hit.rate").record(1.);
+            COUNTS.hit();
             return Ok(Rc::clone(entry));
         }
-        metrics::histogram!("glyph_cache.glyph_cache.miss.rate").record(1.);
+        COUNTS.miss();
 
         let glyph = match self.load_glyph(info, font, followed_by_space, num_cells) {
             Ok(g) => g,
@@ -695,6 +701,9 @@ impl GlyphCache {
         let config = self.fonts.config();
         self.image_cache.update_config(&config);
         self.cursor_glyphs.clear();
+        // LBTerm: a reload that keeps the fonts keeps this cache too, so what a new one would
+        // take from the config is taken here (termwindow/mod.rs, config_was_reloaded)
+        self.min_frame_duration = Duration::from_millis(1000 / config.max_fps.max(1) as u64);
     }
 
     /// Perform the load and render of a glyph

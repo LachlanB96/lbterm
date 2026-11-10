@@ -61,33 +61,10 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The project a working directory belongs to: the folder under
-/// `Life\Projects`, a worktree as `repo · worktree`, the home folder as
-/// `~`, else the last folder's name.
+/// The project a working directory belongs to: the megaproject's one name for its folder,
+/// from Blueprint's names (`names.rs`), as the statusline and every other surface give it.
 pub fn project(cwd: &str) -> String {
-    let p = cwd_path(cwd);
-    if p.is_empty() {
-        return String::new();
-    }
-    let lower = p.to_ascii_lowercase();
-    const WORKTREES: &str = r"\.claude\worktrees\";
-    if let Some(w) = lower.find(WORKTREES) {
-        let tree = p[w + WORKTREES.len()..].split('\\').next().unwrap_or("");
-        return format!("{} · {}", project(&p[..w]), tree);
-    }
-    const PROJECTS: &str = r"\life\projects\";
-    if let Some(i) = lower.find(PROJECTS) {
-        return p[i + PROJECTS.len()..]
-            .split('\\')
-            .next()
-            .unwrap_or("")
-            .to_string();
-    }
-    let parts: Vec<&str> = p.trim_end_matches('\\').split('\\').collect();
-    if parts.len() == 3 && parts[1].eq_ignore_ascii_case("users") {
-        return "~".to_string();
-    }
-    parts.last().copied().unwrap_or("").to_string()
+    crate::names::project(&cwd_path(cwd))
 }
 
 /// How long ago, as the panel shows it: `now` for the first minute, then
@@ -104,6 +81,39 @@ pub fn ago(seconds: f64) -> String {
         format!("{}h", m / 60)
     } else {
         format!("{}d", m / 1440)
+    }
+}
+
+/// How long a guess says is left, short: "~4 min", "~1 min" for anything under a minute and a
+/// half, "~2 h" from an hour and a half.
+pub fn left(seconds: u32) -> String {
+    if seconds < 90 {
+        "~1 min".to_string()
+    } else if seconds < 90 * 60 {
+        format!("~{} min", (seconds as f64 / 60.0).round() as u64)
+    } else {
+        format!("~{} h", (seconds as f64 / 3600.0).round() as u64)
+    }
+}
+
+/// What a conversation has cost, short enough for a pill on the strip or a row's corner:
+/// cents under $100 ("$0.42", "$12.34"), whole dollars to $10,000 ("$148", "$2304"), then
+/// thousands ("$12.3k", "$140k"). Never rounded up past what it is to the cent: $99.996 is
+/// "$99.99", so the dollars shown never run ahead of what was spent.
+pub fn dollars(usd: f64) -> String {
+    let usd = if usd.is_finite() { usd.max(0.0) } else { 0.0 };
+    let cents = (usd * 100.0 + 1e-6).floor() / 100.0;
+    if cents < 100.0 {
+        format!("${cents:.2}")
+    } else if usd < 10_000.0 {
+        format!("${}", usd.floor() as u64)
+    } else {
+        let k = (usd / 100.0).floor() / 10.0;
+        if k < 100.0 {
+            format!("${k:.1}k")
+        } else {
+            format!("${}k", k.floor() as u64)
+        }
     }
 }
 
@@ -179,6 +189,33 @@ mod test {
     use super::*;
 
     #[test]
+    fn dollars_read_short_and_never_run_ahead_of_the_cent() {
+        assert_eq!(dollars(0.0), "$0.00");
+        assert_eq!(dollars(0.84), "$0.84");
+        assert_eq!(dollars(12.34), "$12.34");
+        assert_eq!(dollars(12.349), "$12.34", "cut, not rounded up");
+        assert_eq!(dollars(99.996), "$99.99");
+        assert_eq!(dollars(100.0), "$100");
+        assert_eq!(dollars(148.73), "$148");
+        assert_eq!(dollars(2304.5), "$2304");
+        assert_eq!(dollars(12_345.0), "$12.3k");
+        assert_eq!(dollars(140_200.0), "$140k");
+        assert_eq!(dollars(-3.0), "$0.00");
+        assert_eq!(dollars(f64::NAN), "$0.00");
+    }
+
+    #[test]
+    fn time_left_reads_short() {
+        assert_eq!(left(0), "~1 min");
+        assert_eq!(left(89), "~1 min");
+        assert_eq!(left(90), "~2 min");
+        assert_eq!(left(240), "~4 min");
+        assert_eq!(left(89 * 60), "~89 min");
+        assert_eq!(left(90 * 60), "~2 h");
+        assert_eq!(left(5 * 3600), "~5 h");
+    }
+
+    #[test]
     fn labels_wrap_between_words_and_cut_what_wont_fit() {
         let one = |_: char| 1;
         assert_eq!(wrap("Tab bar bugs", 7, 2, one), ["Tab bar", "bugs"]);
@@ -215,19 +252,6 @@ mod test {
         assert_eq!(cwd_path("file://DESKTOP-1/C:/Code/"), r"C:\Code");
         assert_eq!(cwd_path(r"C:\"), r"C:\");
         assert_eq!(cwd_path(""), "");
-    }
-
-    #[test]
-    fn projects_are_named_like_tab_panel_names_them() {
-        let vault = "file:///C:/Users/me/My%20Notes/Life/Projects";
-        assert_eq!(project(&format!("{vault}/Terminal/wezterm")), "Terminal");
-        assert_eq!(
-            project(&format!("{vault}/Garden/.claude/worktrees/fix-beds")),
-            "Garden · fix-beds"
-        );
-        assert_eq!(project("file:///C:/Users/me/"), "~");
-        assert_eq!(project(r"C:\Users\me\Code\LBTerm"), "LBTerm");
-        assert_eq!(project(""), "");
     }
 
     #[test]

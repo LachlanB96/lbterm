@@ -7,10 +7,13 @@ Records the tab panel opening and closing (lbterm/TAB-PANEL.md): the motion chec
   pwsh -File lbterm\motion\panel-demo.ps1 -Interrupt              # out while it opens, back while it closes
   pwsh -File lbterm\motion\panel-demo.ps1 -Live                 # a window to try it in by hand
   pwsh -File lbterm\motion\panel-demo.ps1 -Split                # the first tab split in three
+  pwsh -File lbterm\motion\panel-demo.ps1 -Wave                 # the wave washing ahead of the edge
 
 -Live opens the same window with the panel's usual delays, plays nothing, records nothing and
 leaves the window open. -Split splits the first tab into three panes, each with a box out to its
-edges, so the cards and their outlines show as the panel presses them over.
+edges, so the cards and their outlines show as the panel presses them over. -Wave turns on
+lbterm_tab_panel.wave (its other settings with -WaveLead, -WaveReach and -WaveCover) and fills the first tab
+with text for it to wash over.
 
 Opens target\release\lbterm-gui.exe (or -Bin's; with Start-Unfocused, so it leaves Claude's job
 object and takes no focus) looking like Lachlan's LBTerm (New-TestConfig: his lbterm.lua without
@@ -38,6 +41,10 @@ param(
   [switch]$Keep,
   [switch]$Live,
   [switch]$Split,
+  [switch]$Wave,
+  [double]$WaveLead = -1,
+  [double]$WaveCover = -1,
+  [double]$WaveReach = -1,
   # More settings for the window, each name=value as --config takes them
   [string[]]$Config = @(),
   # WEZTERM_LOG for the window, as module=level
@@ -49,7 +56,15 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 if ($Live) { $Keep = $true }
 # Measuring the edge, the panel opens on the first posted move; otherwise it waits as usual
-$panelConfig = if ($OpenOnly) { 'lbterm_tab_panel={enabled=true,open_delay_ms=0}' } else { 'lbterm_tab_panel={enabled=true}' }
+$wavePart = ''
+if ($Wave) {
+  $waveSet = @('enabled=true')
+  if ($WaveLead -ge 0) { $waveSet += "lead=$WaveLead" }
+  if ($WaveCover -ge 0) { $waveSet += "cover=$WaveCover" }
+  if ($WaveReach -ge 0) { $waveSet += "reach=$WaveReach" }
+  $wavePart = ",wave={$($waveSet -join ',')}"
+}
+$panelConfig = if ($OpenOnly) { "lbterm_tab_panel={enabled=true,open_delay_ms=0$wavePart}" } else { "lbterm_tab_panel={enabled=true$wavePart}" }
 # Measuring the edge, the running light stays off: its halo crossing the measured row reads as the
 # ring's edge
 $sweep = if ($OpenOnly) { ",panel_sweep='none'" } else { '' }
@@ -62,18 +77,19 @@ $out = Join-Path $repo "target\motion\panel-x$Slowdown"
 $T = Start-Test "motion-panel-x$Slowdown" -Bin $Bin -Out $out -Class 'com.lachlanb.lbterm.panel'
 $home2 = Join-Path $out 'home'
 
-function Demo([string]$Title, [string]$State = 'none', [double]$Age = 0, [switch]$Box) {
+function Demo([string]$Title, [string]$State = 'none', [double]$Age = 0, [switch]$Box, [switch]$Text) {
   $a = @('-Title', $Title, '-State', $State, '-AgeMinutes', $Age)
   if ($Box) { $a += '-Box' }
+  if ($Text) { $a += '-Text' }
   New-PwshProgram -File $demoTab -ArgumentList $a
 }
 
 try {
   $w = Open-TestWindow -UserProfile $home2 -PostedPointer -Log $Log -WorkingDirectory $repo -Cwd $repo `
     -Set (@($Config) + 'lbterm_compositor=true' + "lbterm_motion={enabled='on',slowdown=$Slowdown$sweep}" + $panelConfig + $size) `
-    -Program (Demo 'Tab panel for LBTerm' working -Box:$Split)
+    -Program (Demo 'Tab panel for LBTerm' working -Box:$Split -Text:($Wave -and -not $Split))
   # Every cli call names its window or pane: a window that never has focus has no focused pane
-  Start-Sleep 2
+  Wait-State { param($s) $s.frame -gt 0 -and $s.rail } -What 'the window and its rail' | Out-Null
   # Made-up projects, in folders of the demo's own: the panel names a tab's project after the
   # folder under Life\Projects
   $vault = Join-Path $out 'Life\Projects'
@@ -85,16 +101,16 @@ try {
     @{ cwd = "$vault\Shopping"; title = 'Price watch: monitor arm'; state = 'working'; age = 0 }
   )
   $titled = @(@{ pane = 0; title = 'Tab panel for LBTerm'; state = 'working' })
-  foreach ($t in $tabs) {
-    New-Item -ItemType Directory -Force $t.cwd | Out-Null
-    $pane = Invoke-Cli spawn --window-id 0 --cwd $t.cwd -Program (Demo $t.title $t.state $t.age)
-    $titled += @{ pane = [int]$pane; title = $t.title; state = $t.state }
+  foreach ($tab in $tabs) {
+    New-Item -ItemType Directory -Force $tab.cwd | Out-Null
+    $pane = Invoke-Cli spawn --window-id 0 --cwd $tab.cwd -Program (Demo $tab.title $tab.state $tab.age)
+    $titled += @{ pane = [int]$pane; title = $tab.title; state = $tab.state }
   }
   # Claude Code's glyph in front, as it titles its own sessions: a braille spinner frame while
   # it works, ✳ otherwise
-  foreach ($t in $titled) {
-    $glyph = switch ($t.state) { 'none' { '' } 'working' { [string][char]0x2810 + ' ' } default { [string][char]0x2733 + ' ' } }
-    Invoke-Cli set-tab-title --pane-id $t.pane "$glyph$($t.title)" | Out-Null
+  foreach ($tab in $titled) {
+    $glyph = switch ($tab.state) { 'none' { '' } 'working' { [string][char]0x2810 + ' ' } default { [string][char]0x2733 + ' ' } }
+    Invoke-Cli set-tab-title --pane-id $tab.pane "$glyph$($tab.title)" | Out-Null
   }
   Invoke-Cli activate-tab --pane-id 0 --tab-index 0 | Out-Null
   if ($Split) {
@@ -106,7 +122,8 @@ try {
     "LBTerm demo window open (pid $($w.Pid)): rest the pointer on the panel at its left"
     return
   }
-  Start-Sleep 2
+  # Six rows, settled, before the pointer arrives (lbterm/STATE.md)
+  Wait-Change { param($s) @($s.rail.rows).Count -eq 6 -and $s.active_tab -eq 0 } -What 'six rows on the rail' | Out-Null
 
   $cr = Get-ClientRect $w
   $s = $w.Scale

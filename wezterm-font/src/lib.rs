@@ -26,6 +26,7 @@ mod hbwrap;
 
 pub mod db;
 pub mod ftwrap;
+pub mod lbterm;
 pub mod locator;
 pub mod parser;
 pub mod rasterizer;
@@ -91,6 +92,11 @@ impl LoadedFont {
         &self.text_style
     }
 
+    /// LBTerm: its size in points
+    pub fn lbterm_font_size(&self) -> f64 {
+        self.font_size
+    }
+
     pub fn id(&self) -> LoadedFontId {
         self.id
     }
@@ -113,6 +119,7 @@ impl LoadedFont {
             if let Some(font_config) = self.font_config.upgrade() {
                 *self.shaper.borrow_mut() =
                     new_shaper(&*font_config.config.borrow(), &self.handles.borrow())?;
+                lbterm::SHAPERS.one();
             }
         }
         Ok(loaded)
@@ -188,58 +195,109 @@ impl LoadedFont {
         range: Option<Range<usize>>,
         presentation_width: Option<&PresentationWidth>,
     ) -> anyhow::Result<(bool, Vec<GlyphInfo>)> {
-        let mut no_glyphs = vec![];
-
         {
             let mut pending = self.pending_fallback.lock().unwrap();
             if !pending.is_empty() {
-                match self.insert_fallback_handles(pending.split_off(0)) {
-                    Ok(true) => return Err(ClearShapeCache {})?,
-                    Ok(false) => {}
-                    Err(err) => {
-                        log::error!("Error adding fallback: {:#}", err);
-                    }
+                // LBTerm: what this font's own search found joins it before it shapes anything
+                // more, without upstream's ClearShapeCache, which threw away the paint pass it came
+                // in part-way and shaped the whole window again. The search's completion has
+                // already asked for the window's shapes to be cleared (an InvalidateShapeCache),
+                // so shapes made before it with the glyph missing go then, once
+                if let Err(err) = self.insert_fallback_handles(pending.split_off(0)) {
+                    log::error!("Error adding fallback: {:#}", err);
                 }
             }
         }
 
-        let result = self.shaper.borrow().shape(
-            text,
-            self.font_size,
-            self.dpi,
-            &mut no_glyphs,
-            presentation,
-            direction,
-            range,
-            presentation_width,
-        );
+        let font_config = self.font_config.upgrade();
+        let mut filter_out_synthetic = Some(filter_out_synthetic);
+        // What the filter took out the first time, taken out again after a shape with more faces
+        let mut synthetic: Option<Vec<char>> = None;
+        loop {
+            let mut no_glyphs = vec![];
+            let result = self.shaper.borrow().shape(
+                text,
+                self.font_size,
+                self.dpi,
+                &mut no_glyphs,
+                presentation,
+                direction,
+                range.clone(),
+                presentation_width,
+            );
 
-        no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
-        filter_out_synthetic(&mut no_glyphs);
-
-        let mut tried_glyphs = self.tried_glyphs.borrow_mut();
-        no_glyphs.retain(|c| !tried_glyphs.contains(c));
-        for c in &no_glyphs {
-            tried_glyphs.insert(*c);
-        }
-
-        no_glyphs.sort();
-        no_glyphs.dedup();
-
-        let mut async_resolve = false;
-
-        if !no_glyphs.is_empty() {
-            if let Some(font_config) = self.font_config.upgrade() {
-                font_config.schedule_fallback_resolve(
-                    no_glyphs,
-                    &self.pending_fallback,
-                    completion,
-                );
-                async_resolve = true;
+            no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
+            match &synthetic {
+                None => {
+                    let all = no_glyphs.clone();
+                    if let Some(filter) = filter_out_synthetic.take() {
+                        filter(&mut no_glyphs);
+                    }
+                    synthetic = Some(all.into_iter().filter(|c| !no_glyphs.contains(c)).collect());
+                }
+                Some(gone) => no_glyphs.retain(|c| !gone.contains(c)),
             }
-        }
 
-        result.map(|r| (async_resolve, r))
+            let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+            no_glyphs.retain(|c| !tried_glyphs.contains(c));
+            no_glyphs.sort();
+            no_glyphs.dedup();
+
+            // LBTerm: characters another font with the same settings has searched for already
+            // take the faces it found now, and the text is shaped again with them, so the shape
+            // returned has them, with no search, no completion and no reshape of the window
+            // (lbterm.rs's Found). Only the faces of characters this font meets: a font never
+            // takes a face for a character it hasn't met, so what draws its glyphs doesn't turn
+            // on what other fonts met first (PITFALLS 54). Each pass that takes a new face shapes
+            // again, and a character another font's search answers between two passes takes its
+            // faces on the next, so it's never marked tried without them (each pass marks more
+            // of the text's characters tried, so it ends)
+            if let (Some(font_config), false) = (&font_config, no_glyphs.is_empty()) {
+                let found = Arc::clone(&font_config.found.borrow());
+                let (faces, known, rest) = found.lock().unwrap().split(&no_glyphs);
+                if known > 0 {
+                    lbterm::FALLBACK_SHARED.add(known as u64, 0);
+                    for c in no_glyphs.iter().filter(|c| !rest.contains(c)) {
+                        tried_glyphs.insert(*c);
+                    }
+                    no_glyphs = rest;
+                    if !faces.is_empty() {
+                        drop(tried_glyphs);
+                        match self.insert_fallback_handles(faces) {
+                            Ok(true) => {
+                                // Tests: another font's search ending between two passes
+                                #[cfg(test)]
+                                lbterm_test::between_passes();
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(err) => log::error!("Error adding fallback: {:#}", err),
+                        }
+                        tried_glyphs = self.tried_glyphs.borrow_mut();
+                    }
+                }
+            }
+
+            for c in &no_glyphs {
+                tried_glyphs.insert(*c);
+            }
+            drop(tried_glyphs);
+
+            let mut async_resolve = false;
+
+            if !no_glyphs.is_empty() {
+                if let Some(font_config) = &font_config {
+                    font_config.schedule_fallback_resolve(
+                        no_glyphs,
+                        &self.pending_fallback,
+                        completion,
+                    );
+                    async_resolve = true;
+                }
+            }
+
+            return result.map(|r| (async_resolve, r));
+        }
     }
 
     pub fn metrics_for_idx(&self, font_idx: usize) -> anyhow::Result<FontMetrics> {
@@ -301,10 +359,28 @@ struct FallbackResolveInfo {
     built_in: Arc<FontDatabase>,
     locator: Arc<dyn FontLocator + Send + Sync>,
     config: ConfigHandle,
+    /// LBTerm: what every font with these settings has found (lbterm.rs)
+    found: lbterm::SharedFound,
 }
 
 impl FallbackResolveInfo {
-    fn process(self) {
+    fn process(mut self) {
+        // LBTerm: what another font's search found while this one waited its turn on the thread
+        // is answered from that, and only the rest is searched for
+        let (mut known_faces, known, rest) = self.found.lock().unwrap().split(&self.no_glyphs);
+        if known > 0 {
+            lbterm::FALLBACK_SHARED.add(known as u64, 0);
+        }
+        if rest.is_empty() {
+            if !known_faces.is_empty() {
+                self.pending.lock().unwrap().append(&mut known_faces);
+                (self.completion)();
+            }
+            return;
+        }
+        self.no_glyphs = rest;
+        let searched_at = Instant::now();
+
         let fallback_str = self.no_glyphs.iter().collect::<String>();
         let mut extra_handles = vec![];
 
@@ -349,8 +425,8 @@ impl FallbackResolveInfo {
         }
 
         let mut wanted = RangeSet::new();
-        for c in self.no_glyphs {
-            wanted.add(c as u32);
+        for c in &self.no_glyphs {
+            wanted.add(*c as u32);
         }
         log::trace!(
             "Fallback fonts that match {} before sorting are: {:#?}",
@@ -375,16 +451,25 @@ impl FallbackResolveInfo {
         }
 
         // iteratively reduce to just the fonts that we need
+        // LBTerm: keeping what each covers, for the next font that needs them (lbterm.rs)
+        let mut covered = vec![];
         extra_handles.retain(|p| match p.coverage_intersection(&wanted) {
             Ok(cov) if cov.is_empty() => false,
             Ok(cov) => {
                 // Remove the matches from the set, so that we avoid
                 // picking up multiple fonts for the same glyphs
                 wanted = wanted.difference(&cov);
+                covered.push(cov);
                 true
             }
             Err(_) => false,
         });
+        self.found.lock().unwrap().add(
+            &self.no_glyphs,
+            extra_handles.iter().cloned().zip(covered).collect(),
+        );
+        lbterm::FALLBACK_SEARCHES.since(searched_at);
+        extra_handles.append(&mut known_faces);
 
         if !extra_handles.is_empty() {
             let mut pending = self.pending.lock().unwrap();
@@ -476,7 +561,13 @@ struct FontConfigInner {
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
     panel_label_font: RefCell<Option<Rc<LoadedFont>>>,
+    /// LBTerm: fonts at sizes of their own (the Conductor's view), by style and size in points
+    lbterm_sized: RefCell<HashMap<(TextStyle, u64), Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
+    /// LBTerm: what the fallback searches of every font with these settings found (lbterm.rs)
+    found: RefCell<lbterm::SharedFound>,
+    /// LBTerm: the files in the font dirs when `font_dirs` was read, walked just before it
+    font_dirs_seen: RefCell<lbterm::FontDirs>,
 }
 
 /// Matches and loads fonts for a given input style
@@ -489,6 +580,10 @@ impl FontConfigInner {
     pub fn new(config: Option<ConfigHandle>, dpi: usize) -> anyhow::Result<Self> {
         let config = config.unwrap_or_else(configuration);
         let locator = new_locator(config.font_locator);
+        lbterm::CONFIGURATIONS.one();
+        // LBTerm: walked before they're read, so a file that comes between is read again later
+        // rather than never (lbterm.rs's FontDirs)
+        let dirs = lbterm::FontDirs::of(&config);
         Ok(Self {
             fonts: RefCell::new(HashMap::new()),
             locator,
@@ -498,18 +593,45 @@ impl FontConfigInner {
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
             panel_label_font: RefCell::new(None),
+            lbterm_sized: RefCell::new(HashMap::new()),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
             font_dirs: RefCell::new(Arc::new(FontDatabase::with_font_dirs(&config)?)),
-            built_in: RefCell::new(Arc::new(FontDatabase::with_built_in()?)),
+            // LBTerm: parsed once a process (lbterm.rs)
+            built_in: RefCell::new(lbterm::built_in_database()?),
             fallback_channel: RefCell::new(None),
+            found: RefCell::new(lbterm::found_for(&config::lbterm::fallback_key(&config), &dirs)),
+            font_dirs_seen: RefCell::new(dirs),
         })
+    }
+
+    /// LBTerm: a new config, keeping the fonts, what they found and the font dirs when it makes
+    /// the same fonts ([`config::lbterm::fonts_alike`]) and the font dirs hold the same files as
+    /// when they were read (upstream read them again on every reload); whether it kept them
+    fn lbterm_config_changed(&self, config: &ConfigHandle) -> anyhow::Result<bool> {
+        if config::lbterm::fonts_alike(&self.config.borrow(), config)
+            && lbterm::FontDirs::of(config) == *self.font_dirs_seen.borrow()
+        {
+            *self.config.borrow_mut() = config.clone();
+            lbterm::KEPT.one();
+            return Ok(true);
+        }
+        self.config_changed(config)?;
+        Ok(false)
     }
 
     fn config_changed(&self, config: &ConfigHandle) -> anyhow::Result<()> {
         let mut fonts = self.fonts.borrow_mut();
         *self.config.borrow_mut() = config.clone();
+        // LBTerm: what fallback searches found is kept for these settings' fonts, while the font
+        // dirs hold the same files (lbterm.rs); what they found nothing for is searched for again,
+        // as upstream's fresh fonts did after every reload (Found::forget_missing)
+        let dirs = lbterm::FontDirs::of(config);
+        let found = lbterm::found_for(&config::lbterm::fallback_key(config), &dirs);
+        found.lock().unwrap().forget_missing();
+        *self.found.borrow_mut() = found;
+        *self.font_dirs_seen.borrow_mut() = dirs;
         // Config was reloaded, invalidate our caches
         fonts.clear();
         self.title_font.borrow_mut().take();
@@ -517,6 +639,7 @@ impl FontConfigInner {
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
         self.panel_label_font.borrow_mut().take();
+        self.lbterm_sized.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
         Ok(())
@@ -540,6 +663,7 @@ impl FontConfigInner {
             built_in: Arc::clone(&*self.built_in.borrow()),
             locator: Arc::clone(&self.locator),
             config: self.config.borrow().clone(),
+            found: Arc::clone(&self.found.borrow()),
         };
 
         let mut fallback = self.fallback_channel.borrow_mut();
@@ -630,9 +754,11 @@ impl FontConfigInner {
         let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
 
         let attributes = text_style.font_with_fallback();
+        let started = Instant::now();
         let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
 
         let shaper = new_shaper(&*config, &handles)?;
+        lbterm::SHAPERS.one();
 
         let metrics = shaper.metrics(font_size, dpi).with_context(|| {
             format!(
@@ -655,6 +781,7 @@ impl FontConfigInner {
             tried_glyphs: RefCell::new(HashSet::new()),
             pixel_geometry: config.display_pixel_geometry,
         });
+        lbterm::FONTS.since(started);
 
         Ok(loaded)
     }
@@ -711,6 +838,47 @@ impl FontConfigInner {
         Ok(loaded)
     }
 
+    /// LBTerm: `style` at `font_size` points, kept until the config or the scale changes
+    fn lbterm_sized_font(
+        &self,
+        myself: &Rc<Self>,
+        style: &TextStyle,
+        font_size: f64,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        let key = (style.clone(), font_size.to_bits());
+        if let Some(loaded) = self.lbterm_sized.borrow().get(&key) {
+            return Ok(Rc::clone(loaded));
+        }
+        let config = self.config.borrow();
+        let dpi = *self.dpi.borrow() as u32;
+        let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
+        let attributes = style.font_with_fallback();
+        let started = Instant::now();
+        let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
+        let shaper = new_shaper(&*config, &handles)?;
+        lbterm::SHAPERS.one();
+        let metrics = shaper.metrics(font_size, dpi).with_context(|| {
+            format!("obtaining metrics for font_size={} @ dpi {}", font_size, dpi)
+        })?;
+        let loaded = Rc::new(LoadedFont {
+            rasterizers: RefCell::new(HashMap::new()),
+            handles: RefCell::new(handles),
+            shaper: RefCell::new(shaper),
+            metrics,
+            font_size,
+            dpi,
+            font_config: Rc::downgrade(myself),
+            pending_fallback: Arc::new(Mutex::new(vec![])),
+            text_style: style.clone(),
+            id: alloc_font_id(),
+            tried_glyphs: RefCell::new(HashSet::new()),
+            pixel_geometry: config.display_pixel_geometry,
+        });
+        self.lbterm_sized.borrow_mut().insert(key, Rc::clone(&loaded));
+        lbterm::FONTS.since(started);
+        Ok(loaded)
+    }
+
     fn pane_select_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
         let mut pane_select_font = self.pane_select_font.borrow_mut();
 
@@ -752,9 +920,11 @@ impl FontConfigInner {
             }
 
             let mut loaded_ignored = HashSet::new();
+            let looked = Instant::now();
             let located = self
                 .locator
                 .load_fonts(attrs, &mut loaded_ignored, pixel_size)?;
+            lbterm::LOOKUPS.since(looked);
             for font in &located {
                 candidates.push(font);
             }
@@ -871,6 +1041,7 @@ impl FontConfigInner {
             }
         }
 
+        lbterm::SHAPERS.one();
         Ok((new_shaper(&*config, &handles)?, handles))
     }
 
@@ -894,6 +1065,7 @@ impl FontConfigInner {
         let mut font_size = config.font_size * *self.font_scale.borrow();
         let dpi = *self.dpi.borrow() as u32;
         let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
+        let started = Instant::now();
 
         let (mut shaper, mut handles) = self.resolve_font_helper(style, &config, pixel_size)?;
 
@@ -958,6 +1130,7 @@ impl FontConfigInner {
         });
 
         fonts.insert(style.clone(), Rc::clone(&loaded));
+        lbterm::FONTS.since(started);
 
         Ok(loaded)
     }
@@ -972,6 +1145,7 @@ impl FontConfigInner {
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
         self.panel_label_font.borrow_mut().take();
+        self.lbterm_sized.borrow_mut().clear();
 
         (prior_font, prior_dpi)
     }
@@ -1076,6 +1250,12 @@ impl FontConfiguration {
         self.inner.config_changed(config)
     }
 
+    /// LBTerm: a new config, keeping the fonts when it makes the same ones
+    /// ([`config::lbterm::fonts_alike`]): whether it kept them
+    pub fn lbterm_config_changed(&self, config: &ConfigHandle) -> anyhow::Result<bool> {
+        self.inner.lbterm_config_changed(config)
+    }
+
     pub fn config(&self) -> ConfigHandle {
         self.inner.config.borrow().clone()
     }
@@ -1092,6 +1272,15 @@ impl FontConfiguration {
     /// (`lbterm_tab_panel.label_font_size`)
     pub fn panel_label_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.panel_label_font(&self.inner)
+    }
+
+    /// LBTerm: `style` at `font_size` points, whatever the config's sizes (the Conductor's view)
+    pub fn lbterm_sized_font(
+        &self,
+        style: &TextStyle,
+        font_size: f64,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.lbterm_sized_font(&self.inner, style, font_size)
     }
 
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
@@ -1151,5 +1340,221 @@ impl FontConfiguration {
         attrs: &CellAttributes,
     ) -> &'a TextStyle {
         self.inner.match_style(config, attrs)
+    }
+}
+
+#[cfg(test)]
+mod lbterm_test {
+    use super::*;
+
+    thread_local! {
+        static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    /// Runs what a test asked to happen between two of shape_impl's passes, once
+    pub(super) fn between_passes() {
+        if let Some(f) = BETWEEN.with(|b| b.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    /// A font configuration of the test's own: bundled fonts only, and a fallback key (an unused
+    /// font dir) no other test shares
+    fn fonts(tag: &str) -> (FontConfiguration, lbterm::SharedFound) {
+        let mut config = config::Config::default_config();
+        config.font_dirs = vec![format!("lbterm-test-no-such-dir-{tag}").into()];
+        let found =
+            lbterm::found_for(&config::lbterm::fallback_key(&config), &lbterm::FontDirs::of(&config));
+        let handle = config::lbterm::handle_for_test(config);
+        (FontConfiguration::new(Some(handle), 96).unwrap(), found)
+    }
+
+    fn built_in(family: &str) -> ParsedFont {
+        lbterm::built_in_database()
+            .unwrap()
+            .candidates(&FontAttributes::new(family))
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone()
+    }
+
+    /// Two faces of the bundled Roboto: none of the default font's own faces, and not one another
+    fn two_faces() -> (ParsedFont, ParsedFont) {
+        let db = lbterm::built_in_database().unwrap();
+        let faces = db.candidates(&FontAttributes::new("Roboto"));
+        assert!(faces.len() >= 2 && faces[0] != faces[1]);
+        (faces[0].clone(), faces[1].clone())
+    }
+
+    fn just(c: char) -> RangeSet<u32> {
+        let mut s = RangeSet::new();
+        s.add(c as u32);
+        s
+    }
+
+    // Hangul: none of the bundled fonts has it
+    const HAN: char = '\u{D55C}';
+
+    #[test]
+    fn a_character_another_font_searched_for_is_not_searched_for_again() {
+        let (fonts, found) = fonts("searched");
+        // Searched for before, by another font, with nothing found
+        found.lock().unwrap().add(&[HAN], vec![]);
+        let font = fonts.default_font().unwrap();
+        let (async_resolve, _) = font
+            .shape_impl("\u{D55C}", || {}, |_| {}, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert!(!async_resolve, "answered from what was found: no search scheduled");
+        assert!(font.tried_glyphs.borrow().contains(&HAN));
+    }
+
+    // Another Hangul syllable
+    const GUK: char = '\u{AD6D}';
+
+    #[test]
+    fn a_font_made_after_a_search_takes_only_the_faces_of_what_it_meets() {
+        let (fonts, found) = fonts("made-after");
+        let (roboto, other) = two_faces();
+        // As if searches by other fonts found one face for one character and another face for
+        // another (their coverage is what the searches said)
+        found.lock().unwrap().add(&[HAN], vec![(roboto.clone(), just(HAN))]);
+        found.lock().unwrap().add(&[GUK], vec![(other.clone(), just(GUK))]);
+        let font = fonts.default_font().unwrap();
+        let own = font.clone_handles();
+        assert!(
+            !own.contains(&roboto) && !own.contains(&other),
+            "no face another font found, before this one meets its character (PITFALLS 54)"
+        );
+        let (async_resolve, _) = font
+            .shape_impl("\u{D55C}", || {}, |_| {}, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert!(!async_resolve, "nothing searched for a character searched for already");
+        let handles = font.clone_handles();
+        assert_eq!(handles.len(), own.len() + 1);
+        assert_eq!(handles.last(), Some(&roboto), "the face of the character it met");
+        assert!(!handles.contains(&other), "not the face of one it didn't meet");
+    }
+
+    #[test]
+    fn a_character_found_between_two_passes_takes_its_face() {
+        let (fonts, found) = fonts("between");
+        let font = fonts.default_font().unwrap();
+        let (roboto, other) = two_faces();
+        found.lock().unwrap().add(&[HAN], vec![(roboto.clone(), just(HAN))]);
+        // The second character's search, another font's, ends after the first pass took
+        // Roboto and before the text is shaped again
+        let later = Arc::clone(&found);
+        let face = other.clone();
+        BETWEEN.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                later.lock().unwrap().add(&[GUK], vec![(face, just(GUK))]);
+            }))
+        });
+        let (async_resolve, _) = font
+            .shape_impl("\u{D55C}\u{AD6D}", || {}, |_| {}, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert!(BETWEEN.with(|b| b.borrow().is_none()), "the search ended between the passes");
+        let handles = font.clone_handles();
+        assert!(handles.contains(&roboto));
+        assert!(
+            handles.contains(&other),
+            "a character answered between passes took its face, not only marked tried"
+        );
+        assert!(!async_resolve, "both answered: nothing left to search for");
+    }
+
+    #[test]
+    fn a_file_added_to_the_font_dirs_makes_the_fonts_again() {
+        let dir = std::env::temp_dir().join(format!("lbterm-fontdirs-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = config::Config::default_config();
+        config.font_dirs = vec![dir.clone()];
+        let fonts = FontConfiguration::new(Some(config::lbterm::handle_for_test(config.clone())), 96)
+            .unwrap();
+        let font = fonts.default_font().unwrap();
+        let found = Arc::clone(&fonts.inner.found.borrow());
+        assert!(fonts
+            .lbterm_config_changed(&config::lbterm::handle_for_test(config.clone()))
+            .unwrap(), "the same settings and files: kept");
+        assert!(Rc::ptr_eq(&font, &fonts.default_font().unwrap()));
+        // A file put in the font dirs, as a font installed there would be
+        std::fs::write(dir.join("added.ttf"), b"not a font").unwrap();
+        let kept = fonts
+            .lbterm_config_changed(&config::lbterm::handle_for_test(config.clone()))
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!kept, "the font dirs read again, as upstream read them on every reload");
+        assert!(!Rc::ptr_eq(&font, &fonts.default_font().unwrap()), "the fonts made again");
+        assert!(
+            !Arc::ptr_eq(&found, &fonts.inner.found.borrow()),
+            "what was searched for with the old files is searched for again"
+        );
+    }
+
+    #[test]
+    fn a_face_another_font_found_joins_this_one_and_it_shapes_again() {
+        let (fonts, found) = fonts("joins");
+        let font = fonts.default_font().unwrap();
+        let before = font.clone_handles().len();
+        let roboto = built_in("Roboto");
+        found.lock().unwrap().add(&[HAN], vec![(roboto.clone(), just(HAN))]);
+        let (async_resolve, _) = font
+            .shape_impl("\u{D55C}", || {}, |_| {}, None, Direction::LeftToRight, None, None)
+            .unwrap();
+        assert!(!async_resolve);
+        let handles = font.clone_handles();
+        assert_eq!(handles.len(), before + 1, "the face another font found joined it");
+        assert_eq!(handles.last(), Some(&roboto));
+    }
+
+    #[test]
+    fn a_reload_of_the_same_settings_keeps_the_fonts() {
+        let (fonts, _) = fonts("reload");
+        let font = fonts.default_font().unwrap();
+        let mut same = (*fonts.config()).clone();
+        same.max_fps = 30;
+        assert!(fonts
+            .lbterm_config_changed(&config::lbterm::handle_for_test(same))
+            .unwrap());
+        assert!(Rc::ptr_eq(&font, &fonts.default_font().unwrap()), "the same font");
+        let mut bigger = (*fonts.config()).clone();
+        bigger.font_size += 2.0;
+        assert!(!fonts
+            .lbterm_config_changed(&config::lbterm::handle_for_test(bigger))
+            .unwrap());
+        assert!(
+            !Rc::ptr_eq(&font, &fonts.default_font().unwrap()),
+            "made again at the new size"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_makes_the_fonts_again_searches_again_for_what_nothing_had() {
+        let (fonts, found) = fonts("missing");
+        let roboto = built_in("Roboto");
+        // As if searches found Roboto for one character and nothing for another
+        found.lock().unwrap().add(&[HAN, GUK], vec![(roboto.clone(), just(HAN))]);
+        let mut same = (*fonts.config()).clone();
+        same.max_fps = 30;
+        assert!(fonts
+            .lbterm_config_changed(&config::lbterm::handle_for_test(same))
+            .unwrap());
+        assert!(found.lock().unwrap().searched(GUK), "a reload that keeps the fonts keeps it");
+        let mut bigger = (*fonts.config()).clone();
+        bigger.font_size += 2.0;
+        assert!(!fonts
+            .lbterm_config_changed(&config::lbterm::handle_for_test(bigger))
+            .unwrap());
+        assert!(
+            Arc::ptr_eq(&found, &fonts.inner.found.borrow()),
+            "the same fallback settings and font dirs: the same Found"
+        );
+        assert!(found.lock().unwrap().searched(HAN), "what was found is kept");
+        assert!(
+            !found.lock().unwrap().searched(GUK),
+            "what nothing had is searched for again, as upstream's fresh fonts did"
+        );
     }
 }

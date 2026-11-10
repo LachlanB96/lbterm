@@ -20,6 +20,11 @@ pub enum MouseButton {
     WheelLeft(usize),
     WheelRight(usize),
     None,
+    /// LBTerm: the side buttons, for `mouse_bindings` only. The GUI never passes them to a pane,
+    /// so a mux server built before them never receives one. They come last, so the codec
+    /// numbers the others as before
+    Back,
+    Forward,
 }
 
 #[cfg_attr(feature = "use_serde", derive(Deserialize, Serialize))]

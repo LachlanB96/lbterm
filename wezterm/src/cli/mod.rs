@@ -186,7 +186,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SplitPane(cmd) => cmd.run(client).await,
         CliSubCommand::SendText(cmd) => cmd.run(client).await,
         CliSubCommand::GetText(cmd) => cmd.run(client).await,
-        CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::SpawnCommand(cmd) => cmd.run(client, || crate::init_config(opts)).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,

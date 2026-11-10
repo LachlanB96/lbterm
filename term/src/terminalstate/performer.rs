@@ -14,6 +14,7 @@ use termwiz::input::KeyboardEncoding;
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
+use wezterm_surface::SequenceNo;
 use wezterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
@@ -114,6 +115,94 @@ impl<'a> Performer<'a> {
         }
     }
 
+    /// LBTerm: whether the character set in use is ASCII, which remap_grapheme leaves as it is
+    fn lbterm_ascii_charset(&self) -> bool {
+        let set = if self.shift_out {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        };
+        set == CharSet::Ascii
+    }
+
+    /// LBTerm: the pending wrap taken: the line marked as wrapped (but for ConPTY's quirk) and the
+    /// cursor on the next, as the grapheme path takes it before a character
+    fn lbterm_wrap(&mut self, seqno: SequenceNo) {
+        // Since we're implicitly moving the cursor to the next
+        // line, we need to tag the current position as wrapped
+        // so that we can correctly reflow it if the window is
+        // resized.
+        {
+            let y = self.cursor.y;
+            let is_conpty = self.state.enable_conpty_quirks;
+            let screen = self.screen_mut();
+            let y = screen.phys_row(y);
+
+            fn makes_sense_to_wrap(s: &str) -> bool {
+                let len = s.len();
+                match (len, s.chars().next()) {
+                    (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
+                    _ => true,
+                }
+            }
+
+            let should_mark_wrapped = !is_conpty
+                || screen
+                    .line_mut(y)
+                    .visible_cells()
+                    .last()
+                    .map(|cell| makes_sense_to_wrap(cell.str()))
+                    .unwrap_or(false);
+            if should_mark_wrapped {
+                screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+            }
+        }
+        self.new_line(true);
+    }
+
+    /// LBTerm: printable ASCII, written a stretch at a time: as many characters as fit up to the
+    /// right margin go to their line in one write (Screen::set_cells_ascii), where the grapheme
+    /// path segments, measures and writes each with bookkeeping of its own (lbterm/PERF.md,
+    /// "What printing costs"). The cursor and the pending wrap end as a character at a time
+    /// leaves them
+    fn lbterm_print_ascii(&mut self, text: &str, seqno: SequenceNo) {
+        self.lbterm_ascii_runs += 1;
+        let mut rest = text;
+        while !rest.is_empty() {
+            if self.wrap_next {
+                self.lbterm_wrap(seqno);
+            }
+            let x = self.cursor.x;
+            let y = self.cursor.y;
+            let width = self.left_and_right_margins.end;
+            // Up to the margin's column, its character the run's last; past the margin, one at
+            // a time, each on the column the cursor is in, as the grapheme path puts it
+            let n = rest.len().min(width.saturating_sub(x).max(1));
+            let (run, after) = rest.split_at(n);
+            {
+                let state = &mut *self.state;
+                state.screen.set_cells_ascii(x, y, run, &state.pen, seqno);
+            }
+            rest = after;
+            if x + n < width {
+                self.cursor.x += n;
+                self.wrap_next = false;
+            } else {
+                self.cursor.x = x + n - 1;
+                self.wrap_next = self.dec_auto_wrap;
+                if !self.wrap_next && !rest.is_empty() {
+                    // Autowrap off: each character after writes over the same cell, so the
+                    // last is what it holds
+                    let last = &rest[rest.len() - 1..];
+                    let x = self.cursor.x;
+                    let state = &mut *self.state;
+                    state.screen.set_cells_ascii(x, y, last, &state.pen, seqno);
+                    rest = "";
+                }
+            }
+        }
+    }
+
     fn flush_print(&mut self) {
         if self.print.is_empty() {
             return;
@@ -131,7 +220,17 @@ impl<'a> Performer<'a> {
             p.as_str()
         };
 
-        for g in Graphemes::new(text) {
+        // LBTerm: a run of printable ASCII in the ASCII set, outside insert mode, a stretch at a
+        // time (lbterm_print_ascii); anything else a grapheme at a time, as upstream prints
+        let ascii = !self.insert
+            && !self.lbterm_upstream_print
+            && self.lbterm_ascii_charset()
+            && text.bytes().all(|b| (0x20..0x7f).contains(&b));
+        if ascii {
+            self.lbterm_print_ascii(text, seqno);
+        }
+
+        for g in Graphemes::new(if ascii { "" } else { text }) {
             let g = self.remap_grapheme(g);
 
             let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
@@ -162,43 +261,13 @@ impl<'a> Performer<'a> {
             }
 
             if self.wrap_next {
-                // Since we're implicitly moving the cursor to the next
-                // line, we need to tag the current position as wrapped
-                // so that we can correctly reflow it if the window is
-                // resized.
-                {
-                    let y = self.cursor.y;
-                    let is_conpty = self.state.enable_conpty_quirks;
-                    let screen = self.screen_mut();
-                    let y = screen.phys_row(y);
-
-                    fn makes_sense_to_wrap(s: &str) -> bool {
-                        let len = s.len();
-                        match (len, s.chars().next()) {
-                            (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
-                            _ => true,
-                        }
-                    }
-
-                    let should_mark_wrapped = !is_conpty
-                        || screen
-                            .line_mut(y)
-                            .visible_cells()
-                            .last()
-                            .map(|cell| makes_sense_to_wrap(cell.str()))
-                            .unwrap_or(false);
-                    if should_mark_wrapped {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
-                    }
-                }
-                self.new_line(true);
+                // LBTerm: its own function, which the ASCII path takes too
+                self.lbterm_wrap(seqno);
             }
 
             let x = self.cursor.x;
             let y = self.cursor.y;
             let width = self.left_and_right_margins.end;
-
-            let pen = self.pen.clone();
 
             let wrappable = x + print_width >= width;
 
@@ -220,8 +289,14 @@ impl<'a> Performer<'a> {
                 g,
                 self.pen
             );
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            // LBTerm: the pen by reference, copied only where the line keeps it, where upstream
+            // copied it (and a 24-bit colour's heap block) for every character
+            {
+                let state = &mut *self.state;
+                state
+                    .screen
+                    .set_cell_grapheme_ref(x, y, g, print_width, &state.pen, seqno);
+            }
 
             if !wrappable {
                 self.cursor.x += print_width;
@@ -266,11 +341,9 @@ impl<'a> Performer<'a> {
         }
         match action {
             Action::Print(c) => self.print(c),
-            Action::PrintString(s) => {
-                for c in s.chars() {
-                    self.print(c)
-                }
-            }
+            // LBTerm: the parser's string taken whole, where each of its characters was pushed
+            // again, one at a time
+            Action::PrintString(s) => self.lbterm_print_str(s),
             Action::Control(code) => self.control(code),
             Action::DeviceControl(ctrl) => self.device_control(ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
@@ -363,6 +436,17 @@ impl<'a> Performer<'a> {
     }
 
     /// Draw a character to the screen
+    /// LBTerm: print for a whole string
+    fn lbterm_print_str(&mut self, s: String) {
+        if let Some(title) = self.accumulating_title.as_mut() {
+            title.push_str(&s);
+        } else if self.print.is_empty() {
+            self.print = s;
+        } else {
+            self.print.push_str(&s);
+        }
+    }
+
     fn print(&mut self, c: char) {
         // We buffer up the chars to increase the chances of correctly grouping graphemes into cells
         if let Some(title) = self.accumulating_title.as_mut() {
@@ -745,32 +829,51 @@ impl<'a> Performer<'a> {
         self.pop_tmux_title_state();
         self.flush_print();
         match osc {
+            // LBTerm: an alert only for what changed. Each one is a PDU to every client and an
+            // update of every window's title, and Claude Code sets its title (OSC 0, through
+            // ConPTY) every 960 ms while it works, which raised two each time; a title set again
+            // unchanged (ConPTY passes each one on) raised them too. get_title() is the icon
+            // title, else the title, so a title alert is all a client needs to read it again.
+            // A title set again unchanged goes to title_set_again instead: upstream's mux window
+            // takes the title of whichever pane set one last, which mux's LocalPane keeps.
             OperatingSystemCommand::SetIconNameSun(title)
             | OperatingSystemCommand::SetIconName(title) => {
-                if title.is_empty() {
-                    self.icon_title = None;
-                } else {
-                    self.icon_title = Some(title);
-                }
-                let title = self.icon_title.clone();
-                if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::IconTitleChanged(title));
+                let icon_title = if title.is_empty() { None } else { Some(title) };
+                if icon_title != self.icon_title {
+                    self.icon_title = icon_title;
+                    let title = self.icon_title.clone();
+                    if let Some(handler) = self.alert_handler.as_mut() {
+                        handler.alert(Alert::IconTitleChanged(title));
+                    }
                 }
             }
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
-                self.icon_title.take();
+                let icon_cleared = self.icon_title.take().is_some();
+                let title_changed = self.title != title;
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::WindowTitleChanged(title.clone()));
-                    handler.alert(Alert::IconTitleChanged(Some(title)));
+                    // One alert: the title's, else the icon title's when it clears one, which
+                    // get_title() read in place of the title
+                    if title_changed {
+                        handler.alert(Alert::WindowTitleChanged(title));
+                    } else {
+                        handler.title_set_again(&title);
+                        if icon_cleared {
+                            handler.alert(Alert::IconTitleChanged(Some(title)));
+                        }
+                    }
                 }
             }
 
             OperatingSystemCommand::SetWindowTitleSun(title)
             | OperatingSystemCommand::SetWindowTitle(title) => {
-                self.title = title.clone();
-                if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::WindowTitleChanged(title));
+                if self.title != title {
+                    self.title = title.clone();
+                    if let Some(handler) = self.alert_handler.as_mut() {
+                        handler.alert(Alert::WindowTitleChanged(title));
+                    }
+                } else if let Some(handler) = self.alert_handler.as_mut() {
+                    handler.title_set_again(&title);
                 }
             }
             OperatingSystemCommand::SetHyperlink(link) => {
@@ -984,9 +1087,14 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
-                self.current_dir = Url::parse(&url).ok();
-                if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::CurrentWorkingDirectoryChanged);
+                // LBTerm: only a new folder: pwsh says it at each prompt and Terminal's claudehook
+                // with each status change, and each alert updated every window's title
+                let dir = Url::parse(&url).ok();
+                if dir != self.current_dir {
+                    self.current_dir = dir;
+                    if let Some(handler) = self.alert_handler.as_mut() {
+                        handler.alert(Alert::CurrentWorkingDirectoryChanged);
+                    }
                 }
             }
             OperatingSystemCommand::ChangeColorNumber(specs) => {

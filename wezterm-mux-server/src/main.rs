@@ -59,6 +59,12 @@ struct Opt {
     #[arg(long, hide = true)]
     pid_file_fd: Option<i32>,
 
+    /// LBTerm: started by --daemonize, so send stdout and stderr where the config's
+    /// daemon_options say
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    daemon_output: bool,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `wezterm start -- bash -l` will spawn bash
     /// as if it were a login shell.
@@ -73,6 +79,63 @@ fn main() {
         std::process::exit(1);
     }
     wezterm_blob_leases::clear_storage();
+}
+
+/// The command that runs the server itself, as `opts` asked for it but without `--daemonize`,
+/// `extra` first
+fn server_command(opts: &Opt, extra: Vec<OsString>) -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(extra);
+    if opts.skip_config {
+        cmd.arg("-n");
+    }
+    if let Some(f) = &opts.config_file {
+        cmd.arg("--config-file");
+        cmd.arg(f);
+    }
+    for (name, value) in &opts.config_override {
+        cmd.arg("--config");
+        cmd.arg(&format!("{name}={value}"));
+    }
+    if let Some(cwd) = &opts.cwd {
+        cmd.arg("--cwd");
+        cmd.arg(cwd);
+    }
+    if !opts.prog.is_empty() {
+        cmd.arg("--");
+        for a in &opts.prog {
+            cmd.arg(a);
+        }
+    }
+    cmd
+}
+
+/// On Windows we can't literally daemonize, but we can spawn another copy of ourselves in the
+/// background, detached and without a console, its output its own to send (`--daemon-output`)
+#[cfg(windows)]
+fn start_server(opts: &Opt) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    let mut cmd = server_command(opts, vec!["--daemon-output".into()]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.creation_flags(winapi::um::winbase::DETACHED_PROCESS);
+    cmd.spawn().context("starting the mux server")?;
+    Ok(())
+}
+
+/// Stdout and stderr into the files `daemon` names (the server started by --daemonize)
+#[cfg(windows)]
+fn send_output_where(daemon: &config::DaemonOptions) -> anyhow::Result<()> {
+    use filedescriptor::{FileDescriptor, StdioDescriptor};
+    for (file, stdio) in [
+        (daemon.open_stdout()?, StdioDescriptor::Stdout),
+        (daemon.open_stderr()?, StdioDescriptor::Stderr),
+    ] {
+        // What it was is the null device's handle, closed as it goes
+        FileDescriptor::redirect_stdio(&file, stdio)?;
+    }
+    Ok(())
 }
 
 fn run() -> anyhow::Result<()> {
@@ -93,13 +156,41 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
+    // LBTerm: on Windows the copy started with --daemonize only starts the server, which runs
+    // the config itself: running it here too ran Lachlan's lbterm.lua twice at every server
+    // start (2026-10-29). The server sends its own output where daemon_options say
+    #[cfg(windows)]
+    if opts.daemonize {
+        return start_server(&opts);
+    }
+
     config::common_init(
         opts.config_file.as_ref(),
         &opts.config_override,
         opts.skip_config,
     )?;
 
+    // LBTerm: a server told which config to run doesn't carry on with the defaults when it fails
+    // to load: their domain is the default one, whose socket is Lachlan's daily server's (a test's
+    // server took it that way on 2026-10-29). Without --config-file it still does, as upstream, so
+    // a broken lbterm.lua can't keep LBTerm's own server from starting
+    if let Some(file) = &opts.config_file {
+        if let Err(err) = config::configuration_result() {
+            anyhow::bail!(
+                "{} didn't load, so the server won't start on the default config: {err:#}",
+                std::path::Path::new(file).display()
+            );
+        }
+    }
+
     let config = config::configuration();
+
+    // What it logged while the config loaded, the config's own lines included, is only in its
+    // log file (`lbterm-mux-server.exe-log-<pid>.txt`), which has everything it logs
+    #[cfg(windows)]
+    if opts.daemon_output {
+        send_output_where(&config.daemon_options)?;
+    }
 
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {
@@ -121,71 +212,28 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
+    #[cfg(unix)]
     if opts.daemonize {
-        // On Windows we can't literally daemonize, but we can spawn another copy
-        // of ourselves in the background!
-        // On Unix, forking breaks the global state maintained by `smol`,
-        // so we need to re-exec ourselves to start things back up properly.
-        let mut cmd = Command::new(std::env::current_exe().unwrap());
-
-        #[cfg(unix)]
-        {
-            // Inform the new version of ourselves that we already
-            // locked the pidfile so that it can prevent it from
-            // being propagated to its children when they spawn
-            if let Some(fd) = pid_file {
-                cmd.arg("--pid-file-fd");
-                cmd.arg(&fd.to_string());
-            }
-        }
-        if opts.skip_config {
-            cmd.arg("-n");
-        }
-        if let Some(f) = &opts.config_file {
-            cmd.arg("--config-file");
-            cmd.arg(f);
-        }
-        for (name, value) in &opts.config_override {
-            cmd.arg("--config");
-            cmd.arg(&format!("{name}={value}"));
-        }
-        if let Some(cwd) = opts.cwd {
-            cmd.arg("--cwd");
-            cmd.arg(cwd);
-        }
-        if !opts.prog.is_empty() {
-            cmd.arg("--");
-            for a in &opts.prog {
-                cmd.arg(a);
+        // Forking breaks the global state maintained by `smol`, so we need to re-exec
+        // ourselves to start things back up properly. Inform the new version of ourselves
+        // that we already locked the pidfile so that it can prevent it from being propagated
+        // to its children when they spawn
+        let extra: Vec<OsString> = match pid_file {
+            Some(fd) => vec!["--pid-file-fd".into(), fd.to_string().into()],
+            None => vec![],
+        };
+        let mut cmd = server_command(&opts, extra);
+        use std::os::unix::process::CommandExt;
+        if let Some(mask) = umask::UmaskSaver::saved_umask() {
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::umask(mask);
+                    Ok(())
+                });
             }
         }
 
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.stdout(config.daemon_options.open_stdout()?);
-            cmd.stderr(config.daemon_options.open_stderr()?);
-
-            cmd.creation_flags(winapi::um::winbase::DETACHED_PROCESS);
-            let child = cmd.spawn();
-            drop(child);
-            return Ok(());
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            if let Some(mask) = umask::UmaskSaver::saved_umask() {
-                unsafe {
-                    cmd.pre_exec(move || {
-                        libc::umask(mask);
-                        Ok(())
-                    });
-                }
-            }
-
-            return Err(anyhow::anyhow!("failed to re-exec: {:?}", cmd.exec()));
-        }
+        return Err(anyhow::anyhow!("failed to re-exec: {:?}", cmd.exec()));
     }
 
     // Remove some environment variables that aren't super helpful or
@@ -307,7 +355,10 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
 /// LBTerm: end the server once its last pane has gone (LBTerm closing its
 /// windows kills their panes here), rather than idling on and serving the
 /// next LBTerm from an older build. A second's grace, so a pane spawned
-/// straight after the last one closed keeps it.
+/// straight after the last one closed keeps it, and none while an Activity
+/// is held: a pane being made on a thread of its own (LocalDomain's
+/// spawn_pane) holds one, and when it's let go the mux is pruned, which says
+/// Empty again if it still is.
 fn exit_after_last_pane(mux: &Arc<Mux>) {
     let had_panes = Arc::new(AtomicBool::new(false));
     mux.subscribe(move |n| {
@@ -317,7 +368,7 @@ fn exit_after_last_pane(mux: &Arc<Mux>) {
                 thread::spawn(|| {
                     thread::sleep(Duration::from_secs(1));
                     promise::spawn::spawn_into_main_thread(async {
-                        if Mux::get().is_empty() {
+                        if Mux::get().is_empty() && mux::activity::Activity::count() == 0 {
                             log::info!("the last pane has gone; exiting");
                             std::process::exit(0);
                         }
@@ -342,10 +393,22 @@ pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
     for unix_dom in &config.unix_domains {
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
+        // LBTerm: one server a socket. Claimed before it's bound and held for as long as this
+        // server runs, by this thread (the main thread, which runs as long as it does): a second
+        // server, even one starting beside it before either has bound, refuses, and a client
+        // the socket refuses meanwhile waits for this one rather than start another
+        // (mux/src/lbterm_serve.rs)
+        #[cfg(windows)]
+        mux::lbterm_serve::claim(&unix_dom.socket_path())?.hold();
         let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
             listener.run();
         });
+        // LBTerm: and takes the socket back if another process takes its path
+        wezterm_mux_server_impl::local::keep_socket(unix_dom);
+        // LBTerm: its parked tabs' panes beside the socket, for Terminal's statusline: none at
+        // once, so a crashed server's file never names this one's panes (lbterm_parked.rs)
+        mux::lbterm_parked::publish(unix_dom.socket_path(), |_| true, true);
     }
 
     for tls_server in &config.tls_servers {

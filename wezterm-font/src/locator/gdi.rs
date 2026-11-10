@@ -15,17 +15,50 @@ use winapi::um::dwrite::*;
 use winapi::um::winbase::MulDiv;
 use winapi::um::wingdi::{
     CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, GetDeviceCaps, GetFontData,
-    SelectObject, FIXED_PITCH, GDI_ERROR, LF_FACESIZE, LOGFONTW, LOGPIXELSY, OUT_TT_ONLY_PRECIS,
+    GetTextFaceW, SelectObject, FIXED_PITCH, GDI_ERROR, LF_FACESIZE, LOGFONTW, LOGPIXELSY,
+    OUT_TT_ONLY_PRECIS,
 };
 
 /// A FontLocator implemented using the system font loading
 /// functions provided by the font-loader crate.
 pub struct GdiFontLocator {}
 
-fn extract_raw_font_data(font: HFONT, name: &str) -> anyhow::Result<FontDataSource> {
+/// The name of the face GDI selected into `hdc`, if it says
+fn selected_face(hdc: HDC) -> Option<String> {
+    let mut name = [0u16; LF_FACESIZE];
+    let len = unsafe { GetTextFaceW(hdc, name.len() as _, name.as_mut_ptr()) };
+    if len <= 0 {
+        return None;
+    }
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16(&name[..len]).ok()
+}
+
+/// `font`'s whole file, copied out of GDI. With `want` (LBTerm), only when the face GDI selected
+/// for it is that family: for a family Windows doesn't have, GDI selects another (Courier New, a
+/// font substitute) and upstream copied and parsed that whole file only to turn it down by name,
+/// for each such family of every style a window resolves (the bundled JetBrains Mono, Noto Color
+/// Emoji and Symbols Nerd Font Mono here, 11 files a config save)
+fn extract_raw_font_data(
+    font: HFONT,
+    name: &str,
+    want: Option<&str>,
+) -> anyhow::Result<FontDataSource> {
     unsafe {
         let hdc = CreateCompatibleDC(std::ptr::null_mut());
         SelectObject(hdc, font as *mut _);
+
+        if let Some(want) = want {
+            match selected_face(hdc) {
+                Some(face) if !face.eq_ignore_ascii_case(want) => {
+                    DeleteDC(hdc);
+                    crate::lbterm::SUBSTITUTES.one();
+                    anyhow::bail!("gdi selected {face:?} in place of {want:?}");
+                }
+                _ => {}
+            }
+        }
+        let read_at = std::time::Instant::now();
 
         // GetFontData can retrieve different parts of the font data.
         // We want to fetch the entire font file, but things are made
@@ -60,6 +93,7 @@ fn extract_raw_font_data(font: HFONT, name: &str) -> anyhow::Result<FontDataSour
         };
         DeleteDC(hdc);
         let data = data?;
+        crate::lbterm::FILES_READ.since(read_at);
 
         Ok(FontDataSource::Memory {
             data: Arc::new(data.into_boxed_slice()),
@@ -73,7 +107,7 @@ fn extract_font_data(
     attr: &FontAttributes,
     pixel_size: u16,
 ) -> anyhow::Result<ParsedFont> {
-    let source = extract_raw_font_data(font, &attr.family)?;
+    let source = extract_raw_font_data(font, &attr.family, Some(&attr.family))?;
 
     let mut font_info = vec![];
     parse_and_collect_font_info(&source, &mut font_info, FontOrigin::Gdi)?;
@@ -135,11 +169,37 @@ fn load_font(font_attr: &FontAttributes, pixel_size: u16) -> anyhow::Result<Pars
     }
 }
 
+/// LBTerm: the caption font a window asks for as it's made, on every config reload and on every
+/// theme change (window/src/os/windows/window.rs's update_title_font), kept while it's the same
+/// font at the same dpi: upstream copied its whole file out of GDI and parsed it each time, one
+/// file a save
 pub fn parse_log_font(log_font: &LOGFONTW, hdc: HDC) -> anyhow::Result<(ParsedFont, f64)> {
+    static LAST: std::sync::Mutex<Option<(Vec<u8>, i32, ParsedFont, f64)>> =
+        std::sync::Mutex::new(None);
+    let key = unsafe {
+        std::slice::from_raw_parts(
+            log_font as *const LOGFONTW as *const u8,
+            std::mem::size_of::<LOGFONTW>(),
+        )
+    }
+    .to_vec();
+    let dpi = unsafe { GetDeviceCaps(hdc, LOGPIXELSY) };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, d, parsed, size)) = last.as_ref() {
+        if *k == key && *d == dpi {
+            return Ok((parsed.clone(), *size));
+        }
+    }
+    let (parsed, size) = parse_log_font_now(log_font, hdc)?;
+    *last = Some((key, dpi, parsed.clone(), size));
+    Ok((parsed, size))
+}
+
+fn parse_log_font_now(log_font: &LOGFONTW, hdc: HDC) -> anyhow::Result<(ParsedFont, f64)> {
     let name = String::from_utf16(&log_font.lfFaceName)?;
     unsafe {
         let font = CreateFontIndirectW(log_font);
-        let source = extract_raw_font_data(font, &name);
+        let source = extract_raw_font_data(font, &name, None);
         DeleteObject(font as *mut _);
         let source = source?;
 

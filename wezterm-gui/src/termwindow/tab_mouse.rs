@@ -141,7 +141,7 @@ impl TermWindow {
                         if let Err(err) = self.move_tab(slot) {
                             log::error!("tab drag: {err:#}");
                         }
-                        context.invalidate();
+                        context.lbterm_invalidate();
                     }
                 }
                 context.set_cursor(Some(CursorIcon::Grabbing));
@@ -168,7 +168,7 @@ impl TermWindow {
                     }
                 }
                 context.set_cursor(Some(CursorIcon::Default));
-                context.invalidate();
+                context.lbterm_invalidate();
                 true
             }
             _ => false,

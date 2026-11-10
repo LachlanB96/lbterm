@@ -45,6 +45,10 @@ pub struct Screen {
     pub dpi: u32,
 
     pub(crate) saved_cursor: Option<SavedCursor>,
+
+    /// LBTerm: where its lines can have changed since recent sequence numbers, so that
+    /// get_changed_stable_rows reads those and not the whole scrollback (lbterm_changes.rs)
+    lbterm_changes: crate::lbterm_changes::ChangeBounds,
 }
 
 fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
@@ -69,8 +73,10 @@ impl Screen {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
-        let mut lines =
-            VecDeque::with_capacity(physical_rows + scrollback_size(config, allow_scrollback));
+        // LBTerm: room for the viewport; the scrollback grows as lines go into it
+        // (lbterm_reserve). Upstream reserved all of it at once: with 50,000 lines of scrollback
+        // about 6.8 MB a pane, before it had printed anything
+        let mut lines = VecDeque::with_capacity(physical_rows);
         for _ in 0..physical_rows {
             let mut line = Line::new(seqno);
             bidi_mode.apply_to_line(&mut line, seqno);
@@ -87,7 +93,42 @@ impl Screen {
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
+            lbterm_changes: Default::default(),
         }
+    }
+
+    /// LBTerm: the terminal's sequence number has moved on to `seqno`: every line changed from
+    /// now on is at or below the viewport's top as it is now, until a resize or a change above
+    /// it (lbterm_changes.rs)
+    pub fn lbterm_advanced(&mut self, seqno: SequenceNo) {
+        let top = self.visible_row_to_stable_row(0);
+        self.lbterm_changes.advanced(seqno, top);
+    }
+
+    /// LBTerm: room for `more` lines: twice what there's room for, as the deque would grow by
+    /// itself, but never more than the scrollback holds, so a full one holds what upstream
+    /// reserved and no more
+    fn lbterm_reserve(&mut self, more: usize) {
+        let need = self.lines.len() + more;
+        let room = self.lines.capacity();
+        if need <= room {
+            return;
+        }
+        let most = (self.physical_rows + self.scrollback_size()).max(need);
+        let want = (room * 2).max(need).min(most);
+        self.lines.reserve_exact(want - self.lines.len());
+    }
+
+    /// LBTerm: how many lines it has room for (lbterm_reserve)
+    #[cfg(test)]
+    pub(crate) fn lbterm_capacity(&self) -> usize {
+        self.lines.capacity()
+    }
+
+    /// LBTerm: the physical row the viewport starts at; every row before it is scrollback
+    #[inline]
+    fn lbterm_viewport_start(&self) -> PhysRowIndex {
+        self.lines.len().saturating_sub(self.physical_rows)
     }
 
     pub fn full_reset(&mut self) {
@@ -106,13 +147,18 @@ impl Screen {
         cursor_y: PhysRowIndex,
         seqno: SequenceNo,
     ) -> (usize, PhysRowIndex) {
-        let mut rewrapped = VecDeque::new();
+        // LBTerm: room for the lines there are, where it grew by doubling from none
+        let mut rewrapped = VecDeque::with_capacity(self.lines.len());
         let mut logical_line: Option<Line> = None;
         let mut logical_cursor_x: Option<usize> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
-            line.update_last_change_seqno(seqno);
+            // LBTerm: a line isn't marked changed here, but where it is below: when it's joined,
+            // cut or moved to another row. Upstream marked every line, so a client's next look
+            // at the pane found its whole scrollback changed (a mux server sent 50,000 rows dirty
+            // a pane, which the window walked a row at a time) though a line that keeps its row
+            // and its cells shows what it did
             let was_wrapped = line.last_cell_was_wrapped();
 
             if was_wrapped {
@@ -165,10 +211,20 @@ impl Screen {
                 }
             }
 
+            // LBTerm: one at another row than it had is marked changed (a joined or cut one is
+            // already), since a row's index is its place in the lines (and the stable row's
+            // offset doesn't move here)
             if line.len() <= physical_cols {
+                let mut line = line;
+                if rewrapped.len() != phys_idx {
+                    line.update_last_change_seqno(seqno);
+                }
                 rewrapped.push_back(line);
             } else {
-                for line in line.wrap(physical_cols, seqno) {
+                for mut line in line.wrap(physical_cols, seqno) {
+                    if rewrapped.len() != phys_idx {
+                        line.update_last_change_seqno(seqno);
+                    }
                     rewrapped.push_back(line);
                 }
             }
@@ -212,6 +268,8 @@ impl Screen {
             size.dpi
         );
         self.dpi = size.dpi;
+        // LBTerm: the lines are pruned, rewrapped and moved; nothing noted holds
+        self.lbterm_changes.forget();
 
         // pre-prune blank lines that range from the cursor position to the end of the display;
         // this avoids growing the scrollback size when rapidly switching between normal and
@@ -249,11 +307,7 @@ impl Screen {
             (cursor.x, cursor_phys)
         };
 
-        let capacity = physical_rows + self.scrollback_size();
-        let current_capacity = self.lines.capacity();
-        if capacity > current_capacity {
-            self.lines.reserve(capacity - current_capacity);
-        }
+        // LBTerm: no reserving the whole scrollback here either (lbterm_reserve)
 
         // If we resized wider and the rewrap resulted in fewer
         // lines than the viewport size, or we resized taller,
@@ -329,6 +383,11 @@ impl Screen {
     /// Get mutable reference to a line, relative to start of scrollback.
     #[inline]
     pub fn line_mut(&mut self, idx: PhysRowIndex) -> &mut Line {
+        // LBTerm: a line above the viewport may change (lbterm_changes.rs)
+        if idx < self.lbterm_viewport_start() {
+            let row = self.phys_to_stable_row_index(idx);
+            self.lbterm_changes.touched(row);
+        }
         &mut self.lines[idx]
     }
 
@@ -421,6 +480,36 @@ impl Screen {
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         line.set_cell_grapheme(x, text, width, attr, seqno);
+    }
+
+    /// LBTerm: set_cell_grapheme with the pen by reference, copied only where the line keeps it
+    pub fn set_cell_grapheme_ref(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        text: &str,
+        width: usize,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        let line_idx = self.phys_row(y);
+        let line = self.line_mut(line_idx);
+        line.set_cell_grapheme_ref(x, text, width, attr, seqno);
+    }
+
+    /// LBTerm: printable ASCII written from `x`, a cell a character, in one write to its line
+    /// (Line::set_cells_ascii)
+    pub fn set_cells_ascii(
+        &mut self,
+        x: usize,
+        y: VisibleRowIndex,
+        text: &str,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        let line_idx = self.phys_row(y);
+        let line = self.line_mut(line_idx);
+        line.set_cells_ascii(x, text, attr, seqno);
     }
 
     pub fn cell_mut(&mut self, x: usize, y: VisibleRowIndex) -> Option<&mut Cell> {
@@ -698,6 +787,12 @@ impl Screen {
         } else {
             phys_scroll.start
         };
+        // LBTerm: lines taken out above the viewport with no scrollback to go to (an alternate
+        // screen left taller by a resize) move every line under them up a row, out of what was
+        // noted (lbterm_changes.rs)
+        if !scrollback_ok && lines_removed > 0 && remove_idx < self.lbterm_viewport_start() {
+            self.lbterm_changes.forget();
+        }
 
         let default_blank = CellAttributes::blank();
         // To avoid thrashing the heap, prefer to move lines that were
@@ -734,6 +829,7 @@ impl Screen {
             self.stable_row_index_offset += lines_removed;
         }
 
+        self.lbterm_reserve(to_add);
         for _ in 0..to_add {
             let mut line = if default_blank == blank_attr {
                 Line::new(seqno)
@@ -763,6 +859,11 @@ impl Screen {
     pub fn erase_scrollback(&mut self) {
         let len = self.lines.len();
         let to_clear = len - self.physical_rows;
+        // LBTerm: without scrollback the stable rows aren't kept as lines go, so every line left
+        // moves up (lbterm_changes.rs)
+        if !self.allow_scrollback && to_clear > 0 {
+            self.lbterm_changes.forget();
+        }
         for _ in 0..to_clear {
             self.lines.pop_front();
             if self.allow_scrollback {
@@ -912,7 +1013,9 @@ impl Screen {
         stable_lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> Vec<StableRowIndex> {
-        let phys = self.stable_range(&stable_lines);
+        // LBTerm: only the lines that can have changed since `seqno` are read, not the whole
+        // scrollback (lbterm_changes.rs)
+        let phys = self.lbterm_rows_to_read(&stable_lines, seqno);
         let mut set = vec![];
         for (idx, line) in self
             .lines
@@ -926,6 +1029,26 @@ impl Screen {
             }
         }
         set
+    }
+
+    /// LBTerm: the physical rows of `stable_lines` get_changed_stable_rows reads for the lines
+    /// changed since `seqno`: none above the row every change since is at or below
+    /// (lbterm_changes.rs), where upstream read every one
+    pub fn lbterm_rows_to_read(
+        &self,
+        stable_lines: &Range<StableRowIndex>,
+        seqno: SequenceNo,
+    ) -> Range<PhysRowIndex> {
+        let mut phys = self.stable_range(stable_lines);
+        if let Some(row) = self.lbterm_changes.lowest_since(seqno) {
+            let from = match self.stable_row_to_phys(row) {
+                Some(phys) => phys,
+                None if row < self.phys_to_stable_row_index(0) => 0,
+                None => self.lines.len(),
+            };
+            phys.start = phys.start.max(from).min(phys.end);
+        }
+        phys
     }
 
     pub fn with_phys_lines<F>(&self, phys_range: Range<PhysRowIndex>, mut func: F)
@@ -948,7 +1071,37 @@ impl Screen {
         func(&lines)
     }
 
-    pub fn with_phys_lines_mut<F>(&mut self, phys_range: Range<PhysRowIndex>, mut func: F)
+    pub fn with_phys_lines_mut<F>(&mut self, phys_range: Range<PhysRowIndex>, func: F)
+    where
+        F: FnMut(&mut [&mut Line]),
+    {
+        // LBTerm: the sequence numbers of the lines above the viewport it hands out, to see
+        // which `func` changed (lbterm_changes.rs)
+        let above = phys_range.start
+            ..phys_range
+                .end
+                .min(self.lbterm_viewport_start())
+                .min(self.lines.len());
+        let before: Vec<SequenceNo> = if above.start < above.end {
+            self.lines
+                .range(above.clone())
+                .map(Line::current_seqno)
+                .collect()
+        } else {
+            vec![]
+        };
+        self.lbterm_with_phys_lines_mut(phys_range, func);
+        let changed = before
+            .iter()
+            .enumerate()
+            .find(|&(i, &seqno)| self.lines[above.start + i].current_seqno() != seqno);
+        if let Some((i, _)) = changed {
+            let row = self.phys_to_stable_row_index(above.start + i);
+            self.lbterm_changes.touched(row);
+        }
+    }
+
+    fn lbterm_with_phys_lines_mut<F>(&mut self, phys_range: Range<PhysRowIndex>, mut func: F)
     where
         F: FnMut(&mut [&mut Line]),
     {
@@ -984,8 +1137,19 @@ impl Screen {
     where
         F: FnMut(usize, &mut Line),
     {
+        // LBTerm: the first line above the viewport `f` changed (lbterm_changes.rs)
+        let top = self.lbterm_viewport_start();
+        let mut changed = None;
         for (idx, line) in self.lines.iter_mut().enumerate() {
+            let seqno = line.current_seqno();
             f(idx, line);
+            if idx < top && changed.is_none() && line.current_seqno() != seqno {
+                changed = Some(idx);
+            }
+        }
+        if let Some(idx) = changed {
+            let row = self.phys_to_stable_row_index(idx);
+            self.lbterm_changes.touched(row);
         }
     }
 

@@ -352,6 +352,12 @@ pub struct TerminalState {
     progress: Progress,
     /// LBTerm: kitty notifications (OSC 99) being put together from their chunks
     lbterm_notify: lbterm_notify::Assembler,
+    /// LBTerm, tests only: printing as upstream does, a grapheme at a time
+    /// (`Terminal::lbterm_print_as_upstream`)
+    pub(crate) lbterm_upstream_print: bool,
+    /// LBTerm: runs of ASCII the performer wrote in one go (`lbterm_print_ascii`), so a test can
+    /// tell which way its text was printed
+    pub(crate) lbterm_ascii_runs: u64,
 
     palette: Option<ColorPalette>,
 
@@ -601,7 +607,31 @@ impl TerminalState {
             bidi_hint: None,
             progress: Progress::default(),
             lbterm_notify: Default::default(),
+            lbterm_upstream_print: false,
+            lbterm_ascii_runs: 0,
         }
+    }
+
+    /// LBTerm: how many runs of ASCII were written in one go, rather than a grapheme at a time
+    #[doc(hidden)]
+    pub fn lbterm_ascii_runs(&self) -> u64 {
+        self.lbterm_ascii_runs
+    }
+
+    /// LBTerm: the writer behind the terminal's own input to its program (keys, pastes, replies
+    /// to queries), whose thread writes to the pty in the order it was given, anything still in
+    /// the terminal's buffer sent first. A pane's `writer()` (mux's localpane.rs: a binding's
+    /// SendString, a mux client's WriteToPane, the scroll strip's keys, Lua's `send_text`) writes
+    /// through it. Upstream wrote those to the pty itself, on the caller's thread, so a key typed
+    /// just before one could reach the program after it whenever this thread was slow to run (on
+    /// a busy mux server a letter and Shift+Enter's text swapped in 3 to 24 of 40 pairs,
+    /// perf/mux-client's `perf/mux-gui.ps1`), and the caller, the mux server's only thread or
+    /// the GUI thread, waited whenever the pty's pipe was full
+    pub fn lbterm_writer(&mut self) -> &mut (dyn std::io::Write + 'static) {
+        if !self.writer.buffer().is_empty() {
+            self.writer.flush().ok();
+        }
+        self.writer.get_mut()
     }
 
     pub fn enable_conpty_quirks(&mut self) {
@@ -615,6 +645,10 @@ impl TerminalState {
 
     pub fn increment_seqno(&mut self) {
         self.seqno += 1;
+        // LBTerm: the screen notes where its viewport is as the new seqno starts
+        // (lbterm_changes.rs)
+        let seqno = self.seqno;
+        self.screen.lbterm_advanced(seqno);
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {

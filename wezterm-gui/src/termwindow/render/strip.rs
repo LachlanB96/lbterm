@@ -105,16 +105,31 @@ pub struct StripState {
     last_card: Option<Card>,
     /// Where the card's visual goes this frame, and whether it's opening
     visual: Option<(PixelRect, bool)>,
+    /// The card's words as its last frame laid them out (render/words.rs)
+    card_words: std::cell::RefCell<super::words::Words>,
     /// When the caption next says something else
     caption_due: Option<Instant>,
     /// When a repaint is already on its way
     wake: Option<Instant>,
     /// A notice in the caption's place, and when it goes
     notice: Option<(String, Instant)>,
+    /// A tab on its way to the window, said in the caption's place while it comes
+    opening: Option<strip::Opening>,
     /// The tab the strip was last built for: words that change with the tab swap at once,
     /// words that change in it dissolve (render/strip_swap.rs)
     tab: Option<mux::tab::TabId>,
     pub(crate) swap: super::strip_swap::SwapState,
+    /// The Claude session the strip's tab stands for, as its last look found it (its prompt's,
+    /// render/prompt.rs `target`): the context pill's too (render/context.rs), so a paint looks
+    /// at the panes' user vars once
+    pub(crate) session: Option<String>,
+}
+
+impl StripState {
+    /// The card's words point into a glyph atlas that's gone (gpu_lost.rs)
+    pub(crate) fn forget_card_words(&mut self) {
+        self.card_words.get_mut().forget();
+    }
 }
 
 impl Default for StripState {
@@ -128,11 +143,14 @@ impl Default for StripState {
             card: None,
             last_card: None,
             visual: None,
+            card_words: Default::default(),
             caption_due: None,
             wake: None,
             notice: None,
+            opening: None,
             tab: None,
             swap: Default::default(),
+            session: None,
         }
     }
 }
@@ -191,9 +209,30 @@ impl crate::TermWindow {
             || !self.config.use_fancy_tab_bar
             || !self.show_tab_bar
         {
+            self.lbterm_strip.session = None;
             return None;
         }
-        let (idx, tab) = self.lbterm_active_tab()?;
+        let Some((idx, tab)) = self.lbterm_active_tab() else {
+            self.lbterm_strip.session = None;
+            return None;
+        };
+        // LBTerm: the Conductor's view stands over the tab: the strip names it, and what it's
+        // doing (render/conductor_view.rs)
+        if self.lbterm_view_is_open() {
+            self.lbterm_strip.session = None;
+            self.lbterm_strip.caption_due = None;
+            return Some(Content {
+                title: "Conductor".to_string(),
+                summary: self.lbterm_view_strip_words(),
+                notice: self
+                    .lbterm_strip
+                    .notice
+                    .as_ref()
+                    .filter(|(_, until)| Instant::now() < *until)
+                    .map(|(text, _)| text.clone()),
+                ..Content::default()
+            });
+        }
         let now = SystemTime::now();
         let unix = |t: SystemTime| {
             t.duration_since(SystemTime::UNIX_EPOCH)
@@ -205,17 +244,24 @@ impl crate::TermWindow {
             unix(now),
             self.config.lbterm_tab_panel.idle_full_minutes * 60.0,
         );
+        // The strip leads with the tab's label, as the rail and the open panel do (Lachlan's pick,
+        // 2026-10-25: a conversation has one name for him)
         let mut content = Content {
-            title: row.title,
+            title: row.label,
             ..Content::default()
         };
         self.lbterm_strip.caption_due = None;
         let target = super::prompt::target(&tab);
+        // Kept for the context pill, copied only when it's another session
+        let sid = target.as_ref().map(|t| t.sid.as_str());
+        if self.lbterm_strip.session.as_deref() != sid {
+            self.lbterm_strip.session = sid.map(String::from);
+        }
         let summary = target
             .as_ref()
             .and_then(|t| crate::summaries::get(&t.sid));
         if let Some(summary) = summary {
-            content.summary = summary.short;
+            content.summary = summary.short.clone();
             if let Some(written) = summary.written.filter(|_| content.summary.is_some()) {
                 let (written, now) = (local(written), local(now));
                 content.caption = Some(strip::caption(written, now));
@@ -235,6 +281,25 @@ impl crate::TermWindow {
             .as_ref()
             .filter(|(_, until)| Instant::now() < *until)
             .map(|(text, _)| text.clone());
+        // A tab on its way (lbterm_strip_expect), in the caption's place while it comes, unless a
+        // notice is saying something already
+        let tabs = self.lbterm_window_tab_ids();
+        let opening = self
+            .lbterm_strip
+            .opening
+            .as_ref()
+            .map(|o| strip::opening_now(o, Instant::now(), &tabs));
+        match opening {
+            Some(strip::OpeningNow::Done) => self.lbterm_strip.opening = None,
+            Some(strip::OpeningNow::Waiting(at)) => self.lbterm_strip_wake(Some(at)),
+            Some(strip::OpeningNow::Say(text, until)) => {
+                if content.notice.is_none() {
+                    content.notice = Some(text);
+                }
+                self.lbterm_strip_wake(Some(until));
+            }
+            None => {}
+        }
         // Zoomed, the tab's other panes are out of sight: say so, and which pane this is
         if let Some(zoomed) = tab.get_zoomed_pane() {
             let panes = tab.iter_panes_ignoring_zoom();
@@ -270,8 +335,37 @@ impl crate::TermWindow {
         }
     }
 
+    /// A tab is on its way to this window (Lua's `window:lbterm_expect_tab`, which puts the
+    /// Starting row on the rail too, render/new_tab.rs; Lachlan's E4, 2026-10-29), so a press
+    /// that opens one never looks like nothing happened: past strip::OPENING_AFTER the strip says
+    /// `text` in the caption's place until a tab the window didn't have comes, or
+    /// strip::OPENING_FOR is up. None takes it back (the start failed).
+    pub(crate) fn lbterm_strip_expect(&mut self, text: Option<String>) {
+        let since = Instant::now();
+        self.lbterm_strip.opening = text.map(|text| strip::Opening {
+            text,
+            since,
+            tabs: self.lbterm_window_tab_ids(),
+        });
+        if self.lbterm_strip.opening.is_some() {
+            self.lbterm_strip_wake(Some(since + strip::OPENING_AFTER));
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    /// The ids of this window's tabs
+    pub(crate) fn lbterm_window_tab_ids(&self) -> Vec<usize> {
+        mux::Mux::get()
+            .get_window(self.mux_window_id)
+            .map_or_else(Vec::new, |w| w.iter_tabs().map(|t| t.tab_id()).collect())
+    }
+
     /// Say `text` in the caption's place for a moment (strip::NOTICE_FOR): what happened to the
-    /// window, such as the config reloading or a restart
+    /// window, such as the config reloading or a restart. Its frame is counted as asked for by
+    /// whoever called this (lbterm_extras::counters)
+    #[track_caller]
     pub(crate) fn lbterm_strip_notice(&mut self, text: impl Into<String>) {
         let until = Instant::now() + strip::NOTICE_FOR;
         self.lbterm_strip.notice = Some((text.into(), until));
@@ -297,7 +391,8 @@ impl crate::TermWindow {
         {
             return Some(CardFor::Prompt);
         }
-        let pinned = crate::summaries::store().map_or(false, |s| s.expanded());
+        // LBTerm: Alt+S's pin doesn't lay the card over the Conductor's view (render/conductor_view.rs)
+        let pinned = !self.lbterm_view_is_open() && crate::summaries::store().map_or(false, |s| s.expanded());
         (!content.detail.is_empty() && (self.lbterm_strip.hover.is_open() || pinned))
             .then_some(CardFor::Summary)
     }
@@ -308,7 +403,7 @@ impl crate::TermWindow {
         // Coming back while the card fades out opens it again at once (lbterm_panel::hover).
         // Leaving while it fades in still waits out the grace: the pointer crosses the prompt
         // row on its way down to the card
-        let motion = crate::termwindow::compositor::MotionSettings::from_config(&self.config.lbterm_motion);
+        let motion = self.lbterm_motion();
         let closing = if self.lbterm_composited() && motion.enabled {
             Duration::from_secs_f64(motion.exit.duration())
         } else {
@@ -316,21 +411,32 @@ impl crate::TermWindow {
         };
         self.lbterm_strip.hover.set_motion(Duration::ZERO, closing);
         self.lbterm_strip.prompt_hover.set_motion(Duration::ZERO, closing);
+        // The InMail button's count (render/inbox.rs): looked at while the strip as it was is
+        // still there to dissolve from, as the words are below
+        let inbox_changed = self.lbterm_inbox_refresh();
+        // And the agenda's counts (render/agenda.rs), the same way
+        let agenda_changed = self.lbterm_agenda_refresh();
 
         let content = self.lbterm_strip_content();
+        // The context pill's dollars (render/context.rs), for the session the content just found
+        let context_changed = self.lbterm_context_refresh();
         let card = self.lbterm_strip_card_for(content.as_ref());
         if content != self.lbterm_strip.shown || card != self.lbterm_strip.shown_card {
-            // Words that change in the same tab dissolve into the new ones; a tab switch swaps
-            // them at once (render/strip_swap.rs)
+            // Words that change in the same tab dissolve into the new ones, and a tab's into the
+            // next tab's when it's switched from or closed, as its panes do (render/strip_swap.rs)
             let tab = self.lbterm_active_tab().map(|(_, tab)| tab.tab_id());
+            let tab_changed = self.lbterm_strip.tab.is_some() && tab != self.lbterm_strip.tab;
             if let (Some(old), Some(new)) = (self.lbterm_strip.shown.clone(), content.as_ref()) {
-                if tab.is_some() && tab == self.lbterm_strip.tab {
-                    self.lbterm_strip_swap_begin(&old, new);
+                if tab.is_some() {
+                    self.lbterm_strip_swap_begin(&old, new, tab_changed);
                 }
             }
             self.lbterm_strip.tab = tab;
             self.lbterm_strip.shown = content;
             self.lbterm_strip.shown_card = card;
+            self.invalidate_fancy_tab_bar();
+        }
+        if inbox_changed || agenda_changed || context_changed {
             self.invalidate_fancy_tab_bar();
         }
         let notice_due = self
@@ -512,6 +618,24 @@ impl crate::TermWindow {
         }
         let cell = font.metrics().cell_width.get() as f32;
         let mut kids = vec![];
+        // The context pill under the InMail button, centred on the rail's column as that is, with
+        // the strip between it and the prompt; past the prompt's start it pushes the prompt on, a
+        // column after it (render/context.rs)
+        let mut start = indent;
+        let mut left = indent;
+        if let Some((pill, w)) = self.lbterm_context_pill(font, metrics, surface, bar)? {
+            let column = super::tab_panel::rail_column(&self.config, &self.dimensions, &self.render_metrics);
+            let x = (column - w / 2.).round().max(0.);
+            let gap = (indent - x - w).max(cell);
+            kids.push(pill);
+            kids.push(
+                Element::new(font, ElementContent::Children(vec![]))
+                    .item_type(UIItemType::TabBar(TabBarItem::None))
+                    .min_width(Some(Dimension::Pixels(gap))),
+            );
+            left = x;
+            start = x + w + gap;
+        }
         if content.prompt.is_some() || content.note.is_some() {
             // The chip's corners: filled in its colour, which the border is too
             let radius = Dimension::Pixels((metrics.cell_size.height as f32 * 0.3).round());
@@ -552,7 +676,7 @@ impl crate::TermWindow {
                     .hover_colors(Some(chip(CHIP_HOVER_ALPHA, 1.0))),
             );
             // What's left of the row after the chip, a column of it spare at the right
-            let room = bar.width() - indent - 3.5 * cell;
+            let room = bar.width() - start - 3.5 * cell;
             let width = (room / cell).floor().max(0.) as usize;
             let text = match (&content.note, &content.prompt) {
                 (Some(note), _) => {
@@ -581,7 +705,7 @@ impl crate::TermWindow {
                 .min_width(Some(Dimension::Pixels(bar.width())))
                 .min_height(Some(Dimension::Pixels(height)))
                 .padding(BoxDimension {
-                    left: Dimension::Pixels(indent),
+                    left: Dimension::Pixels(left),
                     right: Dimension::Cells(0.),
                     top: Dimension::Cells(0.),
                     bottom: Dimension::Cells(0.),
@@ -621,7 +745,7 @@ impl crate::TermWindow {
             .prompt_hover
             .pointer(on_prompt || (on_card && showing == Some(CardFor::Prompt)), now);
         if changed {
-            context.invalidate();
+            context.lbterm_invalidate();
         }
         let due = [
             self.lbterm_strip.hover.deadline(),
@@ -676,7 +800,7 @@ impl crate::TermWindow {
         };
         self.lbterm_strip.wake = Some(at);
         promise::spawn::spawn(async move {
-            smol::Timer::at(at).await;
+            lbterm_extras::counters::timer(smol::Timer::at(at)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 if tw.lbterm_strip.wake == Some(at) {
                     tw.lbterm_strip.wake = None;
@@ -825,42 +949,21 @@ impl crate::TermWindow {
             self.lbterm_menu_rounded(&mut quads, card.rect, radius, surface.to_linear())?;
         }
 
-        let mut words = vec![];
+        // Each laid out only when the card's last frame didn't have it (render/words.rs): pinned
+        // by Alt+S it stays open for as long as he likes, while the panes paint under it
+        let mut words: Vec<super::words::Word> = vec![];
         for line in &card.lines {
-            let mut place = |text: &str, x: f64, w: f64, alpha: f32| -> anyhow::Result<()> {
-                let element = Element::new(&font, ElementContent::Text(text.to_string()))
-                    .colors(text_colors(over(surface, alpha)));
-                words.push(self.compute_element(
-                    &LayoutContext {
-                        width: DimensionContext {
-                            dpi: self.dimensions.dpi as f32,
-                            pixel_max: self.dimensions.pixel_width as f32,
-                            pixel_cell: metrics.cell_size.width as f32,
-                        },
-                        height: DimensionContext {
-                            dpi: self.dimensions.dpi as f32,
-                            pixel_max: self.dimensions.pixel_height as f32,
-                            pixel_cell: metrics.cell_size.height as f32,
-                        },
-                        bounds: euclid::rect(x as f32, line.y as f32, w as f32, cell.1 as f32),
-                        metrics: &metrics,
-                        gl_state,
-                        zindex: TEXT_Z,
-                    },
-                    &element,
-                )?);
-                Ok(())
+            let mut place = |text: &str, x: f64, w: f64, alpha: f32| {
+                words.push((text.to_string(), euclid::rect(x as f32, line.y as f32, w as f32, cell.1 as f32), over(surface, alpha)));
             };
             if let Some(label) = &line.label {
-                place(label, card.label_x, card.text_x - card.label_x, LABEL_ALPHA)?;
+                place(label, card.label_x, card.text_x - card.label_x, LABEL_ALPHA);
             }
             let text_w = card.rect.x + card.rect.w - card.text_x;
-            place(&line.text, card.text_x, text_w, DETAIL_ALPHA)?;
+            place(&line.text, card.text_x, text_w, DETAIL_ALPHA);
         }
-        for computed in &words {
-            self.render_element(computed, gl_state, None)?;
-        }
-        Ok(())
+        let room = (metrics.cell_size.width as f32, metrics.cell_size.height as f32);
+        self.lbterm_draw_words(&self.lbterm_strip.card_words, &font, &metrics, room, TEXT_Z, words)
     }
 }
 
@@ -891,6 +994,10 @@ impl crate::TermWindow {
                 .to_string()
             }),
             restart: crate::restart::other_build_installed(),
+            inbox: self.lbterm_state_inbox(),
+            agenda: self.lbterm_state_agenda(),
+            context: self.lbterm_state_context(),
+            mic: crate::mic::shown().map(|s| s.name().to_string()),
             jumping: self.lbterm_prompt_jumping(),
             lit,
             items,

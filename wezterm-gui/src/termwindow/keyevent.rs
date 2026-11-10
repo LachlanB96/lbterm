@@ -248,6 +248,20 @@ impl super::TermWindow {
         is_down: bool,
         key_event: Option<&KeyEvent>,
     ) -> bool {
+        // LBTerm: an open menu has every key, ahead of the leader and the bindings, and a key up
+        // goes nowhere (Lachlan's 7b of 2026-11-07; render/menu_fade.rs, `lbterm_menus_key`).
+        // raw_key_event_impl acts on none while one is, so this is key_event_impl's pass. A
+        // binding the open menu acts on (a + menu row's shortcut, a paste into the picker's box)
+        // acts, as raw_key_event_impl's forms would have had it (render/menu_fade.rs,
+        // `lbterm_menus_binding`)
+        if only_key_bindings == OnlyKeyBindings::No && self.lbterm_menu_takes_keys() {
+            if is_down && !self.lbterm_menus_binding(keycode, raw_modifiers) {
+                let key = self.win_key_code_to_termwiz_key_code(keycode);
+                self.lbterm_menus_key(key, raw_modifiers.remove_positional_mods());
+            }
+            return true;
+        }
+
         if is_down && !leader_active {
             // Check to see if this key-press is the leader activating
             if let Some(duration) = self.input_map.is_leader(&keycode, raw_modifiers) {
@@ -259,7 +273,7 @@ impl super::TermWindow {
                 // area will be repainted at the right time
                 if let Some(window) = self.window.clone() {
                     promise::spawn::spawn(async move {
-                        Timer::at(target).await;
+                        lbterm_extras::counters::timer(Timer::at(target)).await;
                         window.invalidate();
                     })
                     .detach();
@@ -270,30 +284,6 @@ impl super::TermWindow {
 
         if is_down {
             if only_key_bindings == OnlyKeyBindings::No {
-                // LBTerm: the tab menu takes every key while it's open (render/tab_menu.rs)
-                if self.lbterm_menu_is_open() {
-                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
-                        if self.lbterm_tab_menu_key(&term_key, raw_modifiers.remove_positional_mods()) {
-                            return true;
-                        }
-                    }
-                }
-                // LBTerm: so does the list of prompts (render/prompt.rs)
-                if self.lbterm_prompt_list_is_open() {
-                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
-                        if self.lbterm_prompt_list_key(&term_key, raw_modifiers.remove_positional_mods()) {
-                            return true;
-                        }
-                    }
-                }
-                // LBTerm: and the Conductor's menu (render/conductor.rs)
-                if self.lbterm_conductor_menu_is_open() {
-                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
-                        if self.lbterm_conductor_menu_key(&term_key, raw_modifiers.remove_positional_mods()) {
-                            return true;
-                        }
-                    }
-                }
                 if let Some(modal) = self.get_modal() {
                     if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
                         match modal.key_down(term_key, raw_modifiers.remove_positional_mods(), self)
@@ -304,6 +294,18 @@ impl super::TermWindow {
                                 log::error!("Error dispatching key to modal: {err:#}");
                                 return true;
                             }
+                        }
+                    }
+                }
+                // LBTerm: the Conductor's view takes typing and editing keys before the
+                // bindings do; the rest (Alt, the tab keys) still reach them
+                // (render/conductor_view.rs)
+                if self.lbterm_view_is_open() && self.get_modal().is_none() {
+                    if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
+                        let mods = raw_modifiers.remove_positional_mods();
+                        if self.lbterm_view_takes(&term_key, mods) {
+                            self.lbterm_view_key(&term_key, mods);
+                            return true;
                         }
                     }
                 }
@@ -329,15 +331,27 @@ impl super::TermWindow {
                 }
 
                 self.key_table_state.did_process_key();
+                // LBTerm: what its frame turns on, for a binding that sends the pane keys or text
+                // (termwindow/echo.rs)
+                let mark = self.lbterm_key_mark(pane);
                 let handled = match self.perform_key_assignment(&pane, &entry.action) {
                     Ok(PerformAssignmentResult::Handled) => true,
                     Err(_) => true,
                     Ok(_) => false,
                 };
 
-                if handled {
-                    context.invalidate();
+                // LBTerm: a binding that sends the pane keys or text (Shift+Enter's ESC CR in
+                // Lachlan's config) is a key typed: a frame of its own only when it draws
+                // something new, and the pane's echo asks for the frame that shows it
+                let sends = matches!(
+                    entry.action,
+                    KeyAssignment::SendString(_) | KeyAssignment::SendKey(_)
+                );
+                if handled && (!sends || self.lbterm_key_frame(pane, mark)) {
+                    context.lbterm_invalidate();
+                }
 
+                if handled {
                     if leader_active {
                         // A successful leader key-lookup cancels the leader
                         // virtual modifier state
@@ -383,6 +397,8 @@ impl super::TermWindow {
             if bypass_compose {
                 if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
                     let tw_raw_modifiers = raw_modifiers;
+                    // LBTerm: what its frame turns on (termwindow/echo.rs)
+                    let mark = self.lbterm_key_mark(pane);
 
                     let mut did_encode = false;
                     if let Some(key_event) = key_event {
@@ -438,8 +454,10 @@ impl super::TermWindow {
                         {
                             context.set_cursor(None);
                         }
-                        if !keycode.is_modifier() {
-                            context.invalidate();
+                        // LBTerm: a frame of its own only when it draws something new; the
+                        // pane's echo asks for the frame that shows it (termwindow/echo.rs)
+                        if !keycode.is_modifier() && self.lbterm_key_frame(pane, mark) {
+                            context.lbterm_invalidate();
                         }
 
                         return true;
@@ -455,6 +473,12 @@ impl super::TermWindow {
         // LBTerm: whatever this key does to the panes is the key's, not an arrival
         // (lbterm_extras::arrival)
         self.lbterm_arrival.input(std::time::Instant::now());
+        // LBTerm: and it stops the scroll strip scrolling Claude Code (render/scroll_strip.rs)
+        if key.key_is_down {
+            self.lbterm_scroll_cancel();
+        }
+        // LBTerm: the modifiers this key came with, which tint the active outline (held.rs)
+        self.lbterm_note_held(key.modifiers);
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -483,6 +507,26 @@ impl super::TermWindow {
         if self.current_modifier_and_leds != modifier_and_leds {
             self.current_modifier_and_leds = modifier_and_leds;
             self.schedule_next_status_update();
+        }
+
+        // LBTerm: an open menu takes every key, bound ones too (Lachlan's 7b of 2026-11-07): no
+        // binding acts here, and key_event_impl's pass gives the key to the menu
+        // (render/menu_fade.rs, `lbterm_menu_takes_keys`). The bindings an open menu acts on are
+        // the exception, a + menu row's shortcut (his 5a of 2026-11-08) and a paste into the
+        // picker's box (his 11a), each looked up by the forms the passes below look keys up by
+        if self.lbterm_menu_takes_keys() {
+            if key.key_is_down {
+                let phys = match &key.key {
+                    phys @ KeyCode::Physical(_) => Some(phys.clone()),
+                    _ => key.phys_code.map(KeyCode::Physical),
+                };
+                let raw = KeyCode::RawCode(key.raw_code);
+                let acted = phys.iter().chain([&raw, &key.key]).any(|form| self.lbterm_menus_binding(form, key.modifiers));
+                if acted {
+                    key.set_handled();
+                }
+            }
+            return;
         }
 
         let pane = match self.get_active_pane_or_overlay() {
@@ -628,6 +672,11 @@ impl super::TermWindow {
             Some(pane) => pane,
             None => return,
         };
+        // LBTerm: a key of Lachlan's stops the scroll strip scrolling Claude Code
+        // (render/scroll_strip.rs)
+        if window_key.key_is_down {
+            self.lbterm_scroll_cancel();
+        }
 
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
@@ -691,28 +740,6 @@ impl super::TermWindow {
                     self.key_table_state.did_process_key();
                 }
 
-                // LBTerm: the tab menu takes every key while it's open (render/tab_menu.rs)
-                if self.lbterm_menu_is_open() {
-                    if window_key.key_is_down {
-                        self.lbterm_tab_menu_key(&key, modifiers);
-                    }
-                    return;
-                }
-                // LBTerm: so does the list of prompts (render/prompt.rs)
-                if self.lbterm_prompt_list_is_open() {
-                    if window_key.key_is_down {
-                        self.lbterm_prompt_list_key(&key, modifiers);
-                    }
-                    return;
-                }
-                // LBTerm: and the Conductor's menu (render/conductor.rs)
-                if self.lbterm_conductor_menu_is_open() {
-                    if window_key.key_is_down {
-                        self.lbterm_conductor_menu_key(&key, modifiers);
-                    }
-                    return;
-                }
-
                 if let Some(modal) = self.get_modal() {
                     if window_key.key_is_down {
                         modal.key_down(key, modifiers, self).ok();
@@ -720,6 +747,17 @@ impl super::TermWindow {
                     return;
                 }
 
+                // LBTerm: while the Conductor's view is open, no key reaches the pane under it
+                // (render/conductor_view.rs)
+                if self.lbterm_view_is_open() {
+                    if window_key.key_is_down && !key.is_modifier() {
+                        self.lbterm_view_key(&key, modifiers);
+                    }
+                    return;
+                }
+
+                // LBTerm: what its frame turns on (termwindow/echo.rs)
+                let mark = self.lbterm_key_mark(&pane);
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {
                     if self.config.debug_key_events {
                         log::info!("win32: Encoded input as {:?}", encoded);
@@ -764,8 +802,10 @@ impl super::TermWindow {
                     {
                         context.set_cursor(None);
                     }
-                    if !key.is_modifier() {
-                        context.invalidate();
+                    // LBTerm: a frame of its own only when it draws something new; the pane's
+                    // echo asks for the frame that shows it (termwindow/echo.rs)
+                    if !key.is_modifier() && self.lbterm_key_frame(&pane, mark) {
+                        context.lbterm_invalidate();
                     }
                 }
             }
@@ -781,14 +821,26 @@ impl super::TermWindow {
                     return;
                 }
                 self.key_table_state.did_process_key();
+                // LBTerm: composed words (an IME's, a dead key's) go to the Conductor's view's box
+                // while it's open (render/conductor_view.rs); an open menu's, the picker's box
+                // among them, had them in process_key (render/menu_fade.rs, `lbterm_menus_key`)
+                if self.get_modal().is_none() && self.lbterm_view_text(&s) {
+                    return;
+                }
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }
+                // LBTerm: what its frame turns on (termwindow/echo.rs)
+                let mark = self.lbterm_key_mark(&pane);
                 if let Err(err) = pane.send_composed_text(&s) {
                     log::error!("failed to send composed text to pane: {err:#}");
                 }
                 self.maybe_scroll_to_bottom_for_input(&pane);
-                context.invalidate();
+                // LBTerm: a frame of its own only when it draws something new; the pane's echo
+                // asks for the frame that shows it (termwindow/echo.rs)
+                if self.lbterm_key_frame(&pane, mark) {
+                    context.lbterm_invalidate();
+                }
             }
             Key::None => {}
         }

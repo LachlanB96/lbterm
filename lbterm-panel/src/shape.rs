@@ -142,13 +142,18 @@ impl Shape {
     /// The card the outlines are cut from.
     pub fn template(&self) -> Template {
         let band = self.half_gutter();
-        let corner = band + self.radius() + self.feather();
+        let (r, s, f) = (self.radius(), self.hairline(), self.feather());
+        let corner = band + r + f;
         let straight = self.px(TEMPLATE_STRAIGHT);
         Template {
             size: 2.0 * corner + straight,
             band,
             corner,
             sample: corner + (straight / 2.0).floor(),
+            line: band + s + f,
+            // The curve's outer soft edge half covered (r + f/2 from its centre) across the
+            // middle of the line's opaque rows (r - s/2), and the soft pixel past the curve's end
+            reach: f + ((r + f / 2.0).powi(2) - (r - s / 2.0).powi(2)).sqrt(),
         }
     }
 }
@@ -169,6 +174,14 @@ pub struct Template {
     /// The row and column the edges are stretched from, in the straight
     /// middle of each side
     pub sample: f32,
+    /// How far in from a corner piece's outer edges its sides' lines lie,
+    /// soft pixels and all: the strip of the piece on each line's rows
+    pub line: f32,
+    /// How far back from a corner piece's inner end, along either of its
+    /// sides, its curve lies on that side's line, to where it covers half
+    /// the middle of the line's rows: where a straight line meeting the
+    /// curve there leaves off (lbterm_motion::outline)
+    pub reach: f32,
 }
 
 impl Template {
@@ -253,5 +266,20 @@ mod test {
         // Stretched edges fill the gap between the corners, never less than nothing
         assert_eq!(t.stretch(100.0), 70.0);
         assert_eq!(t.stretch(10.0), 0.0);
+    }
+
+    #[test]
+    fn a_corners_curve_lies_on_its_line_the_last_few_pixels_of_its_piece() {
+        // The line's rows: the band, then the outer soft pixel, the hairline and the inner one
+        let t = Shape::new(1.0).template();
+        assert_eq!(t.line, 2.0 + 1.0 + 1.0);
+        // The 12 px curve, its soft edge half covered (12.5 out) across the hairline's middle
+        // (11.5 in): 4.9 px back from where the straight run starts, a soft pixel past it
+        assert!((t.reach - (1.0 + 24f32.sqrt())).abs() < 1e-4, "{}", t.reach);
+        assert!(t.reach < t.corner - t.band, "the curve's end lies inside its piece");
+        // Scaled: wider lines, a longer reach, still inside the piece
+        let t = Shape::new(1.5).template();
+        assert_eq!(t.line, 3.0 + 2.0 + 2.0);
+        assert!(t.reach > 10.0 && t.reach < t.corner - t.band, "{}", t.reach);
     }
 }

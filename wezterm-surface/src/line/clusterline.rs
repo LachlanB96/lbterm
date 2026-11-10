@@ -168,11 +168,17 @@ impl ClusteredLine {
         }
     }
 
+    /// LBTerm: whether any run of cells has attributes `pred` holds for, a look at each run
+    /// rather than a cell at a time (Line::has_semantic_type)
+    pub fn any_attrs(&self, pred: impl Fn(&CellAttributes) -> bool) -> bool {
+        self.clusters.iter().any(|cluster| pred(&cluster.attrs))
+    }
+
     pub fn iter(&self) -> ClusterLineCellIter<'_> {
         let mut clusters = self.clusters.iter();
         let cluster = clusters.next();
         ClusterLineCellIter {
-            graphemes: Graphemes::new(&self.text),
+            rest: &self.text,
             clusters,
             cluster,
             idx: 0,
@@ -181,11 +187,14 @@ impl ClusteredLine {
         }
     }
 
-    pub fn append_grapheme(&mut self, text: &str, cell_width: usize, attrs: CellAttributes) {
+    /// LBTerm: `attrs` by reference, copied only when they start a new cluster: the printer
+    /// hands its pen over for every character, and a copy of it each time was an allocation for
+    /// a pen with a 24-bit colour
+    pub fn append_grapheme(&mut self, text: &str, cell_width: usize, attrs: &CellAttributes) {
         let cell_width = cell_width as u16;
         let new_cluster = match self.clusters.last() {
             Some(cluster) => {
-                if cluster.attrs != attrs {
+                if cluster.attrs != *attrs {
                     true
                 } else {
                     // If we overflow the max length of a run,
@@ -198,7 +207,10 @@ impl ClusteredLine {
         };
         let new_cell_index = self.len as usize;
         if new_cluster {
-            self.clusters.push(Cluster { attrs, cell_width });
+            self.clusters.push(Cluster {
+                attrs: attrs.clone(),
+                cell_width,
+            });
         } else if let Some(cluster) = self.clusters.last_mut() {
             cluster.cell_width += cell_width;
         }
@@ -221,6 +233,31 @@ impl ClusteredLine {
         }
         self.last_cell_width = NonZeroU8::new(cell_width as u8);
         self.len += cell_width as u32;
+    }
+
+    /// LBTerm: `text`, printable ASCII, appended a cell a character, all of it in `attrs`: what
+    /// append_grapheme does for each character, done for the run at once
+    pub fn append_ascii(&mut self, text: &str, attrs: &CellAttributes) {
+        debug_assert!(text.bytes().all(|b| (0x20..0x7f).contains(&b)));
+        // A cluster's width is a u16: a run longer than that goes in pieces
+        for piece in text.as_bytes().chunks(u16::MAX as usize) {
+            let n = piece.len() as u16;
+            let new_cluster = match self.clusters.last() {
+                Some(cluster) => cluster.attrs != *attrs || cluster.cell_width.checked_add(n).is_none(),
+                None => true,
+            };
+            if new_cluster {
+                self.clusters.push(Cluster {
+                    attrs: attrs.clone(),
+                    cell_width: n,
+                });
+            } else if let Some(cluster) = self.clusters.last_mut() {
+                cluster.cell_width += n;
+            }
+            self.len += n as u32;
+        }
+        self.text.push_str(text);
+        self.last_cell_width = NonZeroU8::new(1);
     }
 
     pub fn append(&mut self, cell: Cell) {
@@ -330,8 +367,193 @@ impl ClusteredLine {
     }
 }
 
+/// LBTerm: what a resize's rewrap (`Screen::rewrap_lines`) does to a clustered line, a cluster at
+/// a time rather than a cell at a time (lbterm/MUX.md, "A window's resize"; the audit's core-9).
+/// Upstream joined a wrapped line's rows by turning each cell of the next into a `Cell` and
+/// appending it (`append`), and cut a line into rows by collecting its cells into a vector and
+/// writing each into a new line (`Line::wrap`), and it found whether a line was wrapped by walking
+/// to its last cell: with 50,000 lines of scrollback, a third of them longer than the window, about
+/// 70 ms of the mux server's main thread a pane each time the window's width changed, most of it in
+/// the allocator. These leave each line as those did, the same text, runs, double-wide cells,
+/// length and last cell (line.rs's tests hold them to the cell-at-a-time ways), and a line of
+/// `u16::MAX` cells or more, where a run's width could overflow, still goes a cell at a time
+impl ClusteredLine {
+    /// Whether the last cell is marked wrapped: a cell's attributes are its run's, and the runs
+    /// cover the cells in order, so the last cell's are the last run's
+    pub fn lbterm_last_wrapped(&self) -> bool {
+        !self.text.is_empty() && self.clusters.last().map_or(false, |c| c.attrs.wrapped())
+    }
+
+    /// The last cell's width, as `compute_last_cell_width` finds it, without the walk: a
+    /// double-wide cell two cells from the end is the last
+    fn lbterm_last_width(&self) -> Option<NonZeroU8> {
+        if self.last_cell_width.is_some() || self.len == 0 {
+            return self.last_cell_width;
+        }
+        let wide = self.len >= 2 && self.is_double_wide(self.len as usize - 2);
+        NonZeroU8::new(if wide { 2 } else { 1 })
+    }
+
+    /// A run of `width` cells in `attrs` after the last, as `append_grapheme` adds them a cell at a
+    /// time: onto the last run when it has the same attributes, else a run of its own. The
+    /// callers keep the line under `u16::MAX` cells, so a run can't overflow
+    fn lbterm_push_run(&mut self, attrs: &CellAttributes, width: u16) {
+        if width == 0 {
+            return;
+        }
+        match self.clusters.last_mut() {
+            Some(last) if last.attrs == *attrs => last.cell_width += width,
+            _ => self.clusters.push(Cluster {
+                attrs: attrs.clone(),
+                cell_width: width,
+            }),
+        }
+    }
+
+    /// Cell `idx` marked double-wide, the set grown as `append` grows it
+    fn lbterm_set_wide(&mut self, idx: usize) {
+        let bitset = match self.is_double_wide.take() {
+            Some(mut bitset) => {
+                bitset.grow(idx + 1);
+                bitset.set(idx, true);
+                bitset
+            }
+            None => {
+                let mut bitset = FixedBitSet::with_capacity(idx + 1);
+                bitset.set(idx, true);
+                Box::new(bitset)
+            }
+        };
+        self.is_double_wide.replace(bitset);
+    }
+
+    /// `other`'s cells after this line's, as `append` a cell at a time leaves it
+    pub fn lbterm_append_line(&mut self, other: &ClusteredLine) {
+        if self.len as usize + other.len as usize >= u16::MAX as usize {
+            for cell in other.iter() {
+                self.append(cell.as_cell());
+            }
+            return;
+        }
+        if other.text.is_empty() {
+            return;
+        }
+        let base = self.len as usize;
+        for c in &other.clusters {
+            self.lbterm_push_run(&c.attrs, c.cell_width);
+        }
+        self.text.push_str(&other.text);
+        if let Some(bits) = &other.is_double_wide {
+            for idx in bits.ones() {
+                self.lbterm_set_wide(base + idx);
+            }
+        }
+        self.len += other.len;
+        self.last_cell_width = other.lbterm_last_width();
+    }
+
+    /// The line cut into rows of at most `width` cells, its trailing spaces left off, as
+    /// `Line::wrap` cut it a cell at a time: each row's cells, runs and double-wide cells, none of
+    /// them yet marked wrapped. Empty when the line is only spaces. None where the cell-at-a-time
+    /// way is kept: a width under 2 (where a double-wide cell gets a row of its own and an empty
+    /// one before it) or a line of `u16::MAX` cells or more
+    pub fn lbterm_wrap(&self, width: usize) -> Option<Vec<ClusteredLine>> {
+        if width < 2 || self.len as usize >= u16::MAX as usize {
+            return None;
+        }
+        let base = self.text.as_ptr() as usize;
+        let offset = |cell: &CellRef| cell.str().as_ptr() as usize - base;
+        // Where the last cell that isn't a space ends, in bytes: a cell of a space alone is a
+        // " " grapheme, and a space a combining mark follows is in a cell of its own that isn't,
+        // so it's where the text ends without its trailing spaces
+        let end = self.text.trim_end_matches(' ').len();
+        if end == 0 {
+            return Some(vec![]);
+        }
+        // Printable ASCII with no double-wide cell: a byte a cell, so a row is `width` bytes,
+        // with no walk through the cells (the cell iterator's own fast path, for the whole line)
+        if self.is_double_wide.is_none()
+            && self.text.as_bytes()[..end]
+                .iter()
+                .all(|b| (0x20..0x7f).contains(b))
+        {
+            let mut rows = Vec::with_capacity((end + width - 1) / width);
+            let mut at = 0;
+            while at < end {
+                let to = (at + width).min(end);
+                rows.push(self.lbterm_cells(at..to, at, to - at, 1));
+                at = to;
+            }
+            return Some(rows);
+        }
+        // Each row: its first byte and cell, and its cells' width so far and its last cell's
+        let mut rows = vec![];
+        let mut row: Option<(usize, usize, usize, usize)> = None;
+        for cell in self.iter() {
+            let at = offset(&cell);
+            if at >= end {
+                break;
+            }
+            let w = cell.width();
+            row = match row {
+                Some((byte, first, len, _)) if len + w <= width => Some((byte, first, len + w, w)),
+                done => {
+                    if let Some((byte, first, len, last)) = done {
+                        rows.push(self.lbterm_cells(byte..at, first, len, last));
+                    }
+                    Some((at, cell.cell_index(), w, w))
+                }
+            };
+        }
+        if let Some((byte, first, len, last)) = row {
+            rows.push(self.lbterm_cells(byte..end, first, len, last));
+        }
+        Some(rows)
+    }
+
+    /// The `len` cells from cell `first` (bytes `bytes` of the text) as a line of their own, the
+    /// last `last` wide
+    fn lbterm_cells(
+        &self,
+        bytes: core::ops::Range<usize>,
+        first: usize,
+        len: usize,
+        last: usize,
+    ) -> ClusteredLine {
+        let mut line = ClusteredLine::new();
+        line.text.push_str(&self.text[bytes]);
+        let end = first + len;
+        let mut at = 0usize;
+        for c in &self.clusters {
+            let (from, to) = (at, at + c.cell_width as usize);
+            at = to;
+            let width = to.min(end).saturating_sub(from.max(first));
+            if width > 0 {
+                line.lbterm_push_run(&c.attrs, width as u16);
+            }
+            if at >= end {
+                break;
+            }
+        }
+        if let Some(bits) = &self.is_double_wide {
+            for idx in bits.ones() {
+                if idx >= end {
+                    break;
+                }
+                if idx >= first {
+                    line.lbterm_set_wide(idx - first);
+                }
+            }
+        }
+        line.len = len as u32;
+        line.last_cell_width = NonZeroU8::new(last as u8);
+        line
+    }
+}
+
 pub(crate) struct ClusterLineCellIter<'a> {
-    graphemes: Graphemes<'a>,
+    /// LBTerm: the text not yet iterated, in place of a grapheme iterator over all of it
+    rest: &'a str,
     clusters: core::slice::Iter<'a, Cluster>,
     cluster: Option<&'a Cluster>,
     idx: usize,
@@ -343,7 +565,19 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
     type Item = CellRef<'a>;
 
     fn next(&mut self) -> Option<CellRef<'a>> {
-        let text = self.graphemes.next()?;
+        // LBTerm: printable ASCII before more ASCII, or the line's end, is a grapheme of its own
+        // (only CR LF joins two ASCII characters, and neither is printed), so only the rest asks
+        // the segmenter. Every walk of a line's cells went through it, a character at a time:
+        // its zones, its shape hash, its triggers, its drawing
+        let bytes = self.rest.as_bytes();
+        let first = *bytes.first()?;
+        let len = if (0x20..0x7f).contains(&first) && bytes.get(1).map_or(true, |b| *b < 0x80) {
+            1
+        } else {
+            Graphemes::new(self.rest).next()?.len()
+        };
+        let (text, rest) = self.rest.split_at(len);
+        self.rest = rest;
 
         let cell_index = self.idx;
         let width = if self.line.is_double_wide(cell_index) {

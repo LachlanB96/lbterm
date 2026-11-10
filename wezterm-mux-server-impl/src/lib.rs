@@ -6,6 +6,14 @@ use std::sync::Arc;
 use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 
 pub mod dispatch;
+/// LBTerm: what a connection owes its client, and what it has for the socket
+pub mod lbterm_flow;
+/// LBTerm: what a push of a pane's changes copies
+pub mod lbterm_push;
+/// LBTerm: what a connection's pushes cost, step by step, logged by a test window's server
+pub mod lbterm_pushstats;
+/// LBTerm: the Resize requests, each pane resized off the main thread
+pub mod lbterm_resize;
 pub mod local;
 pub mod pki;
 pub mod sessionhandler;

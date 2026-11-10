@@ -43,12 +43,13 @@ try {
   $w = Open-TestWindow -UserProfile $home2 -WorkingDirectory $repo -Cwd $repo -Program (Demo Left) `
     -Set (@($Config) + 'lbterm_compositor=true' + "lbterm_motion={enabled='on',slowdown=$Slowdown,panel_sweep='none'}")
   # Every cli call names its pane, since a window that never has focus has no focused pane
-  Start-Sleep 2
+  Wait-State { param($s) $s.frame -gt 0 -and $s.panes.Count -eq 1 } -What 'the window' | Out-Null
   $panes = @{ left = 0 }
   $panes.right = [int](Invoke-Cli split-pane --pane-id 0 --right --percent 45 -Program (Demo Right))
   $panes.below = [int](Invoke-Cli split-pane --pane-id $panes.right --bottom -Program (Demo Below))
   Invoke-Cli activate-pane --pane-id $panes.left | Out-Null
-  Start-Sleep 2
+  # Three panes, the keyboard on the left one, settled (lbterm/STATE.md)
+  Wait-Change { param($s) @($s.panes).Count -eq 3 -and $s.active_pane -eq $panes.left } -What 'three panes, the left one active' | Out-Null
 
   $moves = @(if ($Measure) { 'right' } else { 'right', 'below', 'left', 'right' })
   $gap = 900 * $Slowdown

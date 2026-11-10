@@ -9,7 +9,7 @@ LBTerm's GUI thread, which also takes every keypress.
 
 Opens <Bin>\lbterm-gui.exe without a config (-n), with Start-Unfocused (no console, outside
 Claude's job, never taking focus) on the right-most screen (offscreen.ps1). It spawns -Tabs tabs, each
-a pwsh running a node child like a Claude session, so every pane has a process tree to walk and
+a pwsh running a child (cmd.exe at its prompt) like a Claude session, so every pane has a process tree to walk and
 none reports its folder by OSC 7. Then it runs `cli list` -Calls times, -GapMs apart (longer than
 the 300 ms process-list cache), prints the median, 90th percentile and worst, and closes the window.
 #>
@@ -22,7 +22,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test 'cli-list' -Bin $Bin
-$node = 'C:\Program Files\nodejs\node.exe'
+# The child each tab's shell runs, standing in for a Claude session: cmd.exe waiting at its prompt, a
+# single console program as node was (until 2026-10-28), which every Windows has
+$child = $env:ComSpec
 
 Invoke-Test {
   # Open-TestWindow points `lbterm cli` at this GUI, not the terminal this shell runs in
@@ -32,15 +34,15 @@ Invoke-Test {
   # The window never has focus (LBTERM_NO_ACTIVATE), so spawn has to be told which window
   $first = (Get-Panes)[0].pane_id
   for ($n = 1; $n -lt $Tabs; $n++) {
-    New-Tab -From $first -Program (New-PwshProgram "& '$node' -e 'setInterval(()=>{},1e9)'") | Out-Null
+    New-Tab -From $first -Program (New-PwshProgram "& '$child' /d /k") | Out-Null
   }
-  # Every tab in the window, and each one's node running under its pwsh, so every pane has its
+  # Every tab in the window, and each one's child running under its pwsh, so every pane has its
   # whole tree to walk (was 3 s)
   Wait-State { param($x) @($x.tabs).Count -eq $Tabs } -What "$Tabs tabs" | Out-Null
   Wait-Until {
     $shells = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($w.Pid) AND Name = 'pwsh.exe'" | ForEach-Object ProcessId)
-    $nodes = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object { $_.ParentProcessId -in $shells })
-    $nodes.Count -ge $Tabs - 1
+    $children = @(Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" | Where-Object { $_.ParentProcessId -in $shells })
+    $children.Count -ge $Tabs - 1
   } -TimeoutSec 15 -IntervalMs 250 | Out-Null
   $panes = (Get-Panes).Count
 

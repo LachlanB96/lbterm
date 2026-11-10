@@ -33,6 +33,9 @@ use winreg::RegKey;
 
 pub struct Connection {
     event_handle: HANDLE,
+    /// LBTerm: the frames held back for max_fps that are to repaint, and the high-resolution
+    /// timer the loop waits on for them (os/windows/pace.rs)
+    pub(crate) paint_holds: super::pace::Holds,
     pub(crate) windows: RefCell<HashMap<HWindow, Rc<RefCell<WindowInner>>>>,
     pub(crate) gl_connection: RefCell<Option<Rc<crate::egl::GlConnection>>>,
 }
@@ -70,7 +73,13 @@ impl ConnectionOps for Connection {
     fn run_message_loop(&self) -> anyhow::Result<()> {
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         loop {
-            SPAWN_QUEUE.run();
+            // LBTerm: counted (lbterm_extras::pace)
+            lbterm_extras::pace::PACE.turn();
+            // LBTerm: stopping for a key, the pointer or a posted message waiting, which the
+            // PeekMessage below takes (window/src/spawn.rs)
+            SPAWN_QUEUE.run_until_message();
+            // LBTerm: frames held back for max_fps whose time is up repaint (os/windows/pace.rs)
+            self.end_paint_holds();
 
             let res = unsafe { PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) };
             if res != 0 {
@@ -81,6 +90,8 @@ impl ConnectionOps for Connection {
                     self.windows.borrow_mut().clear();
                     return Ok(());
                 }
+                // LBTerm: a key press taken, counted with when (os/windows/work.rs)
+                super::work::message_taken(msg.message);
 
                 unsafe {
                     // We don't want to call TranslateMessage here
@@ -123,21 +134,29 @@ impl Connection {
         let event_handle = SPAWN_QUEUE.event_handle.0;
         Ok(Self {
             event_handle,
+            paint_holds: super::pace::Holds::new()?,
             windows: RefCell::new(HashMap::new()),
             gl_connection: RefCell::new(None),
         })
     }
 
     fn wait_message(&self) {
+        // LBTerm: and on the timer for the soonest frame held back for max_fps, when there's one
+        // to repaint (os/windows/pace.rs)
+        let handles = [self.event_handle, self.paint_holds.timer()];
+        let count = if self.paint_holds.arm() { 2 } else { 1 };
+        // LBTerm: each wake and the time waited, for the counters (lbterm_extras::counters)
+        let waiting = std::time::Instant::now();
         unsafe {
             MsgWaitForMultipleObjects(
-                1,
-                &self.event_handle,
+                count,
+                handles.as_ptr(),
                 0,
                 INFINITE,
                 QS_ALLEVENTS | QS_ALLINPUT | QS_ALLPOSTMESSAGE,
             );
         }
+        lbterm_extras::counters::woke(waiting.elapsed().as_nanos() as u64);
     }
 
     pub(crate) fn get_window(&self, handle: HWindow) -> Option<Rc<RefCell<WindowInner>>> {

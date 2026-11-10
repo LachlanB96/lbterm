@@ -12,7 +12,8 @@ which the conversation no longer shows.
 
 1. The strip's second row shows the arrow and the last prompt, cut short (start.png).
 2. A click on the arrow drops the list of the session's prompts, newest first (list.png).
-3. Down eight times and Enter: the list closes and the jump scrolls the conversation back to
+3. Down eight times and Enter: its row flashes white as the list closes (menu.prompt.flash,
+   Lachlan's 9b), and the jump scrolls the conversation back to
    message 5, through the header, which doesn't jump here; its row is marked, then not
    (jumped.png, unmarked.png). The pane's text is read with `lbterm cli get-text`.
 4. A click on the strip's prompt jumps to the last message, back at the bottom.
@@ -89,7 +90,11 @@ config.default_cursor_style = 'SteadyBlock'
 
   # 3. Down eight, Enter: message 5, through the header and up the conversation
   Send-Key $w (@('Down') * 8)
+  $flashed = [System.Collections.Generic.HashSet[string]]::new()
   Send-Key $w Enter
+  # Not Wait-Change: it waits for the window to settle too, past the landed row's 1.6 s mark
+  Wait-State { param($s) -not $s.menu } -What 'the list closed by Enter' -OnState { param($s) foreach ($a in @($s.animations)) { [void]$flashed.Add($a.name) } } | Out-Null
+  if (-not $flashed.Contains('menu.prompt.flash')) { Add-Failure "the prompt picked didn't flash: no menu.prompt.flash in [$(@($flashed) -join ', ')]" } else { 'list: the prompt picked flashed (menu.prompt.flash)' }
   if (Wait-Text '^\s*\u276f message number 5,') {
     # LBTerm marks the row once the screen has held still, a moment after it's drawn
     Wait-State { param($s) $s.landed -and -not $s.strip.jumping } -What 'the landed row marked' | Out-Null

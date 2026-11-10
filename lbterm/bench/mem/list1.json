@@ -1,0 +1,8 @@
+[
+  { "name": "b-default", "config": "bench" },
+  { "name": "b-comp", "config": "bench", "lua": "lbterm_compositor = true," },
+  { "name": "b-gl", "config": "bench", "lua": "front_end = 'OpenGL'," },
+  { "name": "b-sw", "config": "bench", "lua": "front_end = 'Software'," },
+  { "name": "l-default", "config": "lachlan" },
+  { "name": "n-none", "config": "none" }
+]

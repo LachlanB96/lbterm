@@ -232,6 +232,8 @@ pub fn bootstrap() {
     // wezterm or the mux server from inside gnome terminal.
     // <https://github.com/wezterm/wezterm/issues/2237>
     std::env::remove_var("VTE_VERSION");
+    // LBTerm: what Windows hands an LBTerm process that nothing it starts should inherit
+    config::lbterm::drop_inherited_env();
 
     // Sice folks don't like to reboot or sign out if they `chsh`,
     // SHELL may be stale. Rather than using a stale value, unset

@@ -3,7 +3,7 @@
 # Covers: mux/src/lbterm_repaint.rs, wezterm-gui/src/termwindow/mod.rs, mux/src/tab.rs, mux/src/window.rs, mux/src/lib.rs, wezterm-client/src/domain.rs, wezterm-client/src/client.rs, wezterm-client/src/pane/clientpane.rs, wezterm-mux-server-impl/src/sessionhandler.rs
 <#
 What `lbterm cli` changes in a window shows there at once, with nothing else to paint it. The
-Conductor, AI Dashboard, Relay and terminal.ahk drive LBTerm this way, often while it's in the
+Conductor, the Claude project and Relay drive LBTerm this way, often while it's in the
 background. A focus, a zoom or a split moved from the cli used to change the mux and leave the
 window on its old frame until something else painted it (a program's output, the pointer, a
 capture: PrintWindow sends WM_PAINT, which is how it hid from the capture-based tests).
@@ -35,7 +35,7 @@ param([string]$Bin, [switch]$Mux, [double]$TimeoutSec = 3, [int]$QuietMs = 300)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test ('cli-repaint' + $(if ($Mux) { '-mux' } else { '' })) -Bin $Bin
-$sock = Join-Path $T.Out 'sock'
+$sock = $T.Sock
 $cfg = Join-Path $T.Out 'config\repaint.lua'
 New-Item -ItemType Directory -Force (Split-Path $cfg) | Out-Null
 

@@ -78,5 +78,7 @@ fn submit() {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64),
         windows,
+        pace: lbterm_extras::pace::PACE.counts(),
+        work: lbterm_extras::work::WORK.counts(),
     });
 }

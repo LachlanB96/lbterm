@@ -7,7 +7,8 @@ Each tab runs a stand-in that prints whatever this script leaves in its command 
 records, as Claude Code sends them.
 
 1. The open tab changes: its ring and bar glide from its old row to its new one (focus_move),
-   never past either (marker.png, a frame on the way).
+   never past either (marker.png, a frame on the way), and the new row's open fill comes in
+   over frames (the rows' surfaces are clear where nothing's drawn, so it once showed at once).
 2. A tab's program goes from working to blocked: its row dissolves into the new look over `swap`
    (status.png).
 3. `lbterm cli send-text` types into a tab: its pad glints, and the glint goes (glint.png).
@@ -19,8 +20,13 @@ records, as Claude Code sends them.
 7. A middle tab closed: it fades and the rows under it slide up (close.png).
 8. A row dragged down the rail: it's lifted and follows the pointer (lifted.png), and lands
    where it's let go.
+9. The open tab closed: its panes' last frame fades into the next tab's (tab_switch), the
+   strip's words with them, and the next tab's row takes the open look over frames
+   (open-close.png).
 
-Captures go to target\perf\rail-feedback. Fails with exit 1.
+Each step records frames until the state file (lbterm/STATE.md) says the rail shows the change
+and nothing moves any more, and the frames say how it got there. The rows' pads come from the
+file too. Captures go to target\perf\rail-feedback. Fails with exit 1.
 
   pwsh -File lbterm\perf\rail-feedback.ps1 [-Slowdown 4]
 #>
@@ -36,9 +42,15 @@ New-Item -ItemType Directory -Force $commands, $sums, $home2 | Out-Null
 # The accent the open tab's ring and bar are drawn in, #FF5449, give or take the soft edge
 $accent = New-ColourRange 201 255 51 129 41 119
 
-# A shot once two 700 ms apart match over columns x0..x1, by brightness (a held pointer kept in
-# place meanwhile)
-function Settled($w, [string]$name, [int]$x0, [int]$x1) { Wait-Still $w -Columns $x0, $x1 -Lum -Tries 20 -NoThrow -Name $name }
+# The rail as it shows `what`, settled, captured over columns x0..x1 (a held pointer kept in place)
+function Shows($w, [scriptblock]$what, [string]$name, [string]$desc) {
+  $script:entry = Wait-Change $what -What $desc -Animating
+  Get-Shot $w -Name $name
+}
+# Frames until the rail shows `what` and nothing moves any more (at most $Ms), a little after
+function Record($w, [int]$Ms, [scriptblock]$what) {
+  Get-Frames $w $Ms -TailMs 120 -Until { param($s) (& $what $s) -and -not $s.animating }
+}
 
 function Distance($a, $b, [int]$x0, [int]$x1) { [LbtermE2E.Px]::LumDistance($a, $b, (Get-Columns $x0 $x1 -Of $a)) }
 
@@ -48,6 +60,22 @@ function Between($frames, $before, $after, [int]$x0, [int]$x1) {
   @($frames | Where-Object {
       (Distance $before $_.Shot $x0 $x1) -gt 0.04 * $whole -and
       (Distance $after $_.Shot $x0 $x1) -gt 0.04 * $whole })
+}
+
+# The frames whose `rect` is neither `before` nor `after`, the open tab's ring left out: it
+# glides over the rows on its way
+function Coming($frames, $before, $after, $rect) {
+  $whole = [LbtermE2E.Px]::LumDistance($before, $after, $rect)
+  @($frames | Where-Object {
+      [LbtermE2E.Px]::CountRange($_.Shot, $rect, $accent) -eq 0 -and
+      [LbtermE2E.Px]::LumDistance($before, $_.Shot, $rect) -gt 0.1 * $whole -and
+      [LbtermE2E.Px]::LumDistance($after, $_.Shot, $rect) -gt 0.1 * $whole })
+}
+
+# Beside the open row's pad, inside its pill: where its open fill shows
+function Fill-Of($state) {
+  $pad = @($state.rail.rows | Where-Object { $_.active })[0].pad
+  New-Rect ($pad.x - (& $px 6)) $pad.y (& $px 4) $pad.h
 }
 
 function Save-Middle($frames, [string]$name) {
@@ -63,8 +91,7 @@ function Stand-In([string]$name) {
 # Leave `records` (OSC 7501 fields) for stand-in `name`, whole: written aside, then renamed in
 function Send-To([string]$name, [string[]]$records) {
   $file = Join-Path $commands "$name.txt"
-  [IO.File]::WriteAllText("$file.part", (($records | ForEach-Object { "$e]7501;$_$e\" }) -join ''))
-  Move-Item -LiteralPath "$file.part" -Destination $file -Force
+  Write-FileWhole -Path $file -Text (($records | ForEach-Object { "$e]7501;$_$e\" }) -join '') -Temp "$file.part"
 }
 
 Invoke-Test {
@@ -78,7 +105,7 @@ config.cursor_blink_rate = 0
 config.default_cursor_style = 'SteadyBlock'
 config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
 "@
-  Start-Sleep 2
+  Wait-State { param($s) $s.frame -gt 0 -and $s.rail } -What 'the window and its rail' | Out-Null
   $pane = @{ one = (Get-Panes)[0].pane_id }
   foreach ($n in 'two', 'three') { $pane[$n] = New-Tab -From $pane.one -Program (Stand-In $n) }
   foreach ($n in 'one', 'two', 'three') { Invoke-Cli set-tab-title --pane-id $pane[$n] $n | Out-Null }
@@ -89,15 +116,15 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   $px = { param($v) ConvertTo-Px $v $w.Scale }
   # The closed rail, short of the panes' cards
   $rail = & $px 74
-  $start = Settled $w 'start' 0 $rail
+  $start = Shows $w { param($s) $rows = @($s.rail.rows); $rows.Count -eq 3 -and $rows[1].state -eq 'working' -and $rows[2].progress -and $s.active_tab -eq 0 } 'start' 'three rows, two working'
 
   # 1. The open tab changes: its marker glides from the first row to the third
   $markerX = & $px 30
   $accentY = { param($shot) [LbtermE2E.Px]::MeanYInRange($shot, (Get-Columns 0 $markerX -Of $shot), $accent) }
   $from = & $accentY $start
   Invoke-Cli activate-tab --pane-id $pane.one --tab-index 2 | Out-Null
-  $frames = Get-Frames $w ([int](300 * $Slowdown + 600))
-  $third = Settled $w 'marker-end' 0 $rail
+  $frames = Record $w ([int](300 * $Slowdown + 600)) { param($s) $s.rail.open_row -eq 2 }
+  $third = Shows $w { param($s) $s.rail.open_row -eq 2 } 'marker-end' 'the third tab open'
   $to = & $accentY $third
   $ys = @($frames | ForEach-Object { & $accentY $_.Shot } | Where-Object { $_ -ge 0 })
   $span = $to - $from
@@ -107,16 +134,20 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   if ($from -lt 0 -or $to -lt 0 -or $span -lt (& $px 40)) { Add-Failure "no marker found on the rail ($from, $to)" }
   elseif ($onWay.Count -lt 2) { Add-Failure "the marker jumped: $($onWay.Count) frames on the way between rows" }
   if ($past.Count) { Add-Failure "the marker went past its rows in $($past.Count) frames" }
+  $fill = Fill-Of $script:entry
+  $coming = Coming $frames $start $third $fill
+  "marker: the third row's open fill $('{0:N1}' -f [LbtermE2E.Px]::LumDistance($start, $third, $fill)) brighter, $($coming.Count) frames on the way in"
+  if ([LbtermE2E.Px]::LumDistance($start, $third, $fill) -lt 2) { Add-Failure "the third row showed no open fill beside its pad (marker-end.png)" }
+  elseif ($coming.Count -lt 2) { Add-Failure "the third row's open fill came at once: $($coming.Count) frames on the way in" }
   $mid = @($frames | Where-Object { $y = & $accentY $_.Shot; $y -ge 0 -and [Math]::Abs(($y - $from) / $span - 0.5) -lt 0.25 })
   Save-Middle $mid 'marker'
   Remove-Frames $frames
-  # A row's height, for the drag
-  $pitch = $span / 2
 
   # 2. Tab two blocks on a question: its row dissolves into the new look
   Send-To two 'state=blocked:kind=question:app=claude'
-  $frames = Get-Frames $w ([int](200 * $Slowdown + 800))
-  $blocked = Settled $w 'status-end' 0 $rail
+  $blockedNow = { param($s) @($s.rail.rows)[1].state -eq 'waiting' }
+  $frames = Record $w ([int](200 * $Slowdown + 800)) $blockedNow
+  $blocked = Shows $w $blockedNow 'status-end' 'the second row blocked'
   $between = Between $frames $third $blocked 0 $rail
   "status: $($between.Count) of $($frames.Count) frames between the working row and the blocked one"
   if ((Distance $third $blocked 0 $rail) -eq 0) { Add-Failure 'the row never showed the new state' }
@@ -128,10 +159,13 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   $light = { param($shot) [LbtermE2E.Px]::Light($shot, (Get-Columns 0 $rail -Of $shot)) }
   $rest = & $light $blocked
   Invoke-Cli send-text --pane-id $pane.two --no-paste 'x' | Out-Null
-  $frames = Get-Frames $w ([int](580 * $Slowdown + 800))
+  $script:glinted = $false
+  $frames = Record $w ([int](580 * $Slowdown + 800)) { param($s)
+    if (@($s.animations | ForEach-Object name) -contains 'light.glint') { $script:glinted = $true }
+    $script:glinted }
   $lights = @($frames | ForEach-Object { & $light $_.Shot })
   $peak = ($lights | Measure-Object -Maximum).Maximum
-  $after = Settled $w 'glint-end' 0 $rail
+  $after = Shows $w { param($s) $true } 'glint-end' 'the glint to go'
   "glint: the rail's light $('{0:N2}' -f $rest), at its brightest $('{0:N2}' -f $peak), after $('{0:N2}' -f (& $light $after))"
   if ($peak -lt $rest + 0.15) { Add-Failure 'typing from the cli lit nothing on the rail' }
   if ((Distance $blocked $after 0 $rail) -gt 0) { Add-Failure 'the glint left something behind (glint-end.png)' }
@@ -141,8 +175,9 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
 
   # 4. Tab one renamed: its label dissolves into the name
   Invoke-Cli set-tab-title --pane-id $pane.one 'Renamed' | Out-Null
-  $frames = Get-Frames $w ([int](580 * $Slowdown + 800))
-  $renamed = Settled $w 'rename-end' 0 $rail
+  $renamedNow = { param($s) @($s.rail.rows)[0].title -eq 'Renamed' }
+  $frames = Record $w ([int](580 * $Slowdown + 800)) $renamedNow
+  $renamed = Shows $w $renamedNow 'rename-end' 'the first row renamed'
   $between = Between $frames $after $renamed 0 $rail
   "rename: $($between.Count) of $($frames.Count) frames between the old label and the new"
   if ((Distance $after $renamed 0 $rail) -eq 0) { Add-Failure 'the rail never showed the new name' }
@@ -154,10 +189,11 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   $cr = Get-ClientRect $w
   Set-PointerHold $w (& $px 36) ($cr.Bottom - (& $px 60))
   $panel = & $px 330
-  $at20 = Settled $w 'progress-20' 0 $panel
+  $at20 = Shows $w { param($s) $s.rail.open -and $null -eq $s.rail.hovered } 'progress-20' 'the panel open, no row hovered'
   Send-To three 'state=working:app=claude:progress=80'
-  $frames = Get-Frames $w ([int](220 * $Slowdown + 800))
-  $at80 = Settled $w 'progress-80' 0 $panel
+  $at80Now = { param($s) "$(@($s.rail.rows)[2].progress)" -match '80' }
+  $frames = Record $w ([int](220 * $Slowdown + 800)) $at80Now
+  $at80 = Shows $w $at80Now 'progress-80' 'the third row at 80%'
   $glide = @($frames | ForEach-Object { , [LbtermE2E.Px]::Glide($at20, $at80, $_.Shot, (Get-Columns 0 $panel -Of $at20)) })
   $partway = @($glide | Where-Object { $_[0] -gt 0.15 -and $_[0] -lt 0.85 })
   $clean = @($partway | Where-Object { $_[1] -ge 0.8 })
@@ -171,12 +207,13 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   # Off the panel, over the panes: it closes
   Clear-PointerHold
   Send-Mouse $w Move (& $px 600) (& $px 300)
-  $closed = Settled $w 'closed' 0 $panel
+  $closed = Shows $w { param($s) $s.rail.phase -eq 'closed' -and $s.settled } 'closed' 'the panel closed'
 
   # 6. A tab made without taking the keyboard grows into the rail
   $pane.four = New-Tab -From $pane.one -NoActivate -Program (Stand-In four)
-  $frames = Get-Frames $w ([int](220 * $Slowdown + 800))
-  $grown = Settled $w 'grow-end' 0 $rail
+  $fourNow = { param($s) @($s.rail.rows).Count -eq 4 }
+  $frames = Record $w ([int](220 * $Slowdown + 800)) $fourNow
+  $grown = Shows $w $fourNow 'grow-end' 'four rows'
   $between = Between $frames $closed $grown 0 $rail
   "grow: $($between.Count) of $($frames.Count) frames between the rail without the tab and with it"
   if ((Distance $closed $grown 0 $rail) -eq 0) { Add-Failure 'the new tab never showed on the rail' }
@@ -186,8 +223,9 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
 
   # 7. Tab two closed: it fades and three and four slide up
   Invoke-Cli kill-pane --pane-id $pane.two | Out-Null
-  $frames = Get-Frames $w ([int](220 * $Slowdown + 800))
-  $gone = Settled $w 'close-end' 0 $rail
+  $threeNow = { param($s) @($s.rail.rows).Count -eq 3 }
+  $frames = Record $w ([int](220 * $Slowdown + 800)) $threeNow
+  $gone = Shows $w $threeNow 'close-end' 'three rows again'
   $between = Between $frames $grown $gone 0 $rail
   "close: $($between.Count) of $($frames.Count) frames between"
   if ((Distance $grown $gone 0 $rail) -eq 0) { Add-Failure 'the closed tab stayed on the rail' }
@@ -196,32 +234,61 @@ config.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }
   Remove-Frames $frames
 
   # 8. The first row dragged down to the second's slot and a little past its middle: lifted on
-  # the way, under the pointer, landed in that slot. The panel opens under the pointer first
+  # the way, under the pointer, landed in that slot. The panel opens under the pointer first;
+  # the pads are where the file says
+  # Where the open tab's marker sat on the first row, and a row's height, as the marker's glide
+  # measured them (from the pads' middles the open part came out 6 px short of the pointer)
   $x = & $px 36
+  $pitch = $span / 2
   $y0 = [int]($from); $y1 = [int]($from + 1.3 * $pitch)
   Send-Mouse $w Move $x $y0
-  (Settled $w 'drag-start' 0 $panel).Dispose()
+  (Shows $w { param($s) $s.rail.open } 'drag-start' 'the panel open under the pointer').Dispose()
   Send-Mouse $w LDown $x $y0 -Keys L
   Start-Sleep -Milliseconds 100
   foreach ($k in 1..12) {
     Send-Mouse $w Move $x ([int]($y0 + ($y1 - $y0) * $k / 12)) -Keys L
     Start-Sleep -Milliseconds 40
   }
+  # Lifted: the rail says a row is being dragged; then the time its open part takes to catch the
+  # pointer up, by the clock, since the state file doesn't count that as animating
+  $lift = Wait-State { param($s) $null -ne $s.rail.dragging } -What 'the row lifted'
   Start-Sleep -Milliseconds ([int](220 * $Slowdown + 400))
   $lifted = Get-Shot $w -Name 'lifted'
   Send-Mouse $w LUp $x $y1
-  $landed = Settled $w 'landed' 0 $rail
+  $landed = Shows $w { param($s) $null -eq $s.rail.dragging } 'landed' 'the row let go'
   $d = Distance $lifted $landed 0 $rail
-  "drag: the lifted rail differs from where it lands by $('{0:N2}' -f $d)"
+  "drag: row $($lift.rail.dragging) lifted; the lifted rail differs from where it lands by $('{0:N2}' -f $d)"
   if ($d -lt 0.2) { Add-Failure 'the dragged row showed no lift on its way (lifted.png)' }
   # Its open part (the highlight and words, right of the rail) goes with it, under the pointer
   $want = $y1 - [int]($from + $pitch)
   $x0 = & $px 90; $x1 = & $px 280
-  $ya = [int]($from + 0.6 * $pitch); $yb = [int]($from + 1.4 * $pitch)
+  $ya = [int]($y0 - 0.4 * $pitch); $yb = [int]($y0 + 0.4 * $pitch)
+  $ya += [int]$pitch; $yb += [int]$pitch
   $shift = [LbtermE2E.Px]::BestShift($lifted, $landed, (New-Rect $x0 $ya ($x1 - $x0 + 1) ($yb - $ya + 1)), [int]($pitch / 2))
   "drag: the row's open part shows $shift px off its slot, the pointer $want px"
   if ([Math]::Abs($shift - $want) -gt (& $px 4)) { Add-Failure "the dragged row's open part stayed behind: $shift px off its slot, the pointer $want px (lifted.png)" }
   $order = @(Get-Panes | ForEach-Object tab_title)
   "drag: tabs now $($order -join ', ')"
   if ($order[1] -ne 'Renamed') { Add-Failure "the dragged tab is at $([array]::IndexOf($order, 'Renamed')), not 1" }
-} -Passed 'rail feedback: the marker glides, a new state and a new name dissolve in, typed-into and renamed pads glint, progress glides, tabs grow in and fold away, a dragged row lifts'
+
+  # 9. The open tab closed: its panes fade into the next tab's, and that tab's row comes in
+  Send-Mouse $w Move (& $px 600) (& $px 300)
+  $at = Shows $w { param($s) $s.rail.phase -eq 'closed' -and $s.settled } 'open-close-start' 'the panel closed again'
+  $was = $script:entry
+  $tabs = @($was.rail.rows).Count
+  Invoke-Cli kill-pane --pane-id @($was.panes)[0].id | Out-Null
+  $nextNow = { param($s) @($s.rail.rows).Count -eq $tabs - 1 }.GetNewClosure()
+  $frames = Record $w ([int](250 * $Slowdown + 800)) $nextNow
+  $next = Shows $w $nextNow 'open-close-end' 'the next tab open'
+  $cr = Get-ClientRect $w
+  $panes = Between $frames $at $next (& $px 90) ($cr.Width - 1)
+  "open close: $($panes.Count) of $($frames.Count) frames between the closed tab's panes and the next tab's"
+  if ((Distance $at $next (& $px 90) ($cr.Width - 1)) -eq 0) { Add-Failure 'the panes never showed the next tab' }
+  elseif ($panes.Count -lt 2) { Add-Failure "the next tab's panes came at once: $($panes.Count) frames between" }
+  Save-Middle $panes 'open-close'
+  $fill = Fill-Of $script:entry
+  $coming = Coming $frames $at $next $fill
+  "open close: the next row's open fill, $($coming.Count) frames on the way in"
+  if ($coming.Count -lt 2) { Add-Failure "the next tab's row took its open fill at once: $($coming.Count) frames on the way in" }
+  Remove-Frames $frames
+} -Passed 'rail feedback: the marker glides and the open row dissolves in, a new state and a new name dissolve in, typed-into and renamed pads glint, progress glides, tabs grow in and fold away, a dragged row lifts, a closed open tab dissolves into the next'

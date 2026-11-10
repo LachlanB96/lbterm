@@ -71,6 +71,21 @@ pub trait Domain: Downcast + Send + Sync {
         Ok(tab)
     }
 
+    /// LBTerm: `spawn`, told whether the window goes to the new tab. A domain whose tabs live in a
+    /// mux server tells the server, so its window stays where it was too (wezterm-client's
+    /// ClientDomain sends SpawnNoActivate); every other one spawns as `spawn` does and leaves it to
+    /// the mux, which activates the tab only when asked (`Mux::spawn_tab_or_window_activating`)
+    async fn lbterm_spawn_activating(
+        &self,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        window: WindowId,
+        _activate: bool,
+    ) -> anyhow::Result<Arc<Tab>> {
+        self.spawn(size, command, command_dir, window).await
+    }
+
     async fn split_pane(
         &self,
         source: SplitSource,
@@ -200,7 +215,8 @@ pub trait Domain: Downcast + Send + Sync {
 impl_downcast!(Domain);
 
 pub struct LocalDomain {
-    pty_system: Mutex<Box<dyn PtySystem + Send>>,
+    /// LBTerm: shared, so that a spawn makes its pty on a thread of its own (spawn_pane)
+    pty_system: Arc<Mutex<Box<dyn PtySystem + Send>>>,
     id: DomainId,
     name: String,
 }
@@ -229,7 +245,7 @@ impl LocalDomain {
     pub fn with_pty_system(name: &str, pty_system: Box<dyn PtySystem + Send>) -> Self {
         let id = alloc_domain_id();
         Self {
-            pty_system: Mutex::new(pty_system),
+            pty_system: Arc::new(Mutex::new(pty_system)),
             id,
             name: name.to_string(),
         }
@@ -598,11 +614,6 @@ impl Domain for LocalDomain {
             .build_command(command, command_dir, pane_id)
             .await
             .context("build_command")?;
-        let pair = self
-            .pty_system
-            .lock()
-            .openpty(crate::terminal_size_to_pty_size(size)?)?;
-
         let command_line = cmd
             .as_unix_command_line()
             .unwrap_or_else(|err| format!("error rendering command line: {:?}", err));
@@ -615,7 +626,33 @@ impl Domain for LocalDomain {
             },
             self.name
         );
-        let child_result = pair.slave.spawn_command(cmd);
+        // LBTerm: the pty (on Windows a pseudoconsole, which starts OpenConsole.exe) and the
+        // program are made on a thread of their own, and the pane here once they're there. Made
+        // here they held the thread that runs every pane, the mux server's only one, for 20 to 60
+        // ms a tab (11 to 16 ms the pseudoconsole, 8 to 46 the program, and 1.6 s for the first
+        // pwsh of a run), so no tab's keys reached it and no output was sent meanwhile
+        // (2026-10-30, perf/mux-push.ps1's spawn part). Into an empty mux the pane is made here,
+        // as upstream made every one: there's nothing else to keep waiting, and a client looking
+        // meanwhile would find the mux empty and spawn one of its own (a window starting its
+        // server attached while the server's first pane was being made, and both were made:
+        // perf/cli-repaint.ps1 -Mux). While one is made on its thread an Activity is held, so
+        // neither a window nor the mux server takes the mux, empty for a moment, for closed
+        let pty_size = crate::terminal_size_to_pty_size(size)?;
+        let mut _making = None;
+        let (pair, child_result) = if Mux::get().is_empty() {
+            let pair = self.pty_system.lock().openpty(pty_size)?;
+            let child_result = pair.slave.spawn_command(cmd);
+            (pair, child_result)
+        } else {
+            _making = Some(crate::activity::Activity::new());
+            let pty_system = Arc::clone(&self.pty_system);
+            smol::unblock(move || -> anyhow::Result<_> {
+                let pair = pty_system.lock().openpty(pty_size)?;
+                let child_result = pair.slave.spawn_command(cmd);
+                Ok((pair, child_result))
+            })
+            .await?
+        };
         let mut writer = WriterWrapper::new(pair.master.take_writer()?);
 
         let mut terminal = wezterm_term::Terminal::new(

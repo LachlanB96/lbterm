@@ -12,6 +12,8 @@
 //! as the whole bullet or paragraph it's in.
 
 use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 /// Each question's colour, by its place in the reply: Q1's first
@@ -71,11 +73,17 @@ impl Question {
     }
 
     /// The number its options carry: as the worker gave it, else the label's
-    fn number(&self) -> Option<u32> {
+    pub fn number(&self) -> Option<u32> {
         self.number.or_else(|| {
             let digits: String = self.label.chars().filter(char::is_ascii_digit).collect();
             digits.parse().ok()
         })
+    }
+
+    /// It's an extra offered after the questions, labelled on from them: E4
+    pub fn is_extra(&self) -> bool {
+        let mut chars = self.label.chars();
+        chars.next() == Some('E') && chars.next().is_some_and(|c| c.is_ascii_digit())
     }
 }
 
@@ -120,7 +128,7 @@ pub fn words(text: &str) -> Vec<String> {
 }
 
 /// One cell of the screen: its column, its character, and how many columns it takes.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Glyph {
     pub col: usize,
     pub ch: char,
@@ -172,6 +180,49 @@ pub struct Marker {
     pub label: String,
     /// Above the screen; else below it
     pub up: bool,
+    /// It's in the newest reply laid out
+    pub newest: bool,
+}
+
+/// Where a question's own words are on the screen: a voice draft that answers it ticks it there
+/// (lbterm/CONTROL.md, "Drafts"), and rings the next one it hasn't.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Asked {
+    /// Its place in the reply ([`colour`])
+    pub colour: usize,
+    /// The number its options carry
+    pub number: Option<u32>,
+    /// The row its words start on
+    pub row: usize,
+    /// The rows of its block and its options' after it
+    pub rows: Range<usize>,
+    /// Their columns: from their first glyph to the end of the longest
+    pub cols: Range<usize>,
+    /// It's in the newest reply laid out
+    pub newest: bool,
+}
+
+/// One of the newest reply's questions, as a voice draft goes through them
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ask {
+    /// The number its options carry, which an answer starts with
+    pub number: Option<u32>,
+    /// An extra offered after the questions (E4)
+    pub extra: bool,
+    /// Where it starts in the reply, in words
+    pub pos: usize,
+    /// What its marker says
+    pub label: String,
+}
+
+/// Where the next question a voice draft hasn't answered is
+#[derive(Debug, Clone, PartialEq)]
+pub enum Next<'a> {
+    /// Its own words are on the screen
+    On(&'a Asked),
+    /// It's off the screen that way: the marker at that edge, one of the layout's or one of its
+    /// own when none of it is on the screen
+    Off(Marker),
 }
 
 /// What a held right button shows on one screen.
@@ -179,13 +230,57 @@ pub struct Marker {
 pub struct Layout {
     pub bands: Vec<Band>,
     pub markers: Vec<Marker>,
+    /// The questions whose own words are on the screen
+    pub asked: Vec<Asked>,
     /// The conversation's rows, above Claude Code's input box: the markers go at its edges
     pub area: Range<usize>,
+    /// The newest reply's questions in its order, on the screen or not
+    pub newest: Vec<Ask>,
+    /// What of the newest reply is on the screen, from where in it to where, in words
+    pub shown: Option<Range<usize>>,
 }
 
 impl Layout {
     pub fn is_empty(&self) -> bool {
         self.bands.is_empty() && self.markers.is_empty()
+    }
+
+    /// The question in the newest reply a voice draft answering `answered` should answer next,
+    /// by its place in the reply ([`colour`]): the first, in the reply's order, that it hasn't,
+    /// extras (E4) among them only with `extras`. One with no number can't be answered by one,
+    /// so it's passed by. None once every one's answered.
+    pub fn next_to_answer(&self, answered: &[u32], extras: bool) -> Option<usize> {
+        self.newest
+            .iter()
+            .position(|q| (extras || !q.extra) && q.number.is_some_and(|n| !answered.contains(&n)))
+    }
+
+    /// Where that question is: on the screen, or the edge it's off. None when every one's
+    /// answered, or when nothing of the newest reply is on the screen to say which way it is.
+    pub fn next(&self, answered: &[u32], extras: bool) -> Option<Next<'_>> {
+        let colour = self.next_to_answer(answered, extras)?;
+        if let Some(asked) = self.asked.iter().find(|a| a.newest && a.colour == colour) {
+            return Some(Next::On(asked));
+        }
+        let shown = self.shown.as_ref()?;
+        let ask = &self.newest[colour];
+        let up = ask.pos < shown.start;
+        if !up && ask.pos <= shown.end {
+            // Among what's on the screen, but its words weren't found there
+            return None;
+        }
+        let marker = self
+            .markers
+            .iter()
+            .find(|m| m.newest && m.colour == colour && m.up == up)
+            .cloned()
+            .unwrap_or(Marker {
+                colour,
+                label: ask.label.clone(),
+                up,
+                newest: true,
+            });
+        Some(Next::Off(marker))
     }
 }
 
@@ -210,7 +305,7 @@ struct RowInfo {
     first_word: Option<String>,
 }
 
-fn is_space(ch: char) -> bool {
+pub(crate) fn is_space(ch: char) -> bool {
     ch == ' ' || ch == '\u{a0}' || ch == '\0'
 }
 
@@ -251,8 +346,8 @@ fn starts_block(text: &str) -> bool {
         // spinners, a quote's bar, and tables' borders
         '\u{2022}' | '\u{00b7}' | '\u{25cf}' | '\u{276f}' | '\u{23bf}' | '\u{273b}' | '\u{273d}'
         | '\u{2736}' | '\u{2733}' | '\u{2722}' | '\u{258e}' | '\u{2500}'..='\u{257f}' => true,
-        // A question's label: Q1. Q12:
-        'Q' => {
+        // A question's label, Q1. Q12:, or an extra's numbered on from them, E4. (2026-10-25)
+        'Q' | 'E' => {
             let rest: String = text[1..].chars().take_while(|c| !c.is_whitespace()).collect();
             let digits = rest.chars().take_while(char::is_ascii_digit).count();
             digits > 0 && rest[digits..].chars().all(|c| !c.is_alphanumeric())
@@ -271,10 +366,43 @@ fn starts_block(text: &str) -> bool {
     }
 }
 
-/// A row Claude Code draws round its input box: a line across, nothing else
-fn is_rule(row: &[Glyph]) -> bool {
-    let ink = row.iter().filter(|g| !is_space(g.ch)).count();
-    ink >= 20 && row.iter().all(|g| is_space(g.ch) || g.ch == '\u{2500}' || g.ch == '\u{2501}')
+/// The fewest of the line's glyphs a rule has
+const RULE_MIN: usize = 20;
+
+fn is_line(ch: char) -> bool {
+    ch == '\u{2500}' || ch == '\u{2501}'
+}
+
+/// Whether a row's text is a rule Claude Code draws round its input box: a line across and
+/// nothing else, or a named conversation's upper rule, which carries its name near the right end
+/// (`──…── LBTerm InMail ─`, since 2.1.314): at least [`RULE_MIN`] of the line, a space, the
+/// name, a space and the line to the end. The same shape as Earshot's
+/// `^\s*─{20,}(?: \S.*? ─+)?\s*$`.
+pub fn is_rule_text(text: &str) -> bool {
+    let t = text.trim_matches(|c: char| c.is_whitespace() || is_space(c));
+    if t.chars().all(|c| is_line(c) || is_space(c)) {
+        return t.chars().filter(|&c| is_line(c)).count() >= RULE_MIN;
+    }
+    if t.chars().take_while(|&c| is_line(c)).count() < RULE_MIN {
+        return false;
+    }
+    let body = t.trim_start_matches(is_line);
+    let name = body.trim_end_matches(is_line);
+    name.len() < body.len()
+        && name
+            .strip_prefix(' ')
+            .and_then(|n| n.strip_suffix(' '))
+            .is_some_and(|n| n.starts_with(|c: char| !c.is_whitespace()) && n.ends_with(|c: char| !c.is_whitespace()))
+}
+
+/// A row Claude Code draws round its input box ([`is_rule_text`]). A row whose first ink isn't
+/// the line is turned down before its text is put together.
+pub(crate) fn is_rule(row: &[Glyph]) -> bool {
+    if !row.iter().find(|g| !is_space(g.ch)).is_some_and(|g| is_line(g.ch)) {
+        return false;
+    }
+    let text: String = row.iter().map(|g| if is_space(g.ch) { ' ' } else { g.ch }).collect();
+    is_rule_text(&text)
 }
 
 /// Where the conversation ends: above Claude Code's input box, the lowest rule near the bottom
@@ -289,6 +417,19 @@ fn conversation_end(screen: &Screen) -> usize {
         .rev()
         .find(|&r| is_rule(&screen.rows[r]))
         .unwrap_or(lowest)
+}
+
+/// A hash of all [`lay_out`] reads of `screen`: where the conversation ends, above Claude Code's
+/// input box, and every row above that. A screen whose conversation is the same lays out the
+/// same, however its input box and status line under it change, so a layout is kept until this
+/// is another (wezterm-gui's render/questions.rs): it was laid out again for any output in the
+/// pane, the status line's turning included (lbterm/PERF.md, finding 63)
+pub fn conversation_hash(screen: &Screen) -> u64 {
+    let end = conversation_end(screen);
+    let mut hasher = DefaultHasher::new();
+    end.hash(&mut hasher);
+    screen.rows[..end].hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The screen's words, top to bottom, in its first `end` rows
@@ -365,15 +506,20 @@ fn add_band(bands: &mut Vec<Band>, info: &[RowInfo], rows: Range<usize>, colour:
         }
         return;
     }
-    let lines = &info[rows.clone()];
-    let start = lines.iter().filter(|i| !i.blank).map(|i| i.indent).min().unwrap_or(0);
-    let end = lines.iter().map(|i| i.end).max().unwrap_or(start);
     bands.push(Band {
+        cols: cols_of(info, rows.clone()),
         rows,
-        cols: start..end.max(start),
         colours: vec![colour],
         question,
     });
+}
+
+/// The columns of `rows`: from their first glyph to the end of the longest
+fn cols_of(info: &[RowInfo], rows: Range<usize>) -> Range<usize> {
+    let lines = &info[rows];
+    let start = lines.iter().filter(|i| !i.blank).map(|i| i.indent).min().unwrap_or(0);
+    let end = lines.iter().map(|i| i.end).max().unwrap_or(start);
+    start..end.max(start)
 }
 
 /// Whether a block's first word is one of question `number`'s options: 1a, 1b
@@ -395,13 +541,29 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
     let on = screen_words(screen, end);
     let mut layout = Layout {
         area: 0..end,
+        newest: map
+            .messages
+            .last()
+            .map(|m| {
+                m.questions
+                    .iter()
+                    .enumerate()
+                    .map(|(qi, q)| Ask {
+                        number: q.number(),
+                        extra: q.is_extra(),
+                        pos: q.pos,
+                        label: q.name(qi),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         ..Default::default()
     };
     if on.is_empty() {
         return layout;
     }
 
-    for message in map.messages.iter().rev() {
+    for (age, message) in map.messages.iter().rev().enumerate() {
         // Each question's own words and each passage: where it is in the reply, and on screen
         struct Item {
             question: usize,
@@ -440,25 +602,38 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
             };
             let block = block_of(&info, on[found.start].row, on[found.end - 1].row);
             let mut next = block.end;
-            add_band(&mut layout.bands, &info, block, item.question, item.own);
+            add_band(&mut layout.bands, &info, block.clone(), item.question, item.own);
             if !item.own {
                 continue;
             }
             // Its options, in the blocks after it
-            let Some(number) = message.questions[item.question].number() else {
-                continue;
-            };
-            loop {
-                while next < end && info[next].blank {
-                    next += 1;
+            let number = message.questions[item.question].number();
+            let mut rows = block;
+            if let Some(number) = number {
+                loop {
+                    while next < end && info[next].blank {
+                        next += 1;
+                    }
+                    if next >= end || !is_option(&info[next], number) {
+                        break;
+                    }
+                    let option = block_of(&info, next, next);
+                    next = option.end;
+                    rows.end = option.end;
+                    add_band(&mut layout.bands, &info, option, item.question, true);
                 }
-                if next >= end || !is_option(&info[next], number) {
-                    break;
-                }
-                let option = block_of(&info, next, next);
-                next = option.end;
-                add_band(&mut layout.bands, &info, option, item.question, true);
             }
+            layout.asked.push(Asked {
+                colour: item.question,
+                number,
+                row: on[found.start].row,
+                cols: cols_of(&info, rows.clone()),
+                rows,
+                newest: age == 0,
+            });
+        }
+        if age == 0 {
+            layout.shown = Some(lo..hi);
         }
 
         // A marker for each way a question on screen goes off it
@@ -474,6 +649,7 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
                         colour: qi,
                         label: q.name(qi),
                         up,
+                        newest: age == 0,
                     });
                 }
             }
@@ -564,6 +740,75 @@ mod test {
     }
 
     #[test]
+    fn a_rule_is_a_line_across_or_a_named_conversations_upper_one() {
+        let line = "\u{2500}".repeat(60);
+        for rule in [
+            line.clone(),
+            format!("  {line}  "),
+            "\u{2501}".repeat(30),
+            // Claude Code 2.1.314 on: the conversation's name near the right end
+            format!("{line} LBTerm InMail \u{2500}"),
+            format!("{line} ITMan InMail \u{2500}\u{2500}\u{2500}"),
+            format!("{line} x \u{2500}"),
+        ] {
+            assert!(is_rule_text(&rule), "{rule}");
+            let glyphs = Screen::from_lines(&[rule.as_str()]).rows.remove(0);
+            assert!(is_rule(&glyphs), "glyphs of {rule}");
+        }
+        for not in [
+            "\u{2500}".repeat(19),
+            format!("{} name \u{2500}", "\u{2500}".repeat(19)),
+            // No line after the name, or no space round it
+            format!("{line} LBTerm InMail"),
+            format!("{line} LBTerm InMail \u{2500} more"),
+            format!("{line}LBTerm \u{2500}"),
+            format!("{line} LBTerm\u{2500}"),
+            format!("{line}  LBTerm \u{2500}"),
+            format!("x {line}"),
+            "\u{276f} ".to_string(),
+            String::new(),
+        ] {
+            assert!(!is_rule_text(&not), "{not}");
+            let glyphs = Screen::from_lines(&[not.as_str()]).rows.remove(0);
+            assert!(!is_rule(&glyphs), "glyphs of {not}");
+        }
+    }
+
+    #[test]
+    fn a_named_conversation_ends_where_an_unnamed_one_does() {
+        let mut named = SCREEN.to_vec();
+        named[16] = "──────────────────────────── LBTerm InMail ─";
+        let (plain, named) = (Screen::from_lines(SCREEN), Screen::from_lines(&named));
+        assert_eq!(conversation_end(&named), 16);
+        assert_eq!(conversation_end(&named), conversation_end(&plain));
+        assert_eq!(lay_out(&reply(), &named), lay_out(&reply(), &plain));
+    }
+
+    #[test]
+    fn a_screen_lays_out_the_same_while_its_conversation_is() {
+        let screen = Screen::from_lines(SCREEN);
+        let base = conversation_hash(&screen);
+        // The status line turning and the prompt typed into: the same conversation
+        let mut below = SCREEN.to_vec();
+        below[19] = "  [Opus 5.5] LBTerm | working 12";
+        below[17] = "❯ 1a";
+        assert_eq!(conversation_hash(&Screen::from_lines(&below)), base);
+        assert_eq!(
+            lay_out(&reply(), &Screen::from_lines(&below)),
+            lay_out(&reply(), &screen),
+            "what the hash keeps is what lay_out gives"
+        );
+        // A row of the reply changed, or the box gone so the conversation runs on: another
+        let mut above = SCREEN.to_vec();
+        above[7] = "  The check fails on main.";
+        assert_ne!(conversation_hash(&Screen::from_lines(&above)), base);
+        let mut no_box = SCREEN.to_vec();
+        no_box[16] = "";
+        no_box[18] = "";
+        assert_ne!(conversation_hash(&Screen::from_lines(&no_box)), base);
+    }
+
+    #[test]
     fn the_file_is_read() {
         let m = parse(
             r#"{"sessionId":"x","messages":[{"id":"m1","at":1,"questions":[
@@ -588,10 +833,10 @@ mod test {
 
     #[test]
     fn blocks_start_at_bullets_numbers_labels_and_marks() {
-        for yes in ["- a", "* a", "• a", "● Here", "❯ hi", "⎿  out", "│ cell", "4. Keep", "2) x", "1a. Yes", "3b) no", "Q1. Why?", "Q12: x"] {
+        for yes in ["- a", "* a", "• a", "● Here", "❯ hi", "⎿  out", "│ cell", "4. Keep", "2) x", "1a. Yes", "3b) no", "Q1. Why?", "Q12: x", "E4. Tidy it?", "E12) x"] {
             assert!(starts_block(yes), "{yes}");
         }
-        for no in ["-5 degrees", "*args", "Question", "Q and A", "2026-10-21 was", "1.5 seconds", "4.", "anything", "(You said"] {
+        for no in ["-5 degrees", "*args", "Question", "Q and A", "2026-10-21 was", "1.5 seconds", "4.", "anything", "(You said", "Every", "E4x"] {
             assert!(!starts_block(no), "{no}");
         }
     }
@@ -612,6 +857,15 @@ mod test {
         );
         // Everything's on screen
         assert!(layout.markers.is_empty());
+        // Where each question's own words start, for a voice draft's ticks: the labels' numbers;
+        // and its rows with its options', for its ring
+        assert_eq!(
+            layout.asked,
+            vec![
+                Asked { colour: 0, number: Some(1), row: 9, rows: 9..12, cols: 2..SCREEN[9].chars().count(), newest: true },
+                Asked { colour: 1, number: Some(2), row: 13, rows: 13..15, cols: 2..SCREEN[13].chars().count(), newest: true },
+            ]
+        );
         // The input box and the status under it are left out, though the status says it too
         assert_eq!(layout.area, 0..16);
         // A band runs from its rows' first glyph to the end of the longest
@@ -639,8 +893,8 @@ mod test {
         assert_eq!(
             layout.markers,
             vec![
-                Marker { colour: 0, label: "Q1".into(), up: true },
-                Marker { colour: 1, label: "Q2".into(), up: true },
+                Marker { colour: 0, label: "Q1".into(), up: true, newest: true },
+                Marker { colour: 1, label: "Q2".into(), up: true, newest: true },
             ]
         );
         // Scrolled up: the findings on screen, the questions off the bottom
@@ -661,8 +915,89 @@ mod test {
         let layout = lay_out(&reply(), &screen);
         assert_eq!(
             layout.markers,
-            vec![Marker { colour: 1, label: "Q2".into(), up: true }]
+            vec![Marker { colour: 1, label: "Q2".into(), up: true, newest: true }]
         );
+    }
+
+    #[test]
+    fn labels_from_e_on_are_extras() {
+        for (label, extra) in [("E4", true), ("E12", true), ("Q1", false), ("", false), ("Every", false), ("4", false)] {
+            assert_eq!(question(label, "Tidy it?", 0, vec![]).is_extra(), extra, "{label}");
+        }
+    }
+
+    #[test]
+    fn the_next_question_is_the_first_the_draft_hasnt_answered() {
+        let layout = lay_out(&reply(), &Screen::from_lines(SCREEN));
+        let on = |answered: &[u32]| match layout.next(answered, true) {
+            Some(Next::On(a)) => Some((a.colour, a.rows.clone())),
+            other => panic!("{other:?}"),
+        };
+        // Q1 with its two options, then Q2 on its two rows
+        assert_eq!(on(&[]), Some((0, 9..12)));
+        assert_eq!(on(&[1]), Some((1, 13..15)));
+        assert_eq!(on(&[2]), Some((0, 9..12)), "an answer to a later one doesn't move it on");
+        assert_eq!(layout.next(&[1, 2], true), None, "every one answered: no ring");
+        assert_eq!(layout.next(&[2, 1, 7], true), None);
+    }
+
+    #[test]
+    fn extras_count_only_when_the_setting_says_so() {
+        let mut m = reply();
+        m.messages[0].questions.push(question("E3", "Ring it in red?", 70, vec![]));
+        let layout = lay_out(&m, &Screen::from_lines(SCREEN));
+        assert_eq!(layout.next_to_answer(&[1, 2], true), Some(2));
+        assert_eq!(layout.next_to_answer(&[1, 2], false), None);
+        assert_eq!(layout.next_to_answer(&[1], false), Some(1));
+        // An extra before a question, answered or not, is passed by without them
+        m.messages[0].questions.insert(0, question("E9", "Something first?", 1, vec![]));
+        let layout = lay_out(&m, &Screen::from_lines(SCREEN));
+        assert_eq!(layout.next_to_answer(&[], false), Some(1));
+        assert_eq!(layout.next_to_answer(&[], true), Some(0));
+    }
+
+    #[test]
+    fn a_question_with_no_number_is_passed_by() {
+        let mut m = reply();
+        m.messages[0].questions.insert(0, question("", "Anything else?", 1, vec![]));
+        let layout = lay_out(&m, &Screen::from_lines(SCREEN));
+        assert_eq!(layout.next_to_answer(&[], true), Some(1));
+    }
+
+    #[test]
+    fn the_next_question_off_the_screen_is_its_marker_at_that_edge() {
+        // Scrolled down: Q1's passage is off the top, so its marker's there already
+        let layout = lay_out(&reply(), &Screen::from_lines(&SCREEN[7..]));
+        let q1_up = Marker { colour: 0, label: "Q1".into(), up: true, newest: true };
+        assert!(layout.markers.contains(&q1_up));
+        // Q1's own words are still on the screen, so it's ringed there
+        assert!(matches!(layout.next(&[], true), Some(Next::On(a)) if a.colour == 0));
+        // Only Q2's on the screen and nothing of Q1: a marker of its own, above
+        let layout = lay_out(&reply(), &Screen::from_lines(&SCREEN[12..]));
+        assert!(!layout.markers.iter().any(|m| m.colour == 0));
+        assert_eq!(layout.next(&[], true), Some(Next::Off(q1_up)));
+        assert!(matches!(layout.next(&[1], true), Some(Next::On(a)) if a.colour == 1));
+        // Scrolled up: the passages on the screen, both questions off the bottom
+        let mut top: Vec<&str> = SCREEN[..8].to_vec();
+        top.extend_from_slice(&SCREEN[16..]);
+        let layout = lay_out(&reply(), &Screen::from_lines(&top));
+        let q2_down = Marker { colour: 1, label: "Q2".into(), up: false, newest: true };
+        assert_eq!(layout.next(&[1], true), Some(Next::Off(q2_down)));
+    }
+
+    #[test]
+    fn with_nothing_of_the_newest_reply_on_the_screen_there_is_no_ring() {
+        // The reply on the screen is an older one; the newest asked about something else
+        let mut m = reply();
+        m.messages.push(Message {
+            id: "b".into(),
+            questions: vec![question("Q1", "Drop the summary pane as well?", 12, vec![])],
+        });
+        let layout = lay_out(&m, &Screen::from_lines(SCREEN));
+        assert!(layout.asked.iter().all(|a| !a.newest));
+        assert_eq!(layout.shown, None);
+        assert_eq!(layout.next(&[], true), None);
+        assert_eq!(layout.newest.len(), 1);
     }
 
     #[test]

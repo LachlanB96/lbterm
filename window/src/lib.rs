@@ -269,6 +269,12 @@ pub trait WindowOps {
     /// be repainted shortly
     fn invalidate(&self);
 
+    /// LBTerm: invalidate, saying who asked (lbterm_extras::counters): what `lbterm_invalidate`
+    /// on a `dyn WindowOps` (below) calls with its caller
+    fn lbterm_invalidate_at(&self, _at: &'static std::panic::Location<'static>) {
+        self.invalidate()
+    }
+
     /// Change the titlebar text for the window
     fn set_title(&self, title: &str);
 
@@ -340,6 +346,16 @@ pub trait WindowOps {
         _window_state: WindowState,
     ) -> anyhow::Result<Option<os::parameters::Parameters>> {
         Ok(None)
+    }
+}
+
+/// LBTerm: `invalidate` on a `dyn WindowOps` (the key, mouse and rail handlers' `context`) that
+/// names its caller's line for the counters. `#[track_caller]` doesn't survive a call through a
+/// trait object, where `invalidate` names the implementation's own line instead
+impl<'a> dyn WindowOps + 'a {
+    #[track_caller]
+    pub fn lbterm_invalidate(&self) {
+        self.lbterm_invalidate_at(std::panic::Location::caller())
     }
 }
 

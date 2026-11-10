@@ -27,9 +27,6 @@ pub const PREDECESSOR_VAR: &str = "LBTERM_RESTART_AFTER";
 /// How long the new GUI waits for the old one, in milliseconds
 pub const PREDECESSOR_WAIT_MS: u32 = 10_000;
 
-/// How often a running GUI reads version.txt, in seconds
-pub const POLL_SECS: u64 = 10;
-
 /// Whether version.txt's contents name another build than the running one. A missing or empty
 /// file names none: a GUI run from target\release or a try window has no pill.
 pub fn other_build_installed(installed: Option<&str>, running: &str) -> bool {
@@ -44,22 +41,35 @@ pub fn predecessor(value: Option<&str>) -> Option<u32> {
     value?.trim().parse().ok().filter(|&pid| pid != 0)
 }
 
-/// Why a restart can't go ahead, when it can't. Panes the GUI holds itself, outside a mux
-/// server, would end with it.
+/// Why a restart can't go ahead, when it can't. Panes the GUI holds itself in its tabs, outside a
+/// mux server, would end with it. Never "close LBTerm": closing a window ends every tab it shows,
+/// those in the server too (lbterm/MUX.md); until 2026-10-23 that's what this advised.
 pub fn refusal(local_panes: usize) -> Option<String> {
     match local_panes {
         0 => None,
         1 => Some(
-            "A pane runs in this window rather than in the mux server, and would end with it. \
-             Close and open LBTerm instead."
+            "A pane runs in this window rather than in the mux server, and would end with a \
+             restart. Close that pane, then restart."
                 .to_string(),
         ),
         n => Some(format!(
-            "{n} panes run in this window rather than in the mux server, and would end with it. \
-             Close and open LBTerm instead."
+            "{n} panes run in this window rather than in the mux server, and would end with a \
+             restart. Close those panes, then restart."
         )),
     }
 }
+
+/// The same, short enough for the window strip's caption, where it's said as well as in a toast:
+/// a toast can go unseen, and then the click seems to do nothing (2026-10-23)
+pub fn refusal_notice(local_panes: usize) -> String {
+    match local_panes {
+        1 => "Didn't restart: a pane here isn't in the mux server".to_string(),
+        n => format!("Didn't restart: {n} panes here aren't in the mux server"),
+    }
+}
+
+/// What the strip says when the installed build couldn't be started
+pub const FAILED_NOTICE: &str = "Didn't restart: the installed build wouldn't start";
 
 /// The strip's colours for the pill, as sRGB 0..1, from the strip's own colour: white laid over
 /// it at the design's alphas (lbterm/DESIGN.md: a hairline at rest is white 14%, under the
@@ -132,6 +142,13 @@ mod test {
         assert_eq!(refusal(0), None);
         assert!(refusal(1).unwrap().starts_with("A pane runs"));
         assert!(refusal(3).unwrap().starts_with("3 panes run"));
+        for n in [1, 3] {
+            let why = refusal(n).unwrap();
+            assert!(!why.contains("LBTerm"), "closing LBTerm would end every tab: {why}");
+            assert!(why.contains("then restart"));
+        }
+        assert_eq!(refusal_notice(1), "Didn't restart: a pane here isn't in the mux server");
+        assert_eq!(refusal_notice(3), "Didn't restart: 3 panes here aren't in the mux server");
     }
 
     #[test]

@@ -42,6 +42,11 @@ impl super::TermWindow {
             return;
         }
         if self.dimensions == dimensions && self.window_state == window_state {
+            // LBTerm: a drag of the frame is over (the window gives its last size again at
+            // WM_EXITSIZEMOVE): the tabs it left behind take that size (lbterm_extras::resize)
+            if !live_resizing && self.lbterm_resize.ended() {
+                self.lbterm_resize_behind();
+            }
             // It didn't really change
             log::trace!("dimensions didn't change NOP!");
             return;
@@ -57,6 +62,8 @@ impl super::TermWindow {
             webgpu.resize(dimensions);
         }
 
+        // LBTerm: a drag's size goes to the tab in view alone (lbterm_extras::resize)
+        self.lbterm_resize.sizing(live_resizing);
         // For simple, user-interactive resizes where the dpi doesn't change,
         // skip our scaling recalculation
         if live_resizing && self.dimensions.dpi == dimensions.dpi {
@@ -297,10 +304,26 @@ impl super::TermWindow {
 
         let mux = Mux::get();
         if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter_tabs() {
-                tab.resize(size);
+            // LBTerm: during a drag of the frame only the tab in view takes each size; the rest
+            // take the one the drag ends at (lbterm_extras::resize, lbterm_resize_behind)
+            let shown = window.get_active_tab_idx();
+            let mut took = 0;
+            for (idx, tab) in window.iter_tabs().enumerate() {
+                if self.lbterm_resize.takes(idx == shown) {
+                    tab.resize(size);
+                    took += 1;
+                }
             }
+            log::debug!(
+                target: "lbterm::resize",
+                "{}x{}: {took} of {} tabs took it ({})",
+                size.cols,
+                size.rows,
+                window.count_tabs(),
+                if self.lbterm_resize.is_behind() { "the rest behind, a drag's" } else { "every tab" }
+            );
         };
+        self.lbterm_resize.applied();
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();
@@ -343,6 +366,25 @@ impl super::TermWindow {
                 self.set_inner_size(window, dims.pixel_width, dims.pixel_height);
             }
         }
+    }
+
+    /// LBTerm: the tabs a drag of the frame left at an older size take the window's
+    /// (lbterm_extras::resize)
+    fn lbterm_resize_behind(&mut self) {
+        let size = self.terminal_size;
+        let mux = Mux::get();
+        if let Some(window) = mux.get_window(self.mux_window_id) {
+            log::debug!(
+                target: "lbterm::resize",
+                "the drag is over: {} tabs take {}x{}",
+                window.count_tabs(),
+                size.cols,
+                size.rows
+            );
+            for tab in window.iter_tabs() {
+                tab.resize(size);
+            }
+        };
     }
 
     pub fn current_cell_dimensions(&self) -> RowsAndCols {
@@ -567,7 +609,10 @@ impl super::TermWindow {
 /// enabled the scroll bar then they will expect it to have a reasonable
 /// size unless they've specified differently.
 pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext) -> usize {
-    let padding = if config.enable_scroll_bar && config.window_padding.right.is_zero() {
+    // LBTerm: with the scroll strip on, it's the panes' scrollbar and they keep no room for
+    // their own (render/scroll_strip.rs)
+    let scroll_bar = config.enable_scroll_bar && crate::termwindow::render::scroll_strip::panes_keep_scroll_bar(config);
+    let padding = if scroll_bar && config.window_padding.right.is_zero() {
         context.pixel_cell as usize
     } else {
         config.window_padding.right.evaluate_as_pixels(context) as usize
@@ -575,7 +620,7 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
     // LBTerm: the scrollbar lies inside the pane's card, clear of its outline,
     // and clear of the text, so the padding is still all the thumb's
     // (render/card.rs)
-    if config.enable_scroll_bar {
+    if scroll_bar {
         let shape = lbterm_panel::Shape::new(context.dpi / 96.0);
         padding + (shape.scroll_inset() + shape.scroll_gap()) as usize
     } else {

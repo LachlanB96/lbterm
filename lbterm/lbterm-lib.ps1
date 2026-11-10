@@ -52,96 +52,105 @@ function Save-OpensslCache {
   $true
 }
 
-# ---- This PC's own paths (~\.config\lbterm\dev.json) ----
+# ---- Cargo only inside a job, where a PC asks for it (lbterm.ps1 build, check, test, unify, try) ----
+# This script starts no job of its own: cargo runs in whatever job it's in, and one release rustc
+# can take more cores than -j says. A PC whose heavy work goes through a queue that holds it to its
+# CPUs says so in its dev settings (~\.config\lbterm\dev.json, which never leaves it), "job":
+#   { "env": "WARDEN_JOB",
+#     "run": "warden-run --name lbterm-{command} --cpus 4 --mem 8 --max 2h -- pwsh -NoProfile -File {script} {command}{args}",
+#     "adopt": ["warden-run", "adopt", "{pid}"] }
+# `env` is the variable the queue gives every process it starts; `run` the line to start this
+# script in it instead; `adopt` the command that hands the job a test window started outside it
+# (motion\start-unfocused.ps1's -Job). Without "job", nothing is asked.
 
-# The settings in $Path, a JSON file of this PC's own, so the repo names none of its paths:
-#   guard        the thermal guard cargo runs under (guarded.sh, with cputemp.ps1 beside it)
-#   thermalStop  the file the guard writes at 91 C, after which it refuses everything
-#   config       the lbterm.lua test windows look like (New-TestConfig, motion/offscreen.ps1)
-# Each one missing (or the file) is $null. The guard comes back with slashes, since it runs under
-# Git's bash, whose dirname doesn't split at backslashes.
-function Get-DevSettings([Parameter(Mandatory)][string]$Path) {
-  $json = if (Test-Path -LiteralPath $Path) { Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
-  [pscustomobject]@{
-    guard       = if ($json.guard) { $json.guard -replace '\\', '/' }
-    thermalStop = $json.thermalStop
-    config      = $json.config
+# The PC's dev settings, or nothing without the file: LBTERM_DEV's file (a test's), else the PC's
+function Get-DevSettings([string]$File = ($env:LBTERM_DEV ? $env:LBTERM_DEV : (Join-Path $HOME '.config\lbterm\dev.json'))) {
+  if (-not (Test-Path -LiteralPath $File)) { return $null }
+  Get-Content -Raw -LiteralPath $File | ConvertFrom-Json
+}
+
+# Whether this process is in a Windows job object
+function Test-InJobObject {
+  if (-not ('LbtermJobObject' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class LbtermJobObject {
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+  public static bool Here() {
+    bool inJob;
+    return IsProcessInJob(System.Diagnostics.Process.GetCurrentProcess().Handle, IntPtr.Zero, out inJob) && inJob;
   }
 }
-
-# ---- Cargo under the thermal guard (lbterm.ps1's Invoke-Cargo) ----
-
-# What guarded.sh (the thermal guard) is told to run for $Command: Git's bash, writing
-# $Marker and then handing over to $Command with exec. The guard reads the CPU before it starts
-# anything and refuses with exit 1, so the marker is what tells its refusal from $Command's own
-# exit 1 (cargo exits 1 on a bad argument).
-function Get-GuardedCommand {
-  param(
-    [Parameter(Mandatory)][string]$Marker,
-    [Parameter(Mandatory)][string]$Command,
-    [string[]]$Arguments = @()
-  )
-  @('bash', '-c', ': > "$0" && exec "$@"', ($Marker -replace '\\', '/'), $Command) + @($Arguments)
-}
-
-# What to do after one guarded run that exited with $ExitCode, $Started saying whether the command
-# got going (its marker), on attempt $Attempt of $Attempts:
-#   done     it ran and passed
-#   failed   it ran and failed, or something other than the guard's refusal went wrong: never again
-#   stop     the guard refused for THERMAL-STOP ($ThermalStop), which stays until Lachlan deletes it
-#   retry    the guard refused (the CPU at 80 C or more, or HWiNFO not reporting): wait, run again
-#   refused  the guard refused on the last attempt
-function Get-GuardOutcome {
-  param(
-    [Parameter(Mandatory)][int]$ExitCode,
-    [Parameter(Mandatory)][bool]$Started,
-    [bool]$ThermalStop,
-    [Parameter(Mandatory)][int]$Attempt,
-    [Parameter(Mandatory)][int]$Attempts
-  )
-  if ($ExitCode -eq 0) { return 'done' }
-  if ($Started -or $ExitCode -ne 1) { return 'failed' }
-  if ($ThermalStop) { return 'stop' }
-  if ($Attempt -lt $Attempts) { 'retry' } else { 'refused' }
-}
-
-# Runs $Command under the thermal guard ($Guard, guarded.sh, through Git's $Bash), and again when
-# the guard refuses to start it, up to $Attempts runs in all. $Wait runs before each one
-# (lbterm.ps1 waits there for the CPU to cool below 78 C). With other builds running, the CPU
-# can climb back past 80 C between that wait and the guard's own reading a second later, and the
-# guard refuses. $Marker is the file Get-GuardedCommand writes as the command starts; $StopFile
-# is the guard's THERMAL-STOP. Throws unless the command ran and passed.
-function Invoke-Guarded {
-  param(
-    [Parameter(Mandatory)][string]$Bash,
-    [Parameter(Mandatory)][string]$Guard,
-    [Parameter(Mandatory)][string]$Command,
-    [string[]]$Arguments = @(),
-    [Parameter(Mandatory)][string]$Marker,
-    [string]$StopFile,
-    [ValidateRange(1, 100)][int]$Attempts = 5,
-    [scriptblock]$Wait = {}
-  )
-  $what = (@($Command) + @($Arguments)) -join ' '
-  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-    & $Wait
-    Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
-    & $Bash $Guard @(Get-GuardedCommand -Marker $Marker -Command $Command -Arguments $Arguments)
-    $code = $LASTEXITCODE
-    $started = Test-Path -LiteralPath $Marker
-    Remove-Item -LiteralPath $Marker -Force -ErrorAction SilentlyContinue
-    $stop = [bool]$StopFile -and (Test-Path -LiteralPath $StopFile)
-    switch (Get-GuardOutcome -ExitCode $code -Started $started -ThermalStop $stop -Attempt $attempt -Attempts $Attempts) {
-      'done' { return }
-      'failed' { throw "$what failed (exit $code)" }
-      'stop' {
-        $why = (Get-Content -LiteralPath $StopFile -Raw -ErrorAction SilentlyContinue) -replace '\s+$', ''
-        throw "The thermal guard refused to start $what because $StopFile is there ($why). Nothing builds until Lachlan deletes it."
-      }
-      'refused' { throw "The thermal guard refused to start $what $Attempts times: the CPU kept reaching 80 C before it could start (or HWiNFO stopped reporting)" }
-      'retry' { "lbterm.ps1: the thermal guard refused to start cargo (try $attempt of $Attempts); waiting for the CPU to cool, then trying again" }
-    }
+'@
   }
+  [LbtermJobObject]::Here()
+}
+
+# The command line's parameters after the command, as they'd be typed again: ' -Package a,b -NoSccache'
+function Format-LbtermArguments([System.Collections.IDictionary]$Bound) {
+  $out = foreach ($k in $Bound.Keys) {
+    if ($k -eq 'Command') { continue }
+    $v = $Bound[$k]
+    if ($v -is [switch]) { if ($v.IsPresent) { "-$k" } }
+    elseif ($v -is [array]) { "-$k $($v -join ',')" }
+    else { "-$k $v" }
+  }
+  -join ($out | ForEach-Object { " $_" })
+}
+
+# Why `lbterm.ps1 $Command` may not run cargo here, or nothing when it may: with the PC's "job"
+# setting, it runs only where its variable ($Value) is set and the process is in a job object ($InJob):
+# a process that left the job (a child started outside it) keeps the variable but not the job
+function Get-JobRefusal {
+  param(
+    $Settings,
+    [Parameter(Mandatory)][string]$Command,
+    [Parameter(Mandatory)][string]$Script,
+    [string]$Arguments = '',
+    [string]$Value,
+    [bool]$InJob
+  )
+  $job = $Settings.job
+  if (-not $job -or -not $job.env) { return $null }
+  if ($Value -and $InJob) { return $null }
+  $why = if (-not $Value) { "$($job.env) isn't set" } else { "$($job.env) is set but this process isn't in a job" }
+  $line = ([string]$job.run).Replace('{command}', $Command).Replace('{script}', $Script.Replace('\', '/')).Replace('{args}', $Arguments)
+  # A test-window run is a GPU job that only draws (--gpu-draw, since 2026-11-07: LBTerm has no
+  # compute pipeline and puts no model on the GPU, so it runs beside Earshot's listener), so the
+  # GPU's other rules hold for it (the warden's GPU jobs at once, a game open, the GPU's
+  # temperature); a measuring run (budgets) also takes the lock lbterm-measure, so no other LBTerm
+  # measurement runs beside it and skews its numbers (the warden runs up to 3 GPU jobs at once
+  # since 2026-11-04). e2e checks behaviour, not time: no lock
+  if ($Command -in 'e2e', 'budgets', 'look') {
+    $flags = if ($Command -eq 'budgets') { '--gpu-draw --lock lbterm-measure ' } else { '--gpu-draw ' }
+    $line = $line -replace '^(\S*warden-run(\.exe)?)\s', ('$1 ' + $flags)
+  }
+  $what = if ($Command -in 'e2e', 'budgets', 'look') {
+    'opens test windows, which this PC runs only inside a job, so the warden queues them while the PC is hot'
+  } else { 'runs cargo, which this PC runs only inside a job that holds it to its CPUs' }
+  "lbterm.ps1 $Command $what ($why). Start it in one:`n  $line"
+}
+
+# ---- Test-window runs named, and only while the displays are awake (lbterm.ps1 e2e, budgets) ----
+
+# Why `lbterm.ps1 e2e` or `budgets` won't start as asked, or nothing (Lachlan's 10a and 11a of
+# 2026-11-09). A whole set needs -AllScripts: the sets of 80 to 150 scripts the tracks of 2026-11-08 and 09
+# ran took two to three hours each, read as a fail on one script that fails on main's build too, and
+# told nothing a run of the named scripts wouldn't. And none while the displays sleep ($Asleep,
+# harness.psm1's Get-DisplaysAsleep, after Request-DisplaysAwake's hold has had its chance): DWM then plays no motion and blocks the draw step, so most
+# scripts fail on every build (PITFALLS 239)
+function Get-RunRefusal {
+  param([Parameter(Mandatory)][string]$Command, [string[]]$Only, [switch]$Smoke, [switch]$AllScripts, [string]$Against, [string]$Asleep)
+  if ($Command -eq 'look') {
+    # A look is one capture before and after a change: named scripts, and the build before
+    if (-not @($Only | Where-Object { $_ }).Count) { return 'lbterm.ps1 look shows named scripts only: -Only the scripts whose captures show the look that changed' }
+    if (-not $Against) { return 'lbterm.ps1 look needs the build before the change: -Against <dir> (a copy of the installed build, or main''s)' }
+  } elseif (-not @($Only | Where-Object { $_ }).Count -and -not $AllScripts -and -not ($Smoke -and $Command -eq 'e2e')) {
+    $what = if ($Command -eq 'e2e') { 'scripts with -Only, or run -Smoke (the smoke set and the scripts the branch changed, a branch''s last stage; e2e -Changed lists the ones whose Covers lines match it)' } else { 'scenarios with -Only' }
+    return "lbterm.ps1 $Command runs no whole set: name the $what. A failure is run again by name, beside main's build on that one alone. Every one needs -AllScripts, only when Lachlan asks for it (his 11a of 2026-11-09)"
+  }
+  if ($Asleep) { return "lbterm.ps1 $Command waits for the displays: $Asleep. Nothing it measures or captures can be judged until they wake (PITFALLS 239)" }
 }
 
 # ---- sccache (lbterm.ps1's Invoke-Cargo, unless -NoSccache) ----
@@ -207,6 +216,458 @@ function Get-SccacheEnvironment {
     $vars.SCCACHE_IGNORE_SERVER_IO_ERROR = '1'
   }
   $vars
+}
+
+# ---- One set of features for the build and the check's tests (lbterm-unify) ----
+
+# What the build asks cargo for: the four exes
+$LbtermBuildPackages = 'wezterm', 'wezterm-gui', 'wezterm-mux-server', 'strip-ansi-escapes'
+# The crates whose tests the check runs: config/src/lbterm.rs and wezterm/tests/lbterm.rs, plus
+# the rest of those two crates' tests, lbterm-motion (springs, curves, DComp cubics, the pane
+# layout planner) and lbterm-panel (the tab panel's rows, hover timing and layout), the parser and
+# terminal, which hold OSC 7501 (program_status.rs in each), mux (localpane.rs: process lists
+# refreshed off the GUI thread), lbterm-extras (the smaller additions' logic: taskbar progress,
+# scrollbar marks and hiding, the slow-frame log, the Conductor's seat and view), lbterm-triggers (rules, colours, what's new, the
+# hearts), lbterm-notify (OSC 99), codec (OSC 7501 records crossing from the mux server, a PDU zstd
+# can't compress going uncompressed), promise (a task named by where it was spawned,
+# tests\lbterm_spawn_site.rs), wezterm-client (a unix domain reconnecting when its server hangs
+# up, client.rs), mux-lua (Lua's spawn_tab, spawn_window and split starting in the folder
+# they're given) and wezterm-font (lbterm.rs: fonts sharing what their fallback searches found,
+# a reload of the same settings keeping them, the bundled fonts parsed once), lfucache (the
+# line caches' counts, and an entry just used kept while an older one can go) and wezterm-gui
+# (since feat/dcomp-recorder: the compositor's tests over a stand-in DirectComposition device,
+# compositor/recorder.rs, and the quads' hashes, the menus' fades, the new-tab pad and the line
+# keys, which ran only by hand before; lbterm/COMPOSITOR.md, "Checking it without a window", has
+# what it adds to the check)
+$LbtermTestPackages = 'config', 'wezterm', 'lbterm-motion', 'lbterm-panel', 'wezterm-escape-parser', 'wezterm-term',
+  'mux', 'lbterm-extras', 'lbterm-triggers', 'lbterm-notify', 'codec', 'promise', 'wezterm-client', 'mux-lua',
+  'wezterm-mux-server-impl', 'wezterm-font', 'lfucache', 'wezterm-gui'
+# The crate every cargo run of lbterm.ps1 selects as well, so they all agree on features
+$LbtermUnify = 'lbterm-unify'
+
+# Cargo works out a library's features from the packages a command names (and, for cargo test,
+# their dev-dependencies), and a library built with other features is another artifact, as is
+# everything above it. So the check's cargo test, naming other packages than the build, compiled
+# about 150 crates a second time (2026-10-24: 6 m 49 s after a 12 m 19 s build): upstream's test
+# libraries k9 and criterion turn on serde's alloc and windows-sys 0.59's Win32_System_Console,
+# and without wezterm-gui named, what it turns on in smallvec, winapi, bytemuck, ahash and the rest
+# was missing. lbterm-unify depends on each library that differs, with every feature any of
+# lbterm.ps1's selections turns on, and every cargo run names it too (the trick cargo-hakari plays,
+# without a line in each upstream Cargo.toml). `lbterm.ps1 unify` writes its Cargo.toml.
+
+# cargo tree's lines in `--prefix none -f "{p}|{f}"` form, as a map of "<name> v<version>" to its
+# name, version, source (registry, path or git), path and the union of its nodes' features.
+function ConvertFrom-CargoTree([AllowEmptyCollection()][string[]]$Lines) {
+  $map = [ordered]@{}
+  foreach ($line in $Lines) {
+    $l = ($line -replace ' \(\*\)\s*$', '').Trim()
+    if (-not $l -or $l -notmatch '\|') { continue }
+    $p, $f = $l -split '\|', 2
+    $p = $p -replace ' \(proc-macro\)', ''
+    if ($p -notmatch '^(?<name>\S+) v(?<ver>\S+)(?: \((?<src>.+)\))?$') { continue }
+    $key = "$($Matches.name) v$($Matches.ver)"
+    $src = $Matches.src
+    if (-not $map.Contains($key)) {
+      $map[$key] = [pscustomobject]@{
+        Name     = $Matches.name
+        Version  = $Matches.ver
+        Source   = if (-not $src) { 'registry' } elseif ($src -match '^[a-z+]+://') { 'git' } else { 'path' }
+        Path     = if ($src -and $src -notmatch '^[a-z+]+://') { $src }
+        Features = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
+        Variants = [Collections.Generic.HashSet[string]]::new()
+      }
+    }
+    $feats = @($f -split ',' | Where-Object { $_ })
+    foreach ($x in $feats) { [void]$map[$key].Features.Add($x) }
+    [void]$map[$key].Variants.Add(($feats | Sort-Object) -join ',')
+  }
+  $map
+}
+
+# The features a host (build scripts, proc macros and what they use) and a target (everything
+# else) resolve gives each library, from two cargo trees: $Target is the tree without proc macros
+# and build-dependencies, $Full the whole of it. Host is what the full tree has besides the target
+# side's variant, per library.
+function Split-CargoFeatures($Target, $Full) {
+  $hostSide = [ordered]@{}
+  foreach ($key in $Full.Keys) {
+    $variants = @($Full[$key].Variants | Where-Object { -not ($Target.Contains($key) -and $Target[$key].Variants.Contains($_)) })
+    if (-not $variants) { continue }
+    $p = $Full[$key]
+    $set = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($v in $variants) { foreach ($x in $v -split ',' | Where-Object { $_ }) { [void]$set.Add($x) } }
+    $hostSide[$key] = [pscustomobject]@{ Name = $p.Name; Version = $p.Version; Source = $p.Source; Path = $p.Path; Features = $set }
+  }
+  [pscustomobject]@{ Target = $Target; Host = $hostSide }
+}
+
+# The libraries that more than one of $Selections (a map of a selection's name to its
+# Split-CargoFeatures) resolve with different features, on the same side: each with the union of
+# its features across them, its side and the selections that differ.
+function Compare-CargoFeatures($Selections) {
+  foreach ($side in 'Target', 'Host') {
+    $seen = [ordered]@{}
+    foreach ($sel in $Selections.Keys) {
+      $map = $Selections[$sel].$side
+      foreach ($key in $map.Keys) {
+        if (-not $seen.Contains($key)) { $seen[$key] = [Collections.Generic.List[object]]::new() }
+        $seen[$key].Add([pscustomobject]@{ Selection = $sel; Package = $map[$key] })
+      }
+    }
+    foreach ($key in $seen.Keys) {
+      $in = $seen[$key]
+      if ($in.Count -lt 2) { continue }
+      $sets = @($in | ForEach-Object { @($_.Package.Features) -join ',' } | Sort-Object -Unique)
+      if ($sets.Count -lt 2) { continue }
+      $union = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
+      foreach ($i in $in) { foreach ($x in $i.Package.Features) { [void]$union.Add($x) } }
+      $p = $in[0].Package
+      [pscustomobject]@{
+        Key = $key; Side = $side; Name = $p.Name; Version = $p.Version; Source = $p.Source; Path = $p.Path
+        Features = @($union)
+        Missing = @($in | Where-Object { @($_.Package.Features).Count -lt $union.Count } | ForEach-Object Selection)
+      }
+    }
+  }
+}
+
+# lbterm-unify's Cargo.toml: a dependency on each of $Pins (Compare-CargoFeatures' libraries,
+# merged across rounds) with exactly its features, target-side ones as [dependencies] and host-side
+# ones as [build-dependencies]. $Dir is the crate's folder, which path dependencies are named from.
+function New-UnifyManifest {
+  param(
+    [AllowEmptyCollection()][object[]]$Pins = @(),
+    [Parameter(Mandatory)][string]$Dir
+  )
+  $lines = [Collections.Generic.List[string]]::new()
+  foreach ($l in @(
+      '[package]'
+      'name = "lbterm-unify"'
+      'version = "0.1.0"'
+      'edition = "2021"'
+      'description = "Never built into anything: every cargo run of lbterm.ps1 names it, so the build and the check''s tests resolve the same features and share their artifacts"'
+      'license = "MIT"'
+      'publish = false'
+      ''
+      '[lib]'
+      'path = "src/lib.rs"'
+      'test = false'
+      'doctest = false'
+      ''
+      '# Written by `lbterm.ps1 unify` (lbterm-lib.ps1, "One set of features"): every library that two of'
+      '# lbterm.ps1''s cargo runs would build with different features, with all of them. Do not edit by hand.')) { $lines.Add($l) }
+  foreach ($side in 'Target', 'Host') {
+    # (not $pins: PowerShell's names ignore case, so that would be -Pins)
+    $these = @($Pins | Where-Object Side -eq $side | Sort-Object Name, Version)
+    if (-not $these -and $side -eq 'Host') { continue }
+    $lines.Add('')
+    $lines.Add($(if ($side -eq 'Target') { '[dependencies]' } else { '[build-dependencies]' }))
+    $names = @($these | Group-Object Name | Where-Object Count -gt 1 | ForEach-Object Name)
+    foreach ($p in $these) {
+      $key = if ($names -contains $p.Name) { "$($p.Name)-$($p.Version -replace '[^0-9A-Za-z]', '_')" } else { $p.Name }
+      $where = switch ($p.Source) {
+        'registry' { "version = `"$($p.Version)`"" }
+        'path' { "path = `"$([IO.Path]::GetRelativePath($Dir, $p.Path) -replace '\\', '/')`"" }
+        default { throw "$($p.Name) $($p.Version) comes from git, which lbterm.ps1 unify doesn't pin: pin it by hand" }
+      }
+      $pkg = if ($key -ne $p.Name) { "package = `"$($p.Name)`", " } else { '' }
+      $feats = (@($p.Features) | ForEach-Object { "`"$_`"" }) -join ', '
+      $lines.Add("$key = { $pkg$where, default-features = false, features = [$feats] }")
+    }
+  }
+  ($lines -join "`n") + "`n"
+}
+
+# What every cargo run's features depend on, as one hash: Cargo.lock, every Cargo.toml in the
+# tree, the selections and cargo's version. The check compares the features again only when it
+# changes (Assert-Unified in lbterm.ps1).
+function Get-UnifyKey {
+  param(
+    [Parameter(Mandatory)][string]$Repo,
+    [string]$Cargo = ''
+  )
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $parts = [Collections.Generic.List[string]]::new()
+  $parts.Add($Cargo)
+  $parts.Add(($LbtermBuildPackages + '|' + $LbtermTestPackages + '|' + $LbtermUnify) -join ',')
+  # A pathspec's * crosses folders, so this is every Cargo.toml, committed or not
+  $files = @(git -C $Repo ls-files --cached --others --exclude-standard -- 'Cargo.lock' '*Cargo.toml' | Sort-Object -Unique)
+  foreach ($f in $files) {
+    $path = Join-Path $Repo $f
+    if (Test-Path -LiteralPath $path) { $parts.Add("$f`n$([IO.File]::ReadAllText($path))") }
+  }
+  $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($parts -join "`n`0"))
+  ([BitConverter]::ToString($bytes) -replace '-', '').Substring(0, 16).ToLowerInvariant()
+}
+
+# ---- Pester beside cargo (lbterm.ps1 check) ----
+
+# Starts lbterm\tests' Pester run in a pwsh of its own, its output going to $Log, so the check
+# can build while it runs (it needs no build, and spends most of its 100 s waiting on git and
+# bash). Wait-PesterRun prints the log and gives its exit code.
+function Start-PesterRun {
+  param(
+    [Parameter(Mandatory)][string]$Tests,
+    [Parameter(Mandatory)][string]$Log,
+    [string]$Pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe',
+    # Test files under $Tests to leave out
+    [string[]]$Exclude = @()
+  )
+  New-Item -ItemType Directory -Force (Split-Path $Log) | Out-Null
+  if (Test-Path -LiteralPath $Log) { Remove-Item -LiteralPath $Log -Force }
+  $q = { param($s) "'" + ($s -replace "'", "''") + "'" }
+  # Run.Exit: Pester's own exit code, non-zero when a test fails (*> takes every stream, its result
+  # object too). A Pester that won't load stops the script, so pwsh exits 1 rather than 0.
+  $cmd = @(
+    "`$ErrorActionPreference = 'Stop'"
+    'Import-Module Pester -MinimumVersion 5.0'
+    '$c = New-PesterConfiguration'
+    "`$c.Run.Path = $(& $q $Tests)"
+    if ($Exclude) { "`$c.Run.ExcludePath = @($(($Exclude | ForEach-Object { & $q $_ }) -join ', '))" }
+    '$c.Run.Exit = $true'
+    "`$c.Output.Verbosity = 'Normal'"
+    "Invoke-Pester -Configuration `$c *> $(& $q $Log)"
+  ) -join "`n"
+  $psi = [Diagnostics.ProcessStartInfo]::new($Pwsh)
+  foreach ($a in '-NoProfile', '-NonInteractive', '-Command', $cmd) { $psi.ArgumentList.Add($a) }
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  [pscustomobject]@{ Process = [Diagnostics.Process]::Start($psi); Log = $Log; Started = Get-Date }
+}
+
+# Waits for Start-PesterRun's run, prints its log (not with -Quiet), and gives its exit code
+function Wait-PesterRun($Run, [switch]$Quiet) {
+  $Run.Process.WaitForExit()
+  if (-not $Quiet -and (Test-Path -LiteralPath $Run.Log)) { Get-Content -LiteralPath $Run.Log | Out-Host }
+  $Run.Process.ExitCode
+}
+
+# Ends Start-PesterRun's run if it's still going (the check failed before it was waited for)
+function Stop-PesterRun($Run) {
+  if ($Run -and -not $Run.Process.HasExited) { try { $Run.Process.Kill($true) } catch {} }
+}
+
+# ---- Build slots (lbterm.ps1 slot) ----
+
+# A worktree built from nothing takes 11 to 12 minutes, so a branch starts in a slot instead: one of
+# a few worktrees, .claude\worktrees\slot-<n>, that are never removed. Each is locked with this
+# reason, so land keeps it, build and all, and moves it to main with nothing checked out (Backup's
+# land, a reason starting "slot"); the next branch made there rebuilds only what's changed.
+# Lachlan's pick of four on 2026-10-24, six since 2026-10-31 ("we can probably allow 6 slots")
+$LbtermSlotCount = 6
+$LbtermSlotReason = 'slot: an LBTerm build slot (lbterm.ps1 slot); land keeps it and its build, moved to main'
+
+# git with its output and exit code, never on the console
+function Invoke-LbtermGit([string]$Dir, [string[]]$Arg) {
+  $out = & git -C $Dir @Arg 2>&1
+  [pscustomobject]@{ Code = $LASTEXITCODE; Lines = @($out | ForEach-Object { "$_" } | Where-Object { $_ }) }
+}
+
+# `git worktree list --porcelain`, the main checkout first
+function Get-GitWorktrees([Parameter(Mandatory)][string]$Repo) {
+  $list = [Collections.Generic.List[object]]::new()
+  foreach ($l in (Invoke-LbtermGit $Repo @('worktree', 'list', '--porcelain')).Lines) {
+    if ($l.StartsWith('worktree ')) {
+      $list.Add([pscustomobject]@{ Path = [IO.Path]::GetFullPath($l.Substring(9)); Head = $null; Branch = $null; Locked = $false; LockReason = '' })
+    } elseif ($list.Count -and $l.StartsWith('HEAD ')) { $list[-1].Head = $l.Substring(5) }
+    elseif ($list.Count -and $l.StartsWith('branch refs/heads/')) { $list[-1].Branch = $l.Substring(18) }
+    elseif ($list.Count -and $l -match '^locked\b ?(.*)$') { $list[-1].Locked = $true; $list[-1].LockReason = $Matches[1] }
+  }
+  $list
+}
+
+# The slots of the repo whose main checkout is $Main, made or not: slot-1 to slot-$Count
+function Get-LbtermSlots {
+  param(
+    [Parameter(Mandatory)][string]$Main,
+    [int]$Count = $LbtermSlotCount,
+    [string]$Base = 'main'
+  )
+  $trees = @(Get-GitWorktrees $Main)
+  foreach ($n in 1..$Count) {
+    $path = [IO.Path]::GetFullPath((Join-Path $Main ".claude\worktrees\slot-$n"))
+    $t = $trees | Where-Object { $_.Path -eq $path } | Select-Object -First 1
+    $isSlot = [bool]$t -and $t.Locked -and $t.LockReason -match '^slot\b'
+    $behind = if ($t -and $t.Head) { [int](Invoke-LbtermGit $Main @('rev-list', '--count', "$($t.Head)..$Base")).Lines[0] }
+    [pscustomobject]@{
+      Name = "slot-$n"; Path = $path; Exists = [bool]$t; IsSlot = $isSlot
+      Branch = $t.Branch; Head = $t.Head; Behind = $behind
+      Free = $isSlot -and -not $t.Branch
+    }
+  }
+}
+
+# Holds $Slot for a moment, so two sessions taking one at once can't both have it: a file in its
+# own git folder, made only if it isn't there (or is older than $Minutes: a claim that died).
+function Lock-LbtermSlot($Slot, [int]$Minutes = 10) {
+  $gitDir = (Invoke-LbtermGit $Slot.Path @('rev-parse', '--absolute-git-dir')).Lines[0]
+  if (-not $gitDir) { return $null }
+  $file = Join-Path $gitDir 'lbterm-slot-claim'
+  for ($try = 0; $try -lt 2; $try++) {
+    try {
+      $s = [IO.File]::Open($file, 'CreateNew', 'Write', 'None')
+      $w = [IO.StreamWriter]::new($s); $w.Write("pid $PID at $(Get-Date -Format o)"); $w.Dispose()
+      return $file
+    } catch [IO.IOException] {
+      $age = (Get-Date) - [IO.File]::GetLastWriteTime($file)
+      if ($try -or $age.TotalMinutes -lt $Minutes) { return $null }
+      Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+# A slot for $Branch in the repo whose main checkout is $Main: a free one (the closest to $Base,
+# so the least to rebuild), else a new one while there are fewer than $Count and the disk has
+# $MinFreeGB to spare. The branch is made from $Base there, or checked out if it's there already.
+# A result with Path when it has one; with Busy (the slots and their branches) or Refused when not.
+function Request-LbtermSlot {
+  param(
+    [Parameter(Mandatory)][string]$Main,
+    [Parameter(Mandatory)][string]$Branch,
+    [string]$Base = 'main',
+    [int]$Count = $LbtermSlotCount,
+    [double]$MinFreeGB = 20,
+    [double]$FreeGB = -1
+  )
+  $trees = @(Get-GitWorktrees $Main)
+  $has = $trees | Where-Object Branch -eq $Branch | Select-Object -First 1
+  if ($has) { throw "$Branch is checked out already, in $($has.Path)" }
+  $exists = -not (Invoke-LbtermGit $Main @('rev-parse', '--verify', '--quiet', "refs/heads/$Branch")).Code
+  $switch = if ($exists) { @('switch', '--quiet', $Branch) } else { @('switch', '--quiet', '-c', $Branch, $Base) }
+  $slots = @(Get-LbtermSlots -Main $Main -Count $Count -Base $Base)
+
+  foreach ($s in $slots | Where-Object Free | Sort-Object Behind) {
+    $claim = Lock-LbtermSlot $s
+    if (-not $claim) { continue }
+    try {
+      $again = Get-GitWorktrees $Main | Where-Object { $_.Path -eq $s.Path } | Select-Object -First 1
+      if (-not $again -or $again.Branch) { continue }
+      if ((Invoke-LbtermGit $s.Path @('status', '--porcelain')).Lines.Count) { continue }
+      $r = Invoke-LbtermGit $s.Path $switch
+      if ($r.Code) { throw "git switch in $($s.Path) failed: $($r.Lines -join ' ')" }
+      return [pscustomobject]@{ Path = $s.Path; Name = $s.Name; New = $false; Behind = $s.Behind }
+    } finally { Remove-Item -LiteralPath $claim -Force -ErrorAction SilentlyContinue }
+  }
+
+  $missing = $slots | Where-Object { -not $_.Exists } | Select-Object -First 1
+  if ($missing) {
+    if ($FreeGB -lt 0) { $FreeGB = (Get-PSDrive ([IO.Path]::GetPathRoot($Main).Substring(0, 1))).Free / 1GB }
+    if ($FreeGB -lt $MinFreeGB) {
+      return [pscustomobject]@{ Refused = "a new slot would need about 9 to 13 GB once built, and $('{0:N1}' -f $FreeGB) GB is free (under the $MinFreeGB GB a new slot asks for)"; Slots = $slots }
+    }
+    # Made with the branch out, so no other session can take it as free before it's ours
+    $add = if ($exists) { @('worktree', 'add', '--quiet', $missing.Path, $Branch) } else { @('worktree', 'add', '--quiet', '-b', $Branch, $missing.Path, $Base) }
+    $r = Invoke-LbtermGit $Main $add
+    if (-not $r.Code) {
+      $l = Invoke-LbtermGit $Main @('worktree', 'lock', '--reason', $LbtermSlotReason, $missing.Path)
+      if ($l.Code) { throw "made $($missing.Path) but couldn't lock it as a slot: $($l.Lines -join ' ')" }
+      return [pscustomobject]@{ Path = $missing.Path; Name = $missing.Name; New = $true; Behind = 0 }
+    }
+    # another session made it in between: it's that one's
+  }
+  [pscustomobject]@{ Busy = @($slots | Where-Object Exists); Slots = $slots }
+}
+
+# Puts slot $Name back without landing its branch (given up, or carried on elsewhere): it moves to
+# $Base with nothing checked out, and the branch stays. Refuses uncommitted work.
+function Clear-LbtermSlot {
+  param(
+    [Parameter(Mandatory)][string]$Main,
+    [Parameter(Mandatory)][string]$Name,
+    [string]$Base = 'main'
+  )
+  $s = Get-LbtermSlots -Main $Main -Count 99 -Base $Base | Where-Object { $_.Name -eq $Name -or $_.Path -eq [IO.Path]::GetFullPath($Name) } | Select-Object -First 1
+  if (-not $s -or -not $s.IsSlot) { throw "$Name isn't a slot" }
+  if (-not $s.Branch) { return "$($s.Name) is free already" }
+  $dirty = (Invoke-LbtermGit $s.Path @('status', '--porcelain')).Lines
+  if ($dirty.Count) { throw "$($s.Name) has $($dirty.Count) uncommitted change(s) on $($s.Branch): commit them or throw them away first" }
+  $r = Invoke-LbtermGit $s.Path @('switch', '--quiet', '--detach', $Base)
+  if ($r.Code) { throw "git switch --detach $Base in $($s.Path) failed: $($r.Lines -join ' ')" }
+  $ahead = (Invoke-LbtermGit $Main @('rev-list', '--count', "$Base..$($s.Branch)")).Lines[0]
+  "$($s.Name) is free, on $Base; $($s.Branch) stays, with $ahead commit(s) $Base doesn't have"
+}
+
+# ---- What builds and test runs leave behind (every build and e2e run, and lbterm.ps1 prune) ----
+
+# A tree's target\ grows as it's used, and cargo prunes none of it (.claude/docs/building.md, "A
+# slot's target"): rustc keeps an incremental folder for each crate and fingerprint, and a new
+# fingerprint (main merged in, unify, the tests' build beside the release one) leaves the old
+# folder where it was; and e2e keeps every run's output, captures included. With six slots at 9 to
+# 22 GB each, C: fell under the warden's 20 GB floor and every job on the PC was refused, on
+# 2026-11-04 and again on 2026-11-08 (Root's InMail, Lachlan's 1b: LBTerm keeps its slots small).
+
+# The incremental folders in $Dir (a tree's target\release\incremental, <crate>-<hash> each) no
+# build has written in $IdleDays days and that are more than $MarginDays older than their crate's
+# newest there. So a tree keeps each crate's last folder (the release build's and the tests' both,
+# built within a day of each other), and the next build makes one that went again, for that crate
+# only. rustc makes a session folder in a crate's folder each time it compiles it, so one in use
+# was written minutes ago.
+function Get-StaleIncremental {
+  param(
+    [Parameter(Mandatory)][string]$Dir,
+    [datetime]$Now = (Get-Date),
+    [double]$IdleDays = 2,
+    [double]$MarginDays = 1
+  )
+  if (-not (Test-Path -LiteralPath $Dir)) { return }
+  $crates = Get-ChildItem -LiteralPath $Dir -Directory | Group-Object { $_.Name -replace '-[^-]+$', '' }
+  foreach ($c in $crates) {
+    $newest = ($c.Group | Measure-Object LastWriteTime -Maximum).Maximum
+    $c.Group | Where-Object { $_.LastWriteTime -lt $Now.AddDays(-$IdleDays) -and $_.LastWriteTime -lt $newest.AddDays(-$MarginDays) }
+  }
+}
+
+# The e2e runs in $Dir (a tree's target\e2e, each a folder named by when it started) last written
+# more than $KeepDays ago, never the newest: a run's captures and logs are read while its branch is
+# worked on, and a branch that lands takes no run with it
+function Get-StaleRuns {
+  param(
+    [Parameter(Mandatory)][string]$Dir,
+    [datetime]$Now = (Get-Date),
+    [double]$KeepDays = 3
+  )
+  if (-not (Test-Path -LiteralPath $Dir)) { return }
+  $runs = @(Get-ChildItem -LiteralPath $Dir -Directory | Where-Object Name -match '^\d{8}-\d{6}' | Sort-Object LastWriteTime)
+  if ($runs.Count -lt 2) { return }
+  $runs[0..($runs.Count - 2)] | Where-Object { $_.LastWriteTime -lt $Now.AddDays(-$KeepDays) }
+}
+
+# Deletes from $Tree (the main checkout or a worktree) what Get-StaleIncremental (incremental)
+# and Get-StaleRuns (runs) pick. What went, its size, and any folder that couldn't go (a file in
+# it held open), which stays for the next time.
+function Remove-StaleBuildFiles {
+  param(
+    [Parameter(Mandatory)][string]$Tree,
+    [ValidateSet('incremental', 'runs')][string[]]$What = @('incremental', 'runs'),
+    [datetime]$Now = (Get-Date)
+  )
+  $stale = @(
+    if ('incremental' -in $What) { Get-StaleIncremental -Dir (Join-Path $Tree 'target\release\incremental') -Now $Now }
+    if ('runs' -in $What) {
+      Get-StaleRuns -Dir (Join-Path $Tree 'target\e2e') -Now $Now
+      Get-StaleRuns -Dir (Join-Path $Tree 'target\look') -Now $Now
+    }
+  )
+  $bytes = 0L
+  $gone = 0
+  $kept = [Collections.Generic.List[string]]::new()
+  foreach ($d in $stale) {
+    $size = [long](Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    try {
+      Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop
+      $bytes += $size
+      $gone++
+    } catch { $kept.Add("$($d.FullName): $($_.Exception.Message)") }
+  }
+  [pscustomobject]@{ Tree = $Tree; Folders = $gone; Bytes = $bytes; Kept = @($kept) }
+}
+
+# One line for what Remove-StaleBuildFiles did in a tree, or nothing when it did nothing
+function Format-StaleBuildFiles($Result, [string]$What) {
+  $lines = @()
+  if ($Result.Folders) { $lines += "pruned $($Result.Folders) $What folder(s) ($('{0:N1}' -f ($Result.Bytes / 1GB)) GB) from $($Result.Tree)" }
+  foreach ($k in $Result.Kept) { $lines += "couldn't prune $k" }
+  $lines
 }
 
 # Copies a build's files from $From to $To, version.txt too when $From has one. A running LBTerm
@@ -552,7 +1013,8 @@ function ConvertTo-LbtermLogKey([AllowEmptyString()][string]$Message) {
 
 # The ERROR and WARN entries of $Logs (since $Since) grouped by kind: level, target and
 # ConvertTo-LbtermLogKey's message. Each with Count, First, Last and the Logs it's in; most often
-# first. Slow-frame lines are left to Group-LbtermSlowFrames.
+# first. Slow-frame lines are left to Group-LbtermSlowFrames, and the budget's to
+# Group-LbtermBudgetLines.
 function Group-LbtermLogProblems {
   param([object[]]$Logs, [Nullable[datetime]]$Since)
   $groups = @{}
@@ -561,7 +1023,7 @@ function Group-LbtermLogProblems {
   foreach ($log in $Logs) {
     foreach ($e in $log.Entries) {
       if ($e.Level -ne 'ERROR' -and $e.Level -ne 'WARN') { continue }
-      if ($e.Target -eq $LbtermSlowTarget) { continue }
+      if ($e.Target -eq $LbtermSlowTarget -or $e.Target -eq $LbtermBudgetTarget) { continue }
       if ($null -ne $Since -and $e.Time -lt $Since) { continue }
       # Normalised once per distinct message: most are the same few lines again and again
       $message = $keys[$e.Message]
@@ -640,6 +1102,138 @@ function Group-LbtermSlowFrames {
   $groups.Values | Sort-Object @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Worst'; Descending = $true }
 }
 
+# The budget's lines' target (perf/budgets, lbterm/PERF.md): what ran at rest, and actions over their
+# time. Each shape as lbterm-extras/src/budget.rs writes it; its tests hold the same shapes
+$LbtermBudgetTarget = 'lbterm::budget'
+$LbtermBudgetFrames = [regex]'^window-(?<window>\d+) painted (?<n>\d+) frames (?:in (?<s>\d+) s at rest|at rest in (?<spans>\d+) more spans? of \d+ s in the last \d+ s), asked by (?<sites>.+)$'
+$LbtermBudgetRuns = [regex]'^(?<kind>timers fired|tasks ran) (?<n>\d+) times (?:in (?<s>\d+) s at rest|at rest in (?<spans>\d+) more spans? of \d+ s in the last \d+ s)(?:, (?<ms>\d+(?:\.\d+)?) ms in all)?: (?<sites>.+)$'
+$LbtermBudgetAction = [regex]'^(?<action>[a-z-]+) took (?<ms>\d+(?:\.\d+)?) ms, (?<over>\d+(?:\.\d+)?) ms over its (?<budget>\d+(?:\.\d+)?) ms: (?<went>.+)$'
+$LbtermBudgetActions = [regex]'^(?<action>[a-z-]+): (?<n>\d+) times over its (?<budget>\d+(?:\.\d+)?) ms in the last (?<s>\d+) s, max (?<ms>\d+(?:\.\d+)?) ms$'
+
+# 'a.rs:1 (300), b.rs:2 (12, 4.5 ms), and 3 more (9); and 2 nobody asked for' as its sites, most
+# first: Site, Count and Ms (tasks only). What follows the first '; ' is notes, not sites
+function ConvertFrom-LbtermBudgetSites([string]$Text) {
+  $list = ($Text -split '; ', 2)[0]
+  foreach ($part in ($list -split ', (?=\S+ \(|and \d+ more \()')) {
+    if ($part -match '^(?<site>\S+) \((?<n>\d+)(?:, (?<ms>\d+(?:\.\d+)?) ms)?\)$') {
+      [pscustomobject]@{
+        Site  = $Matches['site']
+        Count = [int]$Matches['n']
+        Ms    = if ($Matches['ms']) { [double]::Parse($Matches['ms'], [cultureinfo]::InvariantCulture) } else { $null }
+      }
+    } elseif ($part -match '^and (?<k>\d+) more \((?<n>\d+)\)$') {
+      [pscustomobject]@{ Site = "($($Matches['k']) more)"; Count = [int]$Matches['n']; Ms = $null }
+    }
+  }
+}
+
+# A budget line's message: Kind (frames, timers, tasks or action), What (the window, or the
+# action's name), Count (frames, timers or tasks at rest, or actions over), Spans (how many 10 s
+# spans it covers, an action's line 1), Ms (the tasks' time, or how long the action took, the
+# longest in a summary), Budget (an action's time), Sites (who asked, or what the time went on,
+# most first) and Top (the first of them). Nothing for any other message.
+function ConvertFrom-LbtermBudgetLine([AllowEmptyString()][string]$Message) {
+  $num = { param($s) if ($s) { [double]::Parse($s, [cultureinfo]::InvariantCulture) } else { $null } }
+  $m = $LbtermBudgetFrames.Match($Message)
+  if ($m.Success) {
+    $sites = @(ConvertFrom-LbtermBudgetSites $m.Groups['sites'].Value)
+    return [pscustomobject]@{
+      Kind = 'frames'; What = "window-$($m.Groups['window'].Value)"; Count = [int]$m.Groups['n'].Value
+      Spans = if ($m.Groups['spans'].Success) { [int]$m.Groups['spans'].Value } else { 1 }
+      Ms = $null; Budget = $null; Sites = $sites; Top = if ($sites) { $sites[0].Site } else { '' }
+    }
+  }
+  $m = $LbtermBudgetRuns.Match($Message)
+  if ($m.Success) {
+    $sites = @(ConvertFrom-LbtermBudgetSites $m.Groups['sites'].Value)
+    return [pscustomobject]@{
+      Kind = if ($m.Groups['kind'].Value -eq 'timers fired') { 'timers' } else { 'tasks' }
+      What = 'process'; Count = [int]$m.Groups['n'].Value
+      Spans = if ($m.Groups['spans'].Success) { [int]$m.Groups['spans'].Value } else { 1 }
+      Ms = & $num $m.Groups['ms'].Value; Budget = $null; Sites = $sites; Top = if ($sites) { $sites[0].Site } else { '' }
+    }
+  }
+  $m = $LbtermBudgetAction.Match($Message)
+  if ($m.Success) {
+    $went = foreach ($part in ($m.Groups['went'].Value -split ', ')) {
+      if ($part -match '^(?<kind>message|task|paint) (?<site>\S+) (?<ms>\d+(?:\.\d+)?) ms(?: \((?<n>\d+)\))?$') {
+        [pscustomobject]@{ Site = "$($Matches['kind']) $($Matches['site'])"; Count = if ($Matches['n']) { [int]$Matches['n'] } else { 1 }; Ms = & $num $Matches['ms'] }
+      } elseif ($part -match '^(?<what>others|the rest) (?<ms>\d+(?:\.\d+)?) ms$') {
+        [pscustomobject]@{ Site = $Matches['what']; Count = 0; Ms = & $num $Matches['ms'] }
+      }
+    }
+    $went = @($went)
+    return [pscustomobject]@{
+      Kind = 'action'; What = $m.Groups['action'].Value; Count = 1; Spans = 1
+      Ms = & $num $m.Groups['ms'].Value; Budget = & $num $m.Groups['budget'].Value
+      Sites = $went; Top = if ($went) { $went[0].Site } else { '' }
+    }
+  }
+  $m = $LbtermBudgetActions.Match($Message)
+  if ($m.Success) {
+    # The 10 s's first was said on a line of its own: these are the rest
+    return [pscustomobject]@{
+      Kind = 'action'; What = $m.Groups['action'].Value; Count = [int]$m.Groups['n'].Value - 1; Spans = 0
+      Ms = & $num $m.Groups['ms'].Value; Budget = & $num $m.Groups['budget'].Value; Sites = @(); Top = ''
+    }
+  }
+}
+
+# The budget's lines of $Logs (since $Since) grouped: what ran at rest by its kind and who asked
+# most (Count added up, Worst the most in one line, Ms the tasks' time), and actions over their
+# time by action (Count of them, Worst the longest, Budget its time, Top what the time went on
+# most often first). Each with Lines, First, Last and Logs; at rest first, the most first
+function Group-LbtermBudgetLines {
+  param([object[]]$Logs, [Nullable[datetime]]$Since)
+  $groups = @{}
+  $seen = [Collections.Generic.HashSet[string]]::new()
+  foreach ($log in $Logs) {
+    foreach ($e in $log.Entries) {
+      if ($e.Target -ne $LbtermBudgetTarget) { continue }
+      if ($null -ne $Since -and $e.Time -lt $Since) { continue }
+      $b = ConvertFrom-LbtermBudgetLine $e.Message
+      if (-not $b) { continue }
+      $key = if ($b.Kind -eq 'action') { "action|$($b.What)" } else { "$($b.Kind)|$($b.Top)" }
+      $g = $groups[$key]
+      if (-not $g) {
+        $g = $groups[$key] = [pscustomobject]@{
+          Kind = $b.Kind; Site = if ($b.Kind -eq 'action') { $b.What } else { $b.Top }; Count = 0; Lines = 0
+          Worst = 0.0; Ms = 0.0; Budget = $b.Budget; Tops = @{}; Top = ''
+          First = $e.Time; Last = $e.Time; Logs = [Collections.Generic.List[object]]::new()
+        }
+      }
+      $g.Count += $b.Count
+      $g.Lines++
+      $worst = if ($b.Kind -eq 'action') { $b.Ms } else { $b.Count }
+      if ($worst -gt $g.Worst) { $g.Worst = $worst }
+      if ($b.Kind -eq 'tasks' -and $b.Ms) { $g.Ms += $b.Ms }
+      if ($b.Kind -eq 'action' -and $b.Top) { $g.Tops[$b.Top] = 1 + [int]$g.Tops[$b.Top] }
+      if ($e.Time -lt $g.First) { $g.First = $e.Time }
+      if ($e.Time -gt $g.Last) { $g.Last = $e.Time }
+      if ($seen.Add("$key|$($log.Path)")) { $g.Logs.Add($log) }
+    }
+  }
+  foreach ($g in $groups.Values) {
+    if ($g.Tops.Count) { $g.Top = ($g.Tops.GetEnumerator() | Sort-Object @{ Expression = 'Value'; Descending = $true }, Name | Select-Object -First 1).Name }
+  }
+  $order = @{ frames = 0; timers = 1; tasks = 2; action = 3 }
+  $groups.Values | Sort-Object @{ Expression = { $order[$_.Kind] } }, @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Worst'; Descending = $true }
+}
+
+# The -Budget view: what ran at rest, then what was over its time
+function Format-LbtermBudget([object[]]$Groups) {
+  foreach ($g in $Groups) {
+    if ($g.Kind -eq 'action') {
+      '{0,6}  over    {1,-14}  worst {2,7:0.#} ms, its {3} ms{4}' -f $g.Count, $g.Site, $g.Worst, $g.Budget, $(if ($g.Top) { "; mostly $($g.Top)" } else { '' })
+    } else {
+      $time = if ($g.Kind -eq 'tasks' -and $g.Ms) { (', {0:0.#} ms' -f $g.Ms) } else { '' }
+      $who = @{ frames = 'asked by'; timers = 'armed at'; tasks = 'spawned at' }[$g.Kind]
+      '{0,6}  {1,-6}  at rest{2}, at most {3} in a line, most {4} {5}' -f $g.Count, $g.Kind, $time, $g.Worst, $who, $g.Site
+    }
+    "        $($g.Lines) line$(if ($g.Lines -ne 1) { 's' }) $(Format-LbtermSeen $g)"
+  }
+}
+
 # How many of $Logs are of each kind: 'daily 2, test 40'
 function Format-LbtermLogKinds([object[]]$Logs) {
   $counts = foreach ($k in $LbtermLogKinds) {
@@ -708,8 +1302,8 @@ function Format-LbtermSlowFrames([object[]]$Groups) {
 # ---- The public repo (lbterm.ps1 publish) ----
 
 # What the public repo leaves out: the notes and memory for Claude, which name this PC's paths and
-# Lachlan's other projects
-$PublishExcludes = '.claude', 'CLAUDE.md'
+# Lachlan's other projects, and the contract (api.json), which says what those projects use of it
+$PublishExcludes = '.claude', 'CLAUDE.md', 'api.json'
 
 # The tree of $Commit in $Repo less $Exclude, written as a tree object through an index of its own
 # (the checkout's own is untouched); its id. Submodules stay the commits they are.

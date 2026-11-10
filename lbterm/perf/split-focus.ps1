@@ -23,7 +23,7 @@ param([string]$Bin)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test 'split-focus' -Bin $Bin
-$sock = Join-Path $T.Out 'sock'
+$sock = $T.Sock
 $cfg = Join-Path $T.Out 'config\split.lua'
 $emit = Join-Path $T.Out 'emit.ps1'
 $ask = Join-Path $T.Out 'ask.txt'
@@ -46,6 +46,7 @@ return {
   front_end = 'WebGpu',
   window_close_confirmation = 'NeverPrompt',
   lbterm_crash_restore = false,
+  wsl_domains = {},
   default_prog = { 'C:/Program Files/PowerShell/7/pwsh.exe', '-NoProfile', '-File', '$(ConvertTo-LuaPath $emit)' },
   default_cwd = 'C:/Windows',
   unix_domains = { {

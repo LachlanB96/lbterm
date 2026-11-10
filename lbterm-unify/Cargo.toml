@@ -1,0 +1,73 @@
+[package]
+name = "lbterm-unify"
+version = "0.1.0"
+edition = "2021"
+description = "Never built into anything: every cargo run of lbterm.ps1 names it, so the build and the check's tests resolve the same features and share their artifacts"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+
+# Written by `lbterm.ps1 unify` (lbterm-lib.ps1, "One set of features"): every library that two of
+# lbterm.ps1's cargo runs would build with different features, with all of them. Do not edit by hand.
+
+[dependencies]
+ahash = { version = "0.8.12", default-features = false, features = ["default", "getrandom", "runtime-rng", "std"] }
+anstream = { version = "1.0.0", default-features = false, features = ["auto", "default", "wincon"] }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc", "default", "std"] }
+bitflags = { version = "2.13.1", default-features = false, features = ["serde", "serde_core", "std"] }
+bytemuck = { version = "1.25.2", default-features = false, features = ["aarch64_simd", "bytemuck_derive", "derive", "extern_crate_alloc", "min_const_generics", "wasm_simd"] }
+clap = { version = "4.6.6", default-features = false, features = ["color", "default", "derive", "error-context", "help", "std", "suggestions", "usage"] }
+clap_builder = { version = "4.6.6", default-features = false, features = ["color", "error-context", "help", "std", "suggestions", "usage"] }
+crossbeam-utils = { version = "0.8.22", default-features = false, features = ["default", "std"] }
+euclid = { version = "0.22.14", default-features = false, features = ["default", "std"] }
+futures-channel = { version = "0.3.33", default-features = false, features = ["alloc", "futures-sink", "sink", "std"] }
+futures-core = { version = "0.3.33", default-features = false, features = ["alloc", "std"] }
+futures-io = { version = "0.3.33", default-features = false, features = ["default", "std"] }
+futures-lite = { version = "2.6.1", default-features = false, features = ["alloc", "default", "fastrand", "futures-io", "parking", "race", "std"] }
+futures-sink = { version = "0.3.33", default-features = false, features = ["alloc", "std"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["alloc", "async-await", "async-await-macro", "channel", "futures-channel", "futures-io", "futures-macro", "futures-sink", "io", "memchr", "sink", "slab", "std"] }
+getrandom = { version = "0.2.17", default-features = false, features = ["js", "js-sys", "rdrand", "std", "wasm-bindgen"] }
+half = { version = "2.7.1", default-features = false, features = ["alloc", "default", "num-traits", "std"] }
+hex = { version = "0.4.3", default-features = false, features = ["alloc", "std"] }
+lbterm-notify = { path = "../lbterm-notify", default-features = false, features = ["serde", "use_serde"] }
+libc = { version = "0.2.189", default-features = false, features = ["default", "extra_traits", "std"] }
+libm = { version = "0.2.16", default-features = false, features = ["arch", "default"] }
+log = { version = "0.4.33", default-features = false, features = ["std"] }
+memchr = { version = "2.8.3", default-features = false, features = ["alloc", "default", "std"] }
+nix = { version = "0.29.0", default-features = false, features = ["default", "fs", "mman", "term"] }
+num-rational = { version = "0.4.2", default-features = false, features = ["default", "num-bigint", "num-bigint-std", "std"] }
+num-traits = { version = "0.2.19", default-features = false, features = ["default", "i128", "libm", "std"] }
+once_cell = { version = "1.21.4", default-features = false, features = ["alloc", "default", "race", "std"] }
+ordered-float = { version = "4.6.0", default-features = false, features = ["libm", "serde", "std"] }
+percent-encoding = { version = "2.3.2", default-features = false, features = ["alloc", "default", "std"] }
+regex-automata = { version = "0.4.18", default-features = false, features = ["alloc", "dfa", "dfa-build", "dfa-onepass", "dfa-search", "hybrid", "meta", "nfa", "nfa-backtrack", "nfa-pikevm", "nfa-thompson", "perf", "perf-inline", "perf-literal", "perf-literal-multisubstring", "perf-literal-substring", "std", "syntax", "unicode", "unicode-age", "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment", "unicode-word-boundary"] }
+rgb = { version = "0.8.53", default-features = false, features = ["argb", "as-bytes", "bytemuck", "default", "grb"] }
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "default", "derive", "rc", "serde_derive", "std"] }
+serde_core = { version = "1.0.229", default-features = false, features = ["alloc", "rc", "result", "std"] }
+smallvec = { version = "1.15.2", default-features = false, features = ["const_generics", "union"] }
+termwiz = { path = "../termwiz", default-features = false, features = ["default", "image", "pest", "pest_derive", "serde", "sha2", "tmux_cc", "use_image", "use_serde", "wezterm-blob-leases"] }
+thiserror = { version = "2.0.20", default-features = false, features = ["default", "std"] }
+time = { version = "0.3.55", default-features = false, features = ["alloc", "default", "formatting", "parsing", "std"] }
+uuid = { version = "1.24.0", default-features = false, features = ["default", "rng", "serde", "std", "v4"] }
+vtparse = { path = "../vtparse", default-features = false, features = ["alloc", "std"] }
+wezterm-blob-leases = { path = "../wezterm-blob-leases", default-features = false, features = ["default", "serde", "simple_tempdir"] }
+wezterm-cell = { path = "../wezterm-cell", default-features = false, features = ["std", "use_image", "use_serde"] }
+wezterm-color-types = { path = "../color-types", default-features = false, features = ["csscolorparser", "serde", "std", "use_serde"] }
+wezterm-dynamic = { path = "../wezterm-dynamic", default-features = false, features = ["std"] }
+wezterm-escape-parser = { path = "../wezterm-escape-parser", default-features = false, features = ["image", "kitty-shm", "sha2", "std", "tmux_cc", "use_image", "use_serde", "wezterm-blob-leases"] }
+wezterm-font = { path = "../wezterm-font", default-features = false, features = ["vendor-jetbrains", "vendor-nerd-font-symbols", "vendor-noto-emoji", "vendor-roboto"] }
+wezterm-input-types = { path = "../wezterm-input-types", default-features = false, features = ["serde", "std"] }
+wezterm-surface = { path = "../wezterm-surface", default-features = false, features = ["appdata", "default", "serde", "std", "use_image", "use_serde"] }
+wezterm-term = { path = "../term", default-features = false, features = ["use_serde"] }
+winapi = { version = "0.3.9", default-features = false, features = ["cfg", "consoleapi", "dwmapi", "dwrite", "dwrite_1", "dwrite_3", "errhandlingapi", "evntrace", "fileapi", "handleapi", "imm", "impl-debug", "impl-default", "in6addr", "inaddr", "knownfolders", "libloaderapi", "memoryapi", "minwinbase", "minwindef", "namedpipeapi", "ntsecapi", "objbase", "processthreadsapi", "psapi", "shellapi", "shellscalingapi", "shlobj", "std", "synchapi", "sysinfoapi", "timezoneapi", "tlhelp32", "unknwnbase", "winbase", "wincon", "windef", "winerror", "winioctl", "winnls", "winnt", "winreg", "winsock2", "winuser"] }
+windows = { version = "0.33.0", default-features = false, features = ["Data", "Data_Xml", "Data_Xml_Dom", "Foundation", "UI", "UI_Notifications", "UI_ViewManagement", "Win32", "Win32_Devices", "Win32_Devices_Display", "Win32_Foundation", "Win32_UI", "Win32_UI_Shell", "default"] }
+windows-sys-0_59_0 = { package = "windows-sys", version = "0.59.0", default-features = false, features = ["Win32", "Win32_Devices", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Security", "Win32_Storage", "Win32_Storage_FileSystem", "Win32_System", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Power", "default"] }
+windows-sys-0_61_2 = { package = "windows-sys", version = "0.61.2", default-features = false, features = ["Wdk", "Wdk_Foundation", "Wdk_Storage", "Wdk_Storage_FileSystem", "Win32", "Win32_Devices", "Win32_Devices_Communication", "Win32_Foundation", "Win32_Globalization", "Win32_Networking", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authentication", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage", "Win32_Storage_FileSystem", "Win32_System", "Win32_System_Console", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_Environment", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "default"] }
+
+[build-dependencies]
+syn-2_0_119 = { package = "syn", version = "2.0.119", default-features = false, features = ["clone-impls", "default", "derive", "extra-traits", "fold", "full", "parsing", "printing", "proc-macro", "visit"] }
+syn-3_0_3 = { package = "syn", version = "3.0.3", default-features = false, features = ["clone-impls", "default", "derive", "full", "parsing", "printing", "proc-macro", "visit-mut"] }

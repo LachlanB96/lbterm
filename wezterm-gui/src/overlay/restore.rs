@@ -1,8 +1,9 @@
 //! LBTerm: the crash-restore prompt (lbterm_extras::restore). When LBTerm starts after one that
-//! didn't close cleanly, its first window asks which of the old tabs to open again: all of
-//! them (Enter), the ones picked, or none (Esc).
+//! didn't close cleanly, a window asks which of the old tabs to open again: all of them
+//! (Enter), the ones picked, or none (Esc). Only those are answers: a prompt whose input ends
+//! (its overlay taken away) is Cancelled, and the note is asked again.
 
-use lbterm_extras::restore::{command, describe, Picks, TabNote};
+use lbterm_extras::restore::{command, describe, Outcome, Picks, TabNote};
 use mux::termwiztermtab::TermWizTerminal;
 use termwiz::cell::{AttributeChange, Intensity};
 use termwiz::color::{AnsiColor, ColorAttribute};
@@ -23,8 +24,22 @@ const BUTTONS: [(Button, &str); 3] = [
     (Button::None, " Don't open "),
 ];
 
-/// Ask, and return the indices of the tabs to open (empty for none)
-pub fn ask(term: &mut TermWizTerminal, tabs: &[TabNote]) -> anyhow::Result<Vec<usize>> {
+/// Ask: the indices of the tabs to open (empty for none), or Cancelled when the prompt went
+/// without an answer. Its input ends when its overlay is taken away (the window switched to
+/// another mux window, its tab went, the window closed), which until 2026-10-30 was taken for
+/// "open none": the note was spent and nothing came back
+pub fn ask(term: &mut TermWizTerminal, tabs: &[TabNote]) -> Outcome {
+    match ask_inner(term, tabs) {
+        Ok(Some(chosen)) => Outcome::Answered(chosen),
+        Ok(None) => Outcome::Cancelled,
+        Err(err) => {
+            log::debug!("restore: the prompt's terminal failed: {err:#}");
+            Outcome::Cancelled
+        }
+    }
+}
+
+fn ask_inner(term: &mut TermWizTerminal, tabs: &[TabNote]) -> anyhow::Result<Option<Vec<usize>>> {
     term.set_raw_mode()?;
     let rows: Vec<String> = tabs.iter().map(describe).collect();
     let claude: Vec<bool> = tabs.iter().map(|t| command(t, "", "").is_some()).collect();
@@ -131,8 +146,9 @@ pub fn ask(term: &mut TermWizTerminal, tabs: &[TabNote]) -> anyhow::Result<Vec<u
         term.render(&changes)?;
         term.flush()?;
 
+        // Nothing more will come: the overlay was taken away, which is no answer
         let Ok(Some(event)) = term.poll_input(None) else {
-            return Ok(vec![]);
+            return Ok(None);
         };
         match event {
             InputEvent::Key(KeyEvent { key, .. }) => match key {
@@ -141,8 +157,8 @@ pub fn ask(term: &mut TermWizTerminal, tabs: &[TabNote]) -> anyhow::Result<Vec<u
                 KeyCode::Char(' ') => picks.toggle(picks.cursor),
                 KeyCode::Char('a' | 'A') => picks.set_all(true),
                 KeyCode::Char('n' | 'N') => picks.set_all(false),
-                KeyCode::Enter => return Ok(picks.chosen()),
-                KeyCode::Escape | KeyCode::Char('q' | 'Q') => return Ok(vec![]),
+                KeyCode::Enter => return Ok(Some(picks.chosen())),
+                KeyCode::Escape | KeyCode::Char('q' | 'Q') => return Ok(Some(vec![])),
                 _ => {}
             },
             InputEvent::Mouse(MouseEvent {
@@ -161,11 +177,11 @@ pub fn ask(term: &mut TermWizTerminal, tabs: &[TabNote]) -> anyhow::Result<Vec<u
                         if mx >= *bx && mx < bx + w {
                             hover = Some(*button);
                             if clicked {
-                                return Ok(match button {
+                                return Ok(Some(match button {
                                     Button::All => (0..rows.len()).collect(),
                                     Button::Picked => picks.chosen(),
                                     Button::None => vec![],
-                                });
+                                }));
                             }
                         }
                     }

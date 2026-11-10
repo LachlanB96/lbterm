@@ -70,10 +70,21 @@ impl crate::TermWindow {
         if !self.lbterm_composited() {
             return;
         }
-        self.lbterm_lights.pending.borrow_mut().push(light);
+        self.lbterm_light_this_frame(light);
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+    }
+
+    /// A brief light decided by the paint under way (the strip's new words, the InMail button's
+    /// more mail, a pad's glint): the compositor takes this frame's lights after the paint pass,
+    /// so it plays from this frame and asks for none of its own. A frame more painted nothing
+    /// new: every InMail message arriving cost one (lbterm/INBOX.md, "What a change costs").
+    pub(crate) fn lbterm_light_this_frame(&self, light: Light) {
+        if !self.lbterm_composited() {
+            return;
+        }
+        self.lbterm_lights.pending.borrow_mut().push(light);
     }
 
     /// This frame's lights, for the compositor
@@ -84,7 +95,7 @@ impl crate::TermWindow {
     /// A click's ripple from `(x, y)` in the window
     pub(crate) fn lbterm_light_press(&self, x: f64, y: f64) {
         let (reach, start) = lights::press_reach(self.dimensions.dpi as f64 / 96.0);
-        self.lbterm_light(Light::Press { x, y, reach, start });
+        self.lbterm_light(Light::Press { x, y, reach, start, within: None });
     }
 
     /// Light up stretches of `pane_id`'s text: each a row of its scrollback and the columns
@@ -216,7 +227,8 @@ impl crate::TermWindow {
     /// the window has only just opened
     pub(crate) fn lbterm_readout_resized(&mut self) {
         let now = Instant::now();
-        if !self.lbterm_composited() || now.saturating_duration_since(self.created) < SETTLE {
+        // Nor over the Conductor's view: the pane it measures is under it (render/conductor_view.rs)
+        if !self.lbterm_composited() || now.saturating_duration_since(self.created) < SETTLE || self.lbterm_view_is_open() {
             return;
         }
         self.lbterm_lights.readout.resized(now);
@@ -412,7 +424,7 @@ impl crate::TermWindow {
         };
         self.lbterm_lights.wake = Some(at);
         promise::spawn::spawn(async move {
-            smol::Timer::at(at).await;
+            lbterm_extras::counters::timer(smol::Timer::at(at)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 if tw.lbterm_lights.wake == Some(at) {
                     tw.lbterm_lights.wake = None;

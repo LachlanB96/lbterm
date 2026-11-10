@@ -17,13 +17,26 @@ pub enum AllowImage {
 impl crate::TermWindow {
     pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
         self.num_frames += 1;
+        // LBTerm: the frame counted for its window, and credited to the sites that asked for it
+        // since its last (lbterm_extras::counters), which the budget judges (termwindow/budget.rs)
+        self.lbterm_budget_frame_start();
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
+        // LBTerm: this frame shows a composition's end (termwindow/echo.rs)
+        self.lbterm_composition_ended = false;
+        // LBTerm: whose panes this frame draws: the open tab's, or while a held pane's push
+        // hasn't come the tab drawn last's (termwindow/frame_wait.rs)
+        self.lbterm_frame_panes();
         // Start with the assumption that we should allow images to render
         self.allow_images = AllowImage::Yes;
 
         let start = Instant::now();
+        // LBTerm: the process's first paint, as a mark of its start (lbterm_extras::start)
+        static PAINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !PAINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            lbterm_extras::start::mark("first_paint");
+        }
 
         {
             let diff = start.duration_since(self.last_fps_check_time);
@@ -34,6 +47,12 @@ impl crate::TermWindow {
                 self.last_fps_check_time = start;
             }
         }
+
+        // LBTerm: links to InMail messages are shaped again when what waits changes (render/inbox.rs)
+        self.lbterm_inbox_links_refresh();
+        // LBTerm: an image's caption is shaped again when its file goes or comes back, and what the
+        // panes drew of their thumbnails is gathered afresh (render/thumbnails.rs)
+        self.lbterm_thumbnails_refresh();
 
         // LBTerm: the slow-frame log times building the frame and drawing it apart, by window,
         // and with the compositor presenting too (render/composited.rs; lbterm_extras::slow)
@@ -60,13 +79,24 @@ impl crate::TermWindow {
                         current_size,
                     }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
                     {
-                        let result = if pass == 0 {
+                        // LBTerm: an atlas that hasn't yet seen a frame through holds nothing but
+                        // what this frame draws, so clearing it frees nothing: it grows at once.
+                        // Upstream cleared it first whatever, so a window's first frame (its atlas
+                        // 128 px a side) and the first after a zoom drew everything again for
+                        // nothing (lbterm/PERF.md, "What font setup costs")
+                        let fresh = self
+                            .render_state
+                            .as_ref()
+                            .map_or(false, |rs| rs.lbterm_atlas_frames == 0);
+                        let result = if pass == 0 && !fresh {
                             // Let's try clearing out the atlas and trying again
                             // self.clear_texture_atlas()
                             log::trace!("recreate_texture_atlas");
+                            crate::counters::fonts::ATLAS_CLEARED.one();
                             self.recreate_texture_atlas(Some(current_size))
                         } else {
                             log::trace!("grow texture atlas to {}", size);
+                            crate::counters::fonts::ATLAS_GROWN.one();
                             self.recreate_texture_atlas(Some(size))
                         };
                         self.invalidate_fancy_tab_bar();
@@ -98,6 +128,7 @@ impl crate::TermWindow {
                     } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
                         self.invalidate_fancy_tab_bar();
                         self.invalidate_modal();
+                        crate::counters::fonts::RESHAPES.one();
                         self.shape_generation += 1;
                         self.shape_cache.borrow_mut().clear();
                         self.line_to_ele_shape_cache.borrow_mut().clear();
@@ -109,6 +140,10 @@ impl crate::TermWindow {
             }
         }
         drop(slow_pass);
+        // LBTerm: the atlas has seen a frame through, so what's in it may be glyphs no longer drawn
+        if let Some(rs) = self.render_state.as_mut() {
+            rs.lbterm_atlas_frames += 1;
+        }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
         let slow_draw =
@@ -116,6 +151,11 @@ impl crate::TermWindow {
         self.call_draw(frame).ok();
         drop(slow_draw);
         self.last_frame_duration = start.elapsed();
+        // LBTerm: and the end of the process's first, drawn
+        static DRAWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DRAWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            lbterm_extras::start::mark("first_drawn");
+        }
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
             self.last_frame_duration,
@@ -136,9 +176,11 @@ impl crate::TermWindow {
                     }
                     _ => {
                         self.scheduled_animation.borrow_mut().replace(next_due);
+                        // LBTerm: on purpose at rest, at the rate it comes (termwindow/budget.rs)
+                        self.lbterm_budget_animation(next_due);
                         let window = self.window.clone().take().unwrap();
                         promise::spawn::spawn(async move {
-                            Timer::at(next_due).await;
+                            lbterm_extras::counters::timer(Timer::at(next_due)).await;
                             let win = window.clone();
                             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                                 tw.scheduled_animation.borrow_mut().take();
@@ -153,8 +195,12 @@ impl crate::TermWindow {
                 }
             }
         }
-        // LBTerm: what this frame shows, to a test window's state file (termwindow/state.rs)
+        // LBTerm: what this frame shows, to a test window's state file (termwindow/state.rs), and
+        // the budget's actions it shows (termwindow/budget.rs)
         self.lbterm_state_frame();
+        self.lbterm_budget_frame_end();
+        // LBTerm: the pushes its frame read, to their servers (termwindow/panes_drawn.rs)
+        self.lbterm_say_read();
     }
 
     pub fn paint_modal(&mut self) -> anyhow::Result<()> {
@@ -195,7 +241,8 @@ impl crate::TermWindow {
             self.fancy_tab_bar.replace(tab_bar);
         }
 
-        let panes = self.get_panes_to_render();
+        // LBTerm: the open tab's panes, or the ones kept in their place (termwindow/frame_wait.rs)
+        let panes = self.lbterm_panes_to_paint();
         let focused = self.focused.is_some();
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
@@ -275,9 +322,17 @@ impl crate::TermWindow {
             .context("filled_rectangle for window background")?;
         }
 
+        // LBTerm: panes kept in the open tab's place while a held pane's push hasn't come are
+        // only drawn: the keyboard, the IME's caret and the server's focus stay with the open
+        // tab's pane, which `activate_tab` told already (termwindow/frame_wait.rs)
+        let kept = self.lbterm_panes_kept();
         for pos in panes {
-            if pos.is_active {
-                self.update_text_cursor(&pos);
+            if pos.is_active && !kept {
+                // LBTerm: the Conductor's view over the panes hands the IME its own caret, and
+                // only when it moves (render/conductor_view.rs)
+                if !self.lbterm_view_is_open() {
+                    self.update_text_cursor(&pos);
+                }
                 if focused {
                     pos.pane.advise_focus();
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
@@ -285,6 +340,9 @@ impl crate::TermWindow {
             }
             self.lbterm_spans
                 .switch(Target::Pane(pos.pane.pane_id()), layers.quad_counts());
+            // LBTerm: the push of it this frame reads, said at the paint's end (panes_drawn.rs);
+            // noted first, so a pass that fails here leaves no push unsaid
+            self.lbterm_frame_read(&pos.pane);
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
         // LBTerm: what the panes' lines showed that's new plays its effect (render/triggers.rs)
@@ -292,8 +350,9 @@ impl crate::TermWindow {
 
         self.lbterm_spans
             .switch(Target::Splits, layers.quad_counts());
-        if let Some(pane) = self.get_active_pane_or_overlay() {
-            let splits = self.get_splits();
+        // LBTerm: those of the panes drawn (termwindow/frame_wait.rs)
+        if let Some(pane) = self.lbterm_pane_to_paint() {
+            let splits = self.lbterm_splits_to_paint();
             for split in &splits {
                 self.paint_split(&mut layers, split, &pane)
                     .context("paint_split")?;
@@ -323,16 +382,49 @@ impl crate::TermWindow {
             .context("paint_lbterm_prompt_mark")?;
         self.paint_lbterm_questions()
             .context("paint_lbterm_questions")?;
+        // LBTerm: a voice draft's card over its pane (render/draft.rs)
+        self.paint_lbterm_drafts().context("paint_lbterm_drafts")?;
+        // LBTerm: the Conductor's view over the panes, under the panel (render/conductor_view.rs)
+        self.paint_lbterm_conductor_view()
+            .context("paint_lbterm_conductor_view")?;
         self.paint_tab_panel().context("paint_tab_panel")?;
+        // LBTerm: after the panel, whose rows its marks line up with (render/objectives.rs)
+        self.lbterm_sides_begin();
+        self.paint_lbterm_objectives()
+            .context("paint_lbterm_objectives")?;
+        // LBTerm: the scroll strip left of it, and its card (render/scroll_strip.rs)
+        self.paint_lbterm_scroll_strip()
+            .context("paint_lbterm_scroll_strip")?;
+        // LBTerm: what the two strips drew, and as a tab is left how they were (render/sides.rs)
+        self.paint_lbterm_sides().context("paint_lbterm_sides")?;
+        // LBTerm: what a tab is running, beside its row on the open panel (render/tasks_card.rs)
+        self.paint_lbterm_tasks_card()
+            .context("paint_lbterm_tasks_card")?;
+        // LBTerm: the new-tab pad's look under the pointer, its picker and its + menu
+        // (render/new_tab.rs), after the tab panel, whose layout places them
+        // LBTerm: no menu drawn yet in this paint: those drawn below are open, and any drawn in
+        // the last and not in this one fades out (render/menu_fade.rs)
+        self.lbterm_menu_fade_begin();
+        self.paint_lbterm_new_tab().context("paint_lbterm_new_tab")?;
         self.paint_modal().context("paint_modal")?;
         // LBTerm: over the panel too (render/tab_menu.rs)
         self.paint_lbterm_tab_menu().context("paint_lbterm_tab_menu")?;
+        // LBTerm: a tab being right-dragged onto another, and its cards (render/link_drag.rs)
+        self.paint_lbterm_link_drag().context("paint_lbterm_link_drag")?;
         // LBTerm: the list of prompts, beside it (render/prompt.rs)
         self.paint_lbterm_prompt_list()
             .context("paint_lbterm_prompt_list")?;
         // LBTerm: and the Conductor's menu (render/conductor.rs)
         self.paint_lbterm_conductor_menu()
             .context("paint_lbterm_conductor_menu")?;
+        // LBTerm: and the InMail button's list (render/inbox.rs)
+        self.paint_lbterm_inbox_list()
+            .context("paint_lbterm_inbox_list")?;
+        self.paint_lbterm_agenda_list()
+            .context("paint_lbterm_agenda_list")?;
+        // LBTerm: and the context pill's list (render/context.rs)
+        self.paint_lbterm_context_list()
+            .context("paint_lbterm_context_list")?;
 
         Ok(())
     }

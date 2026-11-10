@@ -25,8 +25,12 @@ pub enum Target<Id> {
     /// A part of the tab panel, over everything. Its quads have z-layers of
     /// their own rather than spans in z-layer 0.
     Panel(PanelPart),
-    /// Over the tab panel too: the tab menu (z-layers 60-69). Only in a
-    /// frame while something is drawn there, and for one cleared frame after.
+    /// Over the tab panel and the menus: a tab link drag (z-layers 88 to 92). Only in a frame
+    /// while something is drawn there, and for one cleared frame after. The menus were here
+    /// until 2026-11-05; they're `MenuCard` and `MenuLight` now. The compositor's `top` visual
+    /// holds this target's surface and the lights round the drag's matched blocks
+    /// (`prepare_link_lamps`), which show a template of their own, not this target; the
+    /// Conductor menu's turning arc (`MenuSpinner`) is in its menu's card, not `top`.
     Top,
     /// A card template the panes' edges and the active outline are cut
     /// from (z-layers 70, 71, 74 and 75; the strip's hover slots have 72 and
@@ -39,6 +43,11 @@ pub enum Target<Id> {
     /// The window strip's detail card (z-layers 30 to 32), over the hover slots and under the
     /// tab panel: faded in and out by DWM (wezterm-gui's render/strip.rs).
     StripCard,
+    /// One of the objectives panel's three cards over the panes on the right, the list of each
+    /// tab's first objective (0, z-layers 39 to 41), one session's whole list (1, 42 to 44) and
+    /// the projects card (2, 27 to 29): faded in and out by DWM (wezterm-gui's render/objectives.rs
+    /// and render/projects.rs).
+    Objectives(usize),
     /// The turning arc on a Conductor menu item that waits for its answer (z-layer 76): a
     /// template never seen itself, which a visual over the menu shows, turned by DWM
     /// (wezterm-gui's render/conductor.rs).
@@ -53,6 +62,42 @@ pub enum Target<Id> {
     /// The window strip as it was, over its new words while it fades out (z-layers 36 and 37;
     /// render/strip_swap.rs)
     Swap,
+    /// The strips down the window's right (the scroll strip and the objectives strip) as the tab
+    /// left showed them, over the next tab's while they fade out with its panes (z-layer 19;
+    /// wezterm-gui's render/sides.rs). Only the frame a tab is left in draws one: each keeps that
+    /// frame while it fades
+    Sides,
+    /// The card of what a tab's Claude session has running, beside its row on the open tab
+    /// panel (z-layers 80 to 82), over the panel and under the tab menu: faded in and out by
+    /// DWM (wezterm-gui's render/tasks_card.rs).
+    TasksCard,
+    /// The light running round a tab link's matched blocks while a tab is dragged onto the tab
+    /// its wait matches (z-layer 92): a template never seen itself, which a visual per block over
+    /// the drag's cards shows, carried round by DWM (wezterm-gui's render/link_drag.rs).
+    LinkLamp,
+    /// The light running to and fro along each suggested tab connection's line down the rail
+    /// (z-layer 97): a template never seen itself, which a visual per line over the tab panel
+    /// shows, carried along the line by DWM (wezterm-gui's render/connections.rs).
+    ConnectionLamp,
+    /// The easter egg's hearts (z-layer 20): a sheet of one heart in each of their pinks, never
+    /// seen itself, which a visual per heart shows, each risen, swayed, grown and faded by DWM
+    /// (wezterm-gui's render/triggers.rs).
+    Hearts,
+    /// The new-tab picker beside the rail (z-layers 93 to 95), over the panel and under its
+    /// pads' glints: faded in and out by DWM (wezterm-gui's render/new_tab.rs).
+    Picker,
+    /// The new-tab pad's look under the pointer (z-layer 96), over the panel: faded in and out by
+    /// DWM on `button_hover`, as the strip's hover slots are (wezterm-gui's render/new_tab.rs).
+    PlusHover,
+    /// One of the menus' cards (wezterm-gui's render/menu_fade.rs): its light, fill and words,
+    /// the z-layers of the menus in slot `n` (0 the tab menu, 60 to 62; 1 the prompt list, 63 to
+    /// 65; 2 the Conductor's, 66 to 68; 3 the InMail list, the agenda and the + menu, 77 to 79).
+    /// Over the panel, faded in and out by DWM with the slot's highlight.
+    MenuCard(usize),
+    /// The slot's highlight, over its card: a white surface, never drawn into, seen through a
+    /// rounded clip that glides between rows (`crate::menu::light`). No quads: cleared to white,
+    /// and only in a frame when it's new or a new size.
+    MenuLight(usize),
 }
 
 /// The template cards, each drawn as wide as the window (its corners, top
@@ -91,6 +136,8 @@ pub enum PanelPart {
     SpotCore,
     /// The turning arc's template, shown on each pad waiting on tasks
     Spinner,
+    /// The white arc's template, shown on the Starting row's pad while a new tab is on its way
+    StartSpinner,
     /// The Conductor's outlines' templates, shown round its pad and the tabs it's on, and its
     /// light's, carried round them
     RingSpectrum,
@@ -108,6 +155,11 @@ pub enum PanelPart {
     /// Each row's progress fill drawn whole, never seen itself: the open panel shows as
     /// much of each as the program says, and DWM glides it when that changes
     Progress,
+    /// The wave of characters that runs ahead of the edge as it opens and on out over the panes:
+    /// drawn once where its run ends and carried there a cell at a time
+    Wave,
+    /// The spray it throws where its crest breaks, drawn once where it's thrown
+    Spray,
 }
 
 /// A rectangle of the window in whole pixels.
@@ -143,6 +195,26 @@ impl PixelRect {
 
     pub fn to_rect(&self) -> crate::Rect {
         crate::Rect::new(self.x as f64, self.y as f64, self.w as f64, self.h as f64)
+    }
+
+    /// The pixels `rects` cover between them, their edges rounded out so none is cut, inside a
+    /// window `window` big; rectangles of no size take no room. A visual that holds what they
+    /// drew (wezterm-gui's render/sides.rs)
+    pub fn covering(rects: impl IntoIterator<Item = crate::Rect>, window: (u32, u32)) -> Option<PixelRect> {
+        let mut it = rects.into_iter().filter(|r| r.w > 0.0 && r.h > 0.0);
+        let first = it.next()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.right(), first.bottom());
+        for r in it {
+            x0 = x0.min(r.x);
+            y0 = y0.min(r.y);
+            x1 = x1.max(r.right());
+            y1 = y1.max(r.bottom());
+        }
+        let x0 = x0.floor().max(0.0) as i32;
+        let y0 = y0.floor().max(0.0) as i32;
+        let x1 = (x1.ceil() as i32).min(window.0 as i32);
+        let y1 = (y1.ceil() as i32).min(window.1 as i32);
+        (x1 > x0 && y1 > y0).then(|| PixelRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
     }
 
     /// Where this pane shows while the tab panel is open: everything from
@@ -185,9 +257,66 @@ pub fn command_list_for(visual: usize) -> usize {
     visual / SWAPCHAINS_PER_COMMAND_LIST
 }
 
-/// How many command lists a frame of `visuals` visuals needs.
+/// How many command lists a frame of `visuals` visuals needs: none for a
+/// frame that draws none, which then submits nothing.
 pub fn command_lists(visuals: usize) -> usize {
-    visuals.div_ceil(SWAPCHAINS_PER_COMMAND_LIST).max(1)
+    visuals.div_ceil(SWAPCHAINS_PER_COMMAND_LIST)
+}
+
+/// What each of a frame's visuals draws, gathered z-layer by z-layer in the
+/// order they're drawn, so that each visual is drawn in one render pass
+/// (lbterm/COMPOSITOR.md, "What a frame costs"): its pass binds each layer
+/// it has quads in, in turn, and draws them. `B` is a layer's buffers as the
+/// draw binds them. Drawn layer by layer, a visual took a pass of its own for
+/// every z-layer and sub-layer it had quads in, and one more to clear it
+/// when it had none: each pass makes wgpu track and move its swapchain's
+/// texture again and close a D3D12 command list of its own.
+#[derive(Debug)]
+pub struct Passes<B> {
+    layers: Vec<B>,
+    /// Each visual's draws: a layer, by its place in `layers`, and the runs
+    /// of its quads
+    draws: Vec<Vec<(usize, Vec<Range<usize>>)>>,
+}
+
+impl<B> Passes<B> {
+    /// A frame drawing `visuals` visuals, nothing gathered yet
+    pub fn new(visuals: usize) -> Self {
+        Self {
+            layers: vec![],
+            draws: (0..visuals).map(|_| vec![]).collect(),
+        }
+    }
+
+    /// The next layer, in the order they're drawn: `buffers`, and the runs
+    /// of its quads each visual draws (by its place in the frame; one with
+    /// none isn't listed). A layer no visual draws from isn't kept
+    pub fn layer(&mut self, buffers: B, wanted: impl IntoIterator<Item = (usize, Vec<Range<usize>>)>) {
+        let at = self.layers.len();
+        let mut used = false;
+        for (visual, ranges) in wanted {
+            if !ranges.is_empty() {
+                self.draws[visual].push((at, ranges));
+                used = true;
+            }
+        }
+        if used {
+            self.layers.push(buffers);
+        }
+    }
+
+    /// How many visuals the frame draws: one pass each
+    pub fn visuals(&self) -> usize {
+        self.draws.len()
+    }
+
+    /// What `visual`'s pass draws: each layer's buffers and the runs of its
+    /// quads, in the order the layers were given
+    pub fn of(&self, visual: usize) -> impl Iterator<Item = (&B, &[Range<usize>])> {
+        self.draws[visual]
+            .iter()
+            .map(|(layer, ranges)| (&self.layers[*layer], ranges.as_slice()))
+    }
 }
 
 /// Runs of quads in z-layer 0, per sub-layer, each belonging to one target,
@@ -293,7 +422,31 @@ mod test {
             assert!(per.iter().all(|&n| (1..=8).contains(&n)), "{visuals}: {per:?}");
         }
         assert_eq!((command_lists(8), command_lists(9)), (1, 2));
-        assert_eq!(command_lists(0), 1);
+        // A frame that draws nothing submits nothing
+        assert_eq!(command_lists(0), 0);
+    }
+
+    #[test]
+    fn each_visual_draws_every_layer_it_has_quads_in_in_one_pass_in_order() {
+        // Three visuals: under (0), a pane (1) and over (2), drawn from three
+        // layers, z-layer -1, 0 and 3, as the paint pass ordered them
+        let mut passes = Passes::new(3);
+        passes.layer("z-1", vec![(0, vec![0..4])]);
+        passes.layer("z0", vec![(0, vec![0..2]), (1, vec![2..10, 12..15]), (2, vec![])]);
+        passes.layer("z3", vec![(2, vec![0..7])]);
+        // A layer no visual draws from isn't bound at all
+        passes.layer("z9", vec![(1, vec![])]);
+        assert_eq!(passes.visuals(), 3);
+        let of = |v| passes.of(v).map(|(b, r)| (*b, r.to_vec())).collect::<Vec<_>>();
+        assert_eq!(of(0), vec![("z-1", vec![0..4]), ("z0", vec![0..2])]);
+        assert_eq!(of(1), vec![("z0", vec![2..10, 12..15])]);
+        assert_eq!(of(2), vec![("z3", vec![0..7])]);
+        assert_eq!(passes.layers, vec!["z-1", "z0", "z3"]);
+        // A visual with nothing in any layer still gets its pass, which only
+        // clears it
+        let empty: Passes<&str> = Passes::new(1);
+        assert_eq!(empty.of(0).count(), 0);
+        assert_eq!(empty.visuals(), 1);
     }
 
     /// A paint pass like WezTerm's: background, two panes (the active one
@@ -420,5 +573,26 @@ mod test {
         assert_eq!(PixelRect::snap(503.6, 0.0, 10.0, 10.0).x, 504);
         // Whole pixels stay put
         assert_eq!(PixelRect::snap(28.0, 30.0, 500.0, 600.0), PixelRect::new(28, 30, 500, 600));
+    }
+
+    #[test]
+    fn a_visual_covers_what_was_drawn_rounded_out() {
+        let r = crate::Rect::new;
+        // The scroll strip's column and the objectives strip's beside it, a mark half a pixel in
+        let drawn = [r(900.0, 40.0, 18.0, 600.0), r(918.0, 40.0, 18.0, 600.0), r(903.5, 100.25, 7.0, 7.0)];
+        assert_eq!(PixelRect::covering(drawn, (1000, 700)), Some(PixelRect::new(900, 40, 36, 600)));
+        // Fractions of a pixel round out, never in
+        assert_eq!(PixelRect::covering([r(10.4, 20.6, 3.2, 3.2)], (1000, 700)), Some(PixelRect::new(10, 20, 4, 4)));
+    }
+
+    #[test]
+    fn a_visual_covering_what_was_drawn_stays_in_the_window() {
+        let r = crate::Rect::new;
+        assert_eq!(PixelRect::covering([r(990.0, 650.0, 40.0, 100.0)], (1000, 700)), Some(PixelRect::new(990, 650, 10, 50)));
+        assert_eq!(PixelRect::covering([r(-5.0, -5.0, 10.0, 10.0)], (1000, 700)), Some(PixelRect::new(0, 0, 5, 5)));
+        assert_eq!(PixelRect::covering([r(1000.0, 10.0, 10.0, 10.0)], (1000, 700)), None);
+        // Nothing of any size: no room taken
+        assert_eq!(PixelRect::covering([r(5.0, 5.0, 0.0, 10.0), r(20.0, 20.0, 2.0, 2.0)], (1000, 700)), Some(PixelRect::new(20, 20, 2, 2)));
+        assert_eq!(PixelRect::covering([], (1000, 700)), None);
     }
 }

@@ -260,12 +260,17 @@ impl Window {
     }
 
     /// Remove dead tabs, and any tabs not present in given `live_tab_ids`.
-    pub fn prune_dead_tabs(&mut self, live_tab_ids: &[TabId]) {
+    /// LBTerm: `kept` are dead tabs the mux's keeper has taken on (lbterm_keep.rs): they keep
+    /// their panes and their place until it removes them
+    pub fn prune_dead_tabs(&mut self, live_tab_ids: &[TabId], kept: &[TabId]) {
         let mut invalidated = false;
         let dead: Vec<TabId> = self
             .tabs
             .iter()
             .filter_map(|tab| {
+                if kept.contains(&tab.tab_id()) {
+                    return None;
+                }
                 if tab.prune_dead_panes() {
                     invalidated = true;
                 }

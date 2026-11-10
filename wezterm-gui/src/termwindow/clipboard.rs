@@ -8,6 +8,10 @@ use window::{Clipboard, WindowOps};
 
 impl TermWindow {
     pub fn copy_to_clipboard(&self, clipboard: ClipboardCopyDestination, text: String) {
+        // LBTerm: with the state file on (a test window), to the state file, never the clipboard
+        if self.lbterm_copy_to_state(&text) {
+            return;
+        }
         let clipboard = match clipboard {
             ClipboardCopyDestination::Clipboard => [Some(Clipboard::Clipboard), None],
             ClipboardCopyDestination::PrimarySelection => [Some(Clipboard::PrimarySelection), None],

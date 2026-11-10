@@ -1,5 +1,5 @@
 #Requires -Version 7
-# Covers: wezterm-gui/src/termwindow/render/conductor.rs, wezterm-gui/src/conductor_hub.rs, wezterm-gui/src/state_files.rs, lbterm-extras/src/conductor.rs, lbterm-extras/src/menu.rs, lbterm-extras/src/lights.rs, wezterm-gui/src/termwindow/render/tab_panel.rs
+# Covers: wezterm-gui/src/termwindow/render/conductor.rs, wezterm-gui/src/conductor_hub.rs, wezterm-gui/src/state_files.rs, lbterm-extras/src/conductor.rs, lbterm-extras/src/menu.rs, lbterm-extras/src/lights.rs, wezterm-gui/src/termwindow/render/tab_panel.rs, wezterm-gui/src/termwindow/compositor.rs
 <#
 The Conductor on the tab rail (`lbterm_conductor`; wezterm-gui/src/termwindow/render/conductor.rs,
 conductor_hub.rs, state_files.rs; lbterm-extras/src/conductor.rs) end to end, in a test window that
@@ -10,14 +10,29 @@ user var).
 
 1. The hub: LBTerm subscribes, and says which tab and pane holds each session.
 2. No state file: the pad atop the rail is dim, "off" (off.png). On, read only: a grey outline and
-   the mode, in the slot alone (read.png). Accept most: the spectrum's outline, its hues turning
-   (most.png, most-later.png).
+   the mode, in the slot alone (read.png). Accept most and Accept all at rest (Lachlan's 7a of
+   2026-11-01): a still hairline in the mode's colour, yellow and red, measured in a band left of
+   the pad inside its pill, with none of the spectrum's blues there, nothing moving between two
+   pictures 700 ms apart (most.png, most-later.png, all.png, all-later.png), the state file's
+   outline `mode` and no `conductor.outline` among the window's loops.
 3. The hub says it's thinking about the first session: that tab's pad gets the iridescent outline,
-   moving (thinking.png). Acting on the second: its pad too, a light going round it (acting.png).
-   The hub lets go of both: they linger a lap at most, then go.
-4. A right click on the pad drops its menu. A click on an item that waits for its answer runs it,
+   moving (thinking.png), and the Conductor's pad stays still: thinking isn't acting. Acting on the
+   second: its pad too, a light going round it (acting.png), and the Conductor's pad lights, its
+   spectrum fading in over the still outline (`conductor.outline.fade` in flight), its hues
+   turning; lit in Accept all too, and in read only the grey outline, the ring gone at once. The
+   hub lets go of both: they linger a lap at most, then go, and the pad's spectrum fades out to the
+   still outline, the rail as it was before (let-go.png), no loop left. Since feat/dcomp-recorder
+   what the compositor does with the pad's ring (its fades on their curve, its hues' angle a loop
+   only while it shows, `conductor.outline` in `loops` then and gone with it, in read only gone at
+   once) is compositor/imp/tests/rail.rs's; this step keeps the fades' names (the hub's push
+   reaching the compositor), no loop at rest or once let go (render dropping the ring), the read
+   only's no fade, and the pixels: the outline's colours, the hues seen turning, the rail as it was.
+4. A right click on the pad drops its menu. A click on an item that waits for its answer runs it
+   (its row flashing white, menu.conductor.flash, Lachlan's 9b),
    and the menu stays, the item's arc turning and the others out of reach (pending.png,
-   pending-later.png), until the state file changes. An item that doesn't wait, picked with the
+   pending-later.png), until the state file changes; the arc is among the window's loops while it
+   waits and gone from them once the menu closes, where it went on turning, hidden, for good
+   (the compositor's own, lbterm/STATE.md: perf/paint). An item that doesn't wait, picked with the
    keys, runs and closes it at once, and so does the ticked one, which asks for what's so already.
    Esc stops a wait. Off, a left click drops it too, offering to turn on, and waits.
 5. The Conductor's own tab (its session the state file's sessionId), opened last: LBTerm moves it
@@ -34,8 +49,29 @@ the outlines and the menu have answered, come from the window's state file (lbte
 the Conductor's own button.json); the pictures still say how they look.
 
   pwsh -File lbterm\perf\conductor.ps1
+  pwsh -File lbterm\perf\conductor.ps1 -Capture   # step 4a's answer recorded, then it stops
+
+-Capture runs the window with motion at -Slowdown (5) and, at step 4a's answer, records it frame
+by frame as motion\capture.ps1 does: the menu closing while Accept most waits, its card fading out
+on pane_exit with the waiting arc in it, held still at its angle (MenuSpinner::hold; the
+compositor's Conductor slot), to target\motion\conductor-spinner with its contact sheet. It ends
+there: what follows is checked at real speed only.
+
+-CapturePad records the Conductor's pad in Accept most as the hub starts acting on a session and
+lets go (Lachlan's 7a): the spectrum's ring fading in over the still yellow outline on
+`panel_glow`, its hues turning, and fading back out to it, at -Slowdown (1 for real speed),
+-MotionOff for none (there and gone in the next frame), each frame saved as it's taken to
+target\motion\<CaptureName>, with two sheets from timesheet.py, fade-in.png and fade-out.png, of the
+pad three times as big at real-speed times from each push. It says how long the PC had had no
+real input first (PITFALLS 239: with the displays asleep DWM plays nothing into a capture). It ends
+there, after step 2. With -Interrupt the hub acts again 150 ms (of real speed) into the fade out
+and lets go after, so the ring turns round from where it is and fades back in, never from nothing
+(turn-back.png, from the push, and fade-out-again.png, the last fade).
+
+  pwsh -File lbterm\perf\conductor.ps1 -CapturePad -Slowdown 1 -CaptureName conductor-pad-1x
 #>
-param([string]$Bin)
+param([string]$Bin, [switch]$Capture, [double]$Slowdown = 5, [double]$Seconds = 2,
+  [switch]$CapturePad, [string]$CaptureName = 'conductor-pad', [switch]$MotionOff, [switch]$Interrupt)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test 'conductor' -Bin $Bin
@@ -126,6 +162,15 @@ config.initial_rows = 30
 config.cursor_blink_rate = 0
 config.default_cursor_style = 'SteadyBlock'
 "@
+if ($MotionOff) { $lua += "`nconfig.lbterm_motion = { enabled = 'off' }`n" }
+elseif ($Capture -or $CapturePad) { $lua += "`nconfig.lbterm_motion = { enabled = 'on', slowdown = $Slowdown }`n" }
+
+# The pad's outline, read in a band left of the pad, inside its pill, where only the outline is
+# drawn (its label is under the pad, the tabs below its slot): the mode's still hairline, or the
+# spectrum's ring with its glow
+$yellow = New-ColourRange 200 255 180 255 40 170   # palette::MODE_MOST, #F2E86D, and its soft edge
+$red = New-ColourRange 200 255 30 150 20 140       # palette::MODE_ALL, #FF5449
+$cool = New-ColourRange 0 160 0 255 170 255        # the spectrum's blues, cyans and violets
 
 [LbtermConductorHub]::Serve($pipeName)
 Invoke-Test {
@@ -167,37 +212,162 @@ Invoke-Test {
   $pad = Get-RectCenter $padRect
   # Below the Conductor's slot, the tabs start (the pad's outline glows a few pixels past its pill)
   $tabs = if ($head) { $head[3] + 12 } else { [int]($padRect.y + $padRect.h + 12) }
-  [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "most", "tooltip": "Conductor is on (accept most), here only since 09:05" }')
-  $most = Shows { param($s) $s.rail.conductor.level -eq 'most' } 'most' 'the pad accepting most'
-  # Its hues turn: a loop, so two pictures apart
-  Start-Sleep -Milliseconds 700
-  $later = Get-Shot $win -Name 'most-later'
+  # The band left of the pad, inside its pill, where its outline is drawn and nothing else
+  $band = New-Rect ([int][Math]::Max(0, $padRect.x - (ConvertTo-Px 14 $win.Scale))) ([int]$padRect.y) (ConvertTo-Px 13 $win.Scale) ([int]$padRect.h)
+  $edge = { param($shot, $range) [LbtermE2E.Px]::CountRange($shot, $band, $range) }
+  # And the spectrum's blues anywhere round the pad, over its slot: its hues run once round the
+  # pill and DWM turns them, so a band on one side can be all reds for a moment, never the whole
+  # slot; at rest nothing there is blue (the pad's dark, its glyph white, its word and outline
+  # the mode's colour)
+  $top = [int][Math]::Max(0, $padRect.y - (ConvertTo-Px 16 $win.Scale))
+  $slotBox = New-Rect 0 $top (ConvertTo-Px 90 $win.Scale) ([int]$tabs - 1 - $top)
+  $blues = { param($shot) [LbtermE2E.Px]::CountRange($shot, $slotBox, $cool) }
+  "read: in the band left of the pad, $(& $edge $read $yellow) yellow and $(& $edge $read $red) red pixels; $(& $blues $read) of the spectrum's blues round it"
+  if ($script:entry.rail.conductor.outline -ne 'grey') { Add-Failure "read only, the state file's outline is '$($script:entry.rail.conductor.outline)', not grey" }
+  # Accept most and Accept all at rest (his 7a): the mode's colour, still, no loop for DWM. Its
+  # words go out as the report's lines; its picture is left in $script:restShot
+  $rest = { param([string]$mode, $colour, [string]$colourName)
+    [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "' + $mode + '", "tooltip": "Conductor is on (accept ' + $mode + '), here only since 09:05" }')
+    $shot = Shows { param($s) $s.rail.conductor.level -eq $mode }.GetNewClosure() $mode "the pad accepting $mode"
+    $c = $script:entry.rail.conductor
+    if ($c.outline -ne 'mode' -or $c.acting) { Add-Failure "accept $mode at rest: the state file's outline is '$($c.outline)', acting $($c.acting), not a still 'mode'" }
+    if (@($script:entry.loops) -contains 'conductor.outline') { Add-Failure "accept $mode at rest: conductor.outline among the loops ($(@($script:entry.loops) -join ', ')), DWM composing every refresh for it" }
+    Start-Sleep -Milliseconds 700
+    $later = Get-Shot $win -Name "$mode-later"
+    $n = & $edge $shot $colour
+    $cold = & $blues $shot
+    "${mode}: at rest, $n $colourName pixels in the band left of the pad and $cold of the spectrum's blues round it; loops $(@($script:entry.loops) -join ', ')"
+    if ($n -lt (ConvertTo-Px 8 $win.Scale)) { Add-Failure "accept $mode at rest: only $n $colourName pixels in the band left of the pad, no outline in the mode's colour" }
+    if ($cold -gt 0) { Add-Failure "accept $mode at rest: $cold of the spectrum's blues round the pad" }
+    $d = Changed $shot $later 0 0 90 $tabs
+    if ($d) { Add-Failure "accept $mode at rest: the pad moved in 700 ms at $(Format-Box $d)" } else { "${mode}: still in 700 ms" }
+    if (Changed $shot $later 0 $tabs 90 100000) { Add-Failure "accept ${mode}: the tabs changed at rest" }
+    $script:restShot = $shot
+  }
+  & $rest 'most' $yellow 'yellow'
+  $most = $script:restShot
   $d = Changed $read $most 0 0 100000 $tabs
-  if (-not $d) { Add-Failure 'accept most never showed' } else { "most: the outline at $(Format-Box $d)" }
-  if (-not (Changed $most $later 0 0 90 $tabs)) { Add-Failure "the spectrum's hues never turned" } else { 'most: its hues turn' }
-  if (Changed $most $later 0 $tabs 90 100000) { Add-Failure "the tabs changed while only the pad's outline should move" }
+  if (-not $d) { Add-Failure 'accept most never showed' } else { "most: the outline and the word at $(Format-Box $d)" }
+  & $rest 'all' $red 'red'
+  # Back to most, the pad as step 3 starts from
+  & $rest 'most' $yellow 'yellow'
+  $most = $script:restShot
+
+  if ($CapturePad) {
+    # The pad as the hub starts acting and lets go, frame by frame, saved as they're taken
+    $out = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "target\motion\$CaptureName"
+    Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $out | Out-Null
+    $slow = if ($MotionOff) { 1 } else { $Slowdown }
+    "capture: $([LbtermE2E.Win]::IdleMs()) ms since the last real key or mouse input; locked: $(Test-WorkstationLocked)"
+    $acts = '{"type":"conductor.focus","sessions":[{"sessionId":"' + $sids[1] + '","doing":"acting"}]}'
+    $inMs = 300
+    # Let go once the fade in is long done; it lights for its lap at least and lingers a moment
+    # (lbterm_extras::conductor, ACTING_AT_LEAST, LINGER), then fades out
+    $letGoMs = $inMs + [Math]::Max(1500, 900 * $slow)
+    $outMs = [Math]::Max($letGoMs + 400, $inMs + 1400)
+    # -Interrupt: acting again while it fades out, and let go again after (lbterm_extras::conductor's
+    # PadRing: lit again while it fades, it fades back in from where it is)
+    $backMs = $outMs + 150 * $slow
+    $againMs = $backMs + [Math]::Max(1500, 900 * $slow)
+    $out2Ms = $againMs + 400
+    $endMs = $(if ($Interrupt) { $out2Ms } else { $outMs }) + 1000 * $slow + 600
+    $h = Resolve-Handle $win
+    $csv = [Collections.Generic.List[string]]::new(); $csv.Add('frame,ms')
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $pushed = 0; $n = 0
+    while ($clock.ElapsedMilliseconds -lt $endMs) {
+      if ($pushed -eq 0 -and $clock.ElapsedMilliseconds -ge $inMs) { [void][LbtermConductorHub]::Push($acts); $pushed = 1 }
+      if ($pushed -eq 1 -and $clock.ElapsedMilliseconds -ge $letGoMs) { [void][LbtermConductorHub]::Push('{"type":"conductor.focus","sessions":[]}'); $pushed = 2 }
+      if ($Interrupt -and $pushed -eq 2 -and $clock.ElapsedMilliseconds -ge $backMs) { [void][LbtermConductorHub]::Push($acts); $pushed = 3 }
+      if ($pushed -eq 3 -and $clock.ElapsedMilliseconds -ge $againMs) { [void][LbtermConductorHub]::Push('{"type":"conductor.focus","sessions":[]}'); $pushed = 4 }
+      $shot = [LbtermE2E.Win]::Capture($h)
+      $ms = [Math]::Round($clock.Elapsed.TotalMilliseconds, 1)
+      if ($shot) {
+        $shot.Save((Join-Path $out ('frame{0:D3}.png' -f $n)))
+        $shot.Dispose()
+        $csv.Add("$n,$ms"); $n++
+      }
+    }
+    Watch-Foreground
+    $csv | Set-Content (Join-Path $out 'frames.csv')
+    "capture: $n frames in $([Math]::Round($endMs / 1000, 1)) s to $out (acting at $inMs ms, let go at $letGoMs, fading out from about $outMs$(if ($Interrupt) { ", acting again at $backMs, let go at $againMs, fading out from about $out2Ms" }))"
+    # Sheets of the pad, three times as big, at times of real speed from each push
+    $x = [int][Math]::Max(0, $padRect.x - (ConvertTo-Px 18 $win.Scale)); $y = [int][Math]::Max(0, $padRect.y - (ConvertTo-Px 14 $win.Scale))
+    $w = [int]$padRect.w + (ConvertTo-Px 36 $win.Scale); $hh = [int]$padRect.h + (ConvertTo-Px 34 $win.Scale)
+    $steps = @(-60, 0, 40, 80, 120, 160, 200, 260, 320, 400, 500, 700)
+    $sheets = @(@('fade-in.png', $inMs), @('fade-out.png', $outMs))
+    if ($Interrupt) { $sheets += , @('turn-back.png', $backMs); $sheets += , @('fade-out-again.png', $out2Ms) }
+    foreach ($sheet in $sheets) {
+      $at = ($steps | ForEach-Object { [Math]::Round($sheet[1] / $slow + $_) }) -join ','
+      python (Join-Path $PSScriptRoot '..\motion\timesheet.py') $out (Join-Path $out $sheet[0]) $x $y $w $hh 3 $slow $at 6
+    }
+    return
+  }
 
   # 3. Thinking about the first session, acting on the second, then neither
   $focus = { param($list) '{"type":"conductor.focus","sessions":[' + (($list | ForEach-Object { '{"sessionId":"' + $_[0] + '","doing":"' + $_[1] + '"}' }) -join ',') + ']}' }
   $n = [LbtermConductorHub]::Push((& $focus @(, @($sids[0], 'thinking'))))
   if ($n -lt 1) { Add-Failure 'no subscriber to push to' }
   $thinking = Shows { param($s) @($s.rail.rows | Where-Object conductor -eq 'thinking').Count -eq 1 } 'thinking' 'a row the Conductor thinks about'
+  $c = $script:entry.rail.conductor
+  if ($c.outline -ne 'mode' -or $c.acting) { Add-Failure "thinking about a session lit the Conductor's pad: outline '$($c.outline)', acting $($c.acting)" }
+  if (Changed $most $thinking 0 0 90 $tabs) { Add-Failure 'thinking about a session changed the Conductor''s pad' } else { 'thinking: the Conductor''s pad stays still' }
   $d = Changed $most $thinking 0 $tabs 90 100000
   if (-not $d) { Add-Failure 'thinking: no outline on the first session''s tab' } else { "thinking: an outline at $(Format-Box $d)" }
   $thinkingTop = if ($d) { $d[1] } else { 0 }
   Start-Sleep -Milliseconds 700
   if (-not (Changed $thinking (Get-Shot $win -Name 'thinking-later') 0 $tabs 90 100000)) { Add-Failure 'thinking: the outline never moved' }
+  # What plays as the pad lights and goes out, frame by frame from the state file
+  $played = [System.Collections.Generic.HashSet[string]]::new()
+  $collect = { param($s) foreach ($a in @($s.animations)) { [void]$played.Add($a.name) } }
   [void][LbtermConductorHub]::Push((& $focus @(@($sids[0], 'thinking'), @($sids[1], 'acting'))))
-  $acting = Shows { param($s) @($s.rail.rows | Where-Object conductor -eq 'acting').Count -eq 1 } 'acting' 'a row the Conductor acts on'
+  Wait-State { param($s) $s.rail.conductor.outline -eq 'spectrum' } -What 'the Conductor''s pad lit as it acts' -OnState $collect | Out-Null
+  $acting = Shows { param($s) @($s.rail.rows | Where-Object conductor -eq 'acting').Count -eq 1 -and $s.rail.conductor.outline -eq 'spectrum' } 'acting' 'a row the Conductor acts on, its pad lit'
+  $c = $script:entry.rail.conductor
+  if (-not $c.acting) { Add-Failure 'acting on a session: the state file''s conductor.acting is false' }
+  if (-not $played.Contains('conductor.outline.fade')) { Add-Failure "the pad's spectrum came without its fade in: played [$(@($played) -join ', ')]" } else { 'acting: the pad''s spectrum faded in (conductor.outline.fade)' }
+  # Its hues handed to DWM as a loop while it shows (the hue rotation's angle once round every
+  # HUE_PERIOD, `loops` naming conductor.outline) is the compositor's given the ring and spin:
+  # compositor/imp/tests/rail.rs (feat/dcomp-recorder). Here the loops are said, and the hues seen
+  # turning below (DWM playing them)
+  "acting: loops $(@($script:entry.loops) -join ', ')"
+  $cold = & $blues $acting
+  if ($cold -lt (ConvertTo-Px 4 $win.Scale)) { Add-Failure "acting: only $cold of the spectrum's blues round the pad" } else { "acting: $cold of the spectrum's blues round the pad" }
+  Start-Sleep -Milliseconds 700
+  if (-not (Changed $acting (Get-Shot $win -Name 'acting-later') 0 0 90 $tabs)) { Add-Failure "acting: the pad's hues never turned" } else { 'acting: the pad''s hues turn' }
   $d = Changed $thinking $acting 0 ($thinkingTop + 40) 90 100000
   if (-not $d) { Add-Failure 'acting: no outline on the second session''s tab' } else { "acting: an outline and its light at $(Format-Box $d)" }
   # The second session's row, for a click on it later (the third row)
   $actingRow = @($script:entry.rail.rows | Where-Object conductor -eq 'acting')[0]
+  # Each mode while it acts: Accept all lights too; read only takes no notice, its grey outline
+  # there and the ring gone at once
+  [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "all", "tooltip": "Conductor is on (accept all)" }')
+  $all = Shows { param($s) $s.rail.conductor.level -eq 'all' -and $s.rail.conductor.outline -eq 'spectrum' } 'acting-all' 'the pad accepting all, lit as it acts'
+  if ((& $blues $all) -lt (ConvertTo-Px 4 $win.Scale)) { Add-Failure 'acting in accept all: none of the spectrum round the pad' } else { 'acting: lit in accept all too' }
+  $played.Clear()
+  [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "read", "tooltip": "Conductor is on (read only)" }')
+  Wait-State { param($s) $s.rail.conductor.level -eq 'read' } -What 'the pad read only' -OnState $collect | Out-Null
+  $readActing = Shows { param($s) $s.rail.conductor.level -eq 'read' -and $s.rail.conductor.outline -eq 'grey' -and $s.rail.conductor.acting } 'acting-read' 'the pad read only while it acts'
+  if ($played.Contains('conductor.outline.fade')) { Add-Failure 'read only: the ring faded out, where it goes at once' }
+  $cold = & $blues $readActing
+  if ($cold -gt 0) { Add-Failure "read only while it acts: $cold of the spectrum's blues round the pad" } else { 'acting: read only keeps its grey outline' }
+  [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "most", "tooltip": "Conductor is on (accept most), here only since 09:05" }')
+  Shows { param($s) $s.rail.conductor.level -eq 'most' -and $s.rail.conductor.outline -eq 'spectrum' } 'acting-most' 'the pad accepting most again, lit' | Out-Null
+  $played.Clear()
   [void][LbtermConductorHub]::Push((& $focus @()))
-  # They linger a lap at most: the wait is what's tested
+  # They linger a lap at most, the pad's spectrum fading out after: the wait is what's tested
+  Wait-State { param($s) $s.rail.conductor.outline -eq 'mode' -and -not $s.rail.conductor.acting } -What 'the pad no longer lit' -TimeoutSec 5 -OnState $collect | Out-Null
+  Wait-State { param($s) @($s.animations | Where-Object name -eq 'conductor.outline.fade').Count -eq 0 } -What 'the pad''s fade out over' -TimeoutSec 5 -OnState $collect | Out-Null
+  if (-not $played.Contains('conductor.outline.fade')) { Add-Failure "the pad's spectrum went without its fade out: played [$(@($played) -join ', ')]" } else { 'let go: the pad''s spectrum faded out (conductor.outline.fade)' }
   Start-Sleep 2.5
-  $d = Changed $most (Get-Shot $win -Name 'let-go') 0 $tabs 90 100000
+  $letGo = Get-Shot $win -Name 'let-go'
+  $d = Changed $most $letGo 0 $tabs 90 100000
   if ($d) { Add-Failure "the outlines stayed after the hub let go: $(Format-Box $d)" } else { 'let go: both outlines went' }
+  $d = Changed $most $letGo 0 0 90 $tabs
+  if ($d) { Add-Failure "the pad isn't as it was at rest after the hub let go: $(Format-Box $d)" } else { 'let go: the pad is its still outline again' }
+  $loops = @((Read-State).windows[0].loops)
+  if ($loops -contains 'conductor.outline') { Add-Failure "let go: conductor.outline still among the loops ($($loops -join ', '))" }
 
   # 4. The menu, by what its items run. Read only, the pad's outline holds still
   $menuUp = { param([switch]$Left)
@@ -229,9 +399,12 @@ Invoke-Test {
   $item = @($m.menu.items | Where-Object label -eq 'Accept most')[0]
   if (-not $item) { throw "no 'Accept most' in the menu: $(@($m.menu.items | ForEach-Object label) -join ', ')" }
   $x, $y = Get-RectCenter $item.rect
+  $flashed = [System.Collections.Generic.HashSet[string]]::new()
   Send-Click $win $x $y
   & $leave
-  $waiting = Wait-State { param($s) $s.menu.waiting -ne $null } -What 'the item to wait for its answer' -TimeoutSec 5
+  $waiting = Wait-State { param($s) $s.menu.waiting -ne $null } -What 'the item to wait for its answer' -TimeoutSec 5 -OnState { param($s) foreach ($a in @($s.animations)) { [void]$flashed.Add($a.name) } }
+  # The row picked flashes white, as the picker's rows do (Lachlan's 9b)
+  if (-not $flashed.Contains('menu.conductor.flash')) { Add-Failure "the click on 'Accept most' didn't flash its row: no menu.conductor.flash in [$(@($flashed) -join ', ')]" } else { 'menu: the row picked flashed (menu.conductor.flash)' }
   $p1 = Get-Shot $win -Name 'pending'
   Start-Sleep -Milliseconds 500
   $p2 = Get-Shot $win -Name 'pending-later'
@@ -239,12 +412,32 @@ Invoke-Test {
   if (((Reported) -join ',') -ne 'mode most') { Add-Failure "a click on the first item ran: $((Reported) -join ', ')" } else { 'menu: a click ran "Accept most"' }
   if (-not (Read-State).windows[0].menu) { Add-Failure 'the menu closed while its item waited' } else { "menu: it stays open while ""Accept most"" waits (waiting: $($waiting.menu.waiting))" }
   if (-not (Changed $p1 $p2 $arc[0] $arc[1] $arc[2] $arc[3])) { Add-Failure "the waiting item's arc never turned" } else { 'menu: its arc turns' }
+  # What DWM was given, from the compositor's tree: the arc turns while the item waits
+  try { Wait-State { param($s) @($s.loops) -contains 'menu.spinner' } -What 'the waiting item''s arc among the loops' -TimeoutSec 5 | Out-Null; 'menu: its arc is among the loops while it waits' }
+  catch { Add-Failure "while its item waited, the arc wasn't among the window's loops: $(@((Read-State).windows[0].loops) -join ', ')" }
   & $keys Down, Enter
   if ((Reported).Count -ne 1) { Add-Failure "while it waited, Down and Enter ran: $((Reported) -join ', ')" }
   # The answer: the file written again in the same words, only its updatedAt new (as Conductor's
   # off does when it's off already; the mode stays read so the pad holds still), and the menu goes
-  [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "read", "tooltip": "Conductor is on (read only)", "updatedAt": 2 }')
+  $answer = { [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "read", "tooltip": "Conductor is on (read only)", "updatedAt": 2 }') }
+  if ($Capture) {
+    # The card fading out with its arc, frame by frame (motion\capture.ps1's way), then no more
+    $out = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'target\motion\conductor-spinner'
+    Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $out | Out-Null
+    $answered = @{ Done = $false }
+    $frames = Get-Frames $win ([int]($Seconds * 1000)) -Raw -Each { param($ms) if (-not $answered.Done) { & $answer; $answered.Done = $true } }
+    Save-Frames $frames -Dir $out -Window $win
+    Remove-Frames $frames
+    "capture: $($frames.Count) frames in $Seconds s to $out"
+    python (Join-Path $PSScriptRoot '..\motion\sheet.py') $out --row 200
+    return
+  }
+  & $answer
   if (-not (& $menuGoes 'answered')) { Add-Failure 'the menu stayed after the state file changed' } else { 'menu: it closes when the state file changes' }
+  # Hidden, the arc holds still: a turn DWM plays for ever keeps it composing every refresh
+  try { Wait-State { param($s) -not $s.menu -and @($s.loops) -notcontains 'menu.spinner' } -What 'the arc gone from the loops' -TimeoutSec 5 | Out-Null; 'menu: closed, its arc no longer turns' }
+  catch { Add-Failure "the menu closed, but its hidden arc still turns: loops $(@((Read-State).windows[0].loops) -join ', ')" }
 
   # b. "Say hello" doesn't wait: Down five times and Enter run it, and the menu closes at once
   & $menuUp | Out-Null

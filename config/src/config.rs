@@ -393,16 +393,87 @@ pub struct Config {
     #[dynamic(default)]
     pub lbterm_prompt_history: Option<String>,
 
+    /// LBTerm: while a voice draft is open over a Claude pane, a red ring marks the question in
+    /// the newest reply it should answer next (render/questions.rs, lbterm/QUESTIONS.md). On, the
+    /// extras offered after the questions (E4) are among them; off, the ring passes them by
+    #[dynamic(default = "default_true")]
+    pub lbterm_next_question_extras: bool,
+
+    /// LBTerm: a `#RRGGBB` colour code in a pane's text gets a bar in its own colour along the
+    /// foot of its cells, every character staying as it is (render/screen_line.rs, lbterm/HEX.md)
+    #[dynamic(default = "default_true")]
+    pub lbterm_hex_colours: bool,
+
+    /// LBTerm: the folder a tab or pane closed by hand (CloseCurrentTab, CloseCurrentPane once
+    /// any question is answered yes, the tab bar's close button, the tab menu's Close tab and
+    /// Close other tabs) leaves `<session id>.closing` in, for each Claude Code session in it
+    /// (its `claude_session` user var), so a list of live sessions can tell those from the ones
+    /// a window closing or LBTerm going down ended (lbterm_extras::closing). Unset: no marks
+    #[dynamic(default)]
+    pub lbterm_close_marks: Option<String>,
+
     /// LBTerm: the Conductor on the tab rail, its pad above the tabs and its outlines on the tabs
     /// it's on (render/conductor.rs)
     #[dynamic(default)]
     pub lbterm_conductor: Option<crate::lbterm::LbtermConductor>,
+
+    /// LBTerm: a button on the window strip, above the tab rail, counting the messages waiting in
+    /// a set of folders, which lists them and opens a tab for one (render/inbox.rs)
+    #[dynamic(default)]
+    pub lbterm_inbox: Option<crate::lbterm::LbtermInbox>,
+
+    /// LBTerm: a folder of requests, each naming a folder every watch of LBTerm's lets go of for a
+    /// while, so another program can rename or remove it (let_go.rs)
+    #[dynamic(default)]
+    pub lbterm_let_go: Option<crate::lbterm::LbtermLetGo>,
+
+    /// LBTerm: a button on the window strip beside the InMail button, with the counts of what's
+    /// urgent and what's failing from a file another program keeps, which drops a list of what's
+    /// to do, coming up and failing (render/agenda.rs)
+    #[dynamic(default)]
+    pub lbterm_agenda: Option<crate::lbterm::LbtermAgenda>,
+
+    /// LBTerm: a pill on the window strip's second row, under the InMail button, with what the
+    /// open tab's Claude conversation has cost, which drops a list of the files in its context
+    /// (render/context.rs)
+    #[dynamic(default)]
+    pub lbterm_context: Option<crate::lbterm::LbtermContext>,
+
+    /// LBTerm: the objectives panel down the right of the window: a mark per tab saying what
+    /// became of what its Claude session was started for, and cards of each session's objectives
+    /// (render/objectives.rs, lbterm/OBJECTIVES.md). Needs the tab panel and `lbterm_summaries`
+    #[dynamic(default)]
+    pub lbterm_objectives: Option<crate::lbterm::LbtermObjectives>,
+
+    /// LBTerm: tab links, one tab's Claude session waiting on another's: a right-button drag of a
+    /// tab's row onto another's makes one, a line joins their pads down the rail and the waiting
+    /// pad turns purple (render/tab_panel.rs, lbterm/LINKS.md). Needs the tab panel
+    #[dynamic(default)]
+    pub lbterm_links: Option<crate::lbterm::LbtermLinks>,
+
+    /// LBTerm: the projects card, from a pad at the top of the objectives strip: every project's
+    /// sessions, subagents and InMail, with buttons to start sessions there (render/projects.rs,
+    /// lbterm/OBJECTIVES.md). Needs `lbterm_objectives`
+    #[dynamic(default)]
+    pub lbterm_projects: Option<crate::lbterm::LbtermProjects>,
+
+    /// LBTerm: the scroll strip down the right of the window, left of the objectives panel: the
+    /// active pane's scrollbar, its shell's scrollback or its Claude conversation, with a mark at
+    /// each prompt and each Claude event (render/scroll_strip.rs, lbterm/SCROLL-STRIP.md). Needs
+    /// the tab panel. With it on, the panes' own scrollbar goes
+    #[dynamic(default)]
+    pub lbterm_scroll_strip: Option<crate::lbterm::LbtermScrollStrip>,
 
     /// LBTerm: the slow-frame log. Whatever holds the GUI thread longer than this many
     /// milliseconds (a window message, a task from its queue, a part of a paint) is logged by
     /// name, since that thread also takes every keypress (lbterm_extras::slow). 0 turns it off
     #[dynamic(default = "crate::lbterm::default_slow_ms")]
     pub lbterm_slow_ms: u64,
+
+    /// LBTerm: the budgets the GUI holds itself to and logs when it's over (nothing running at
+    /// rest, the time each action should take), lbterm/PERF.md
+    #[dynamic(default)]
+    pub lbterm_budget: crate::lbterm::LbtermBudget,
 
     /// Whether to select the higher powered discrete GPU when
     /// the system has a choice of integrated or discrete.
@@ -2169,19 +2240,19 @@ fn default_glyph_cache_image_cache_size() -> usize {
 }
 
 fn default_shape_cache_size() -> usize {
-    1024
+    crate::lbterm::default_line_cache_size()
 }
 
 fn default_line_state_cache_size() -> usize {
-    1024
+    crate::lbterm::default_line_cache_size()
 }
 
 fn default_line_quad_cache_size() -> usize {
-    1024
+    crate::lbterm::default_line_cache_size()
 }
 
 fn default_line_to_ele_shape_cache_size() -> usize {
-    1024
+    crate::lbterm::default_line_cache_size()
 }
 
 #[derive(Debug, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]

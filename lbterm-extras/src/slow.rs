@@ -28,8 +28,15 @@
 //! The first is a site's first time over in a 10 s window, logged at once; the second ends a
 //! window that had more. A site has no spaces and no `: `, so a line splits on its last `: `.
 //! `lbterm_slow_ms` (default 33, 0 off) is the threshold; until a window hands it over, nothing
-//! is timed. `LBTERM_SLOW_EVERY` in the GUI's environment logs every time over instead, with no
+//! is logged. `LBTERM_SLOW_EVERY` in the GUI's environment logs every time over instead, with no
 //! windows, for measuring (`lbterm\perf\slow.ps1 -Measure`).
+//!
+//! Every run is timed all the same, from the first, and goes into the counters (counters.rs,
+//! the control pipe's `metrics`): its count, total and longest, by site, logged or not. And into
+//! the budget (budget.rs): traced while an action waits for the frame that shows it, so a line
+//! over its time says what the time went on, and counted when it's a task run at rest. The
+//! scopes also say when what runs now began ([`cause`]): the last key press or click, or the
+//! outermost message or task.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -413,13 +420,59 @@ thread_local! {
     /// When the next window ends
     static DUE: Cell<Option<Instant>> = const { Cell::new(None) };
     static WINDOWS: RefCell<Windows> = RefCell::new(Windows::default());
+    /// How many scopes are open, and when the outermost began: the message or task running now
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+    static OUTER: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// When the last key press or button message began, until an action takes it (budget.rs)
+    static CAUSE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-/// Times what runs until it's dropped, less what nested scopes took
+/// How far back the last key or click can be and still be what started an action
+pub const CAUSE_AT_MOST: Duration = Duration::from_secs(1);
+
+/// The messages that start what the budget times (budget.rs): a key pressed, a button pressed or
+/// let go, a wheel turned. Not a key let go, nor the pointer moving, which come between a press
+/// and what it does
+pub fn is_cause(msg: u32) -> bool {
+    matches!(msg, 0x0100 | 0x0104 | 0x0201..=0x020E)
+}
+
+/// One tick of the clock Windows stamps messages with (GetMessageTime, GetTickCount): a time on
+/// it is only good to this
+pub const MESSAGE_TICK: Duration = Duration::from_millis(16);
+
+/// The message `msg` being handled waited `waited` in the queue, by Windows' stamp on it: a key
+/// or click that clearly waited (more than two of its clock's ticks, behind a busy GUI thread)
+/// started that much earlier, less a tick, than its arrival here, and what it starts is timed
+/// from then. Called just after [`message`]'s scope opens. A wait past [`CAUSE_AT_MOST`] is
+/// another message's stamp (one sent, not queued, carries the last queued one's), not this one's
+pub fn queued(msg: u32, waited: Duration) {
+    if !is_cause(msg) || waited <= MESSAGE_TICK * 2 || waited > CAUSE_AT_MOST {
+        return;
+    }
+    CAUSE.with(|c| {
+        if let Some(at) = c.get() {
+            c.set(Some(at.checked_sub(waited - MESSAGE_TICK).unwrap_or(at)));
+        }
+    });
+}
+
+/// When what's being done now started, for the budget's actions (budget.rs): the last key press
+/// or click, if one came in the last second and nothing has taken it, else the message or task
+/// running now, else `now`. Taking it means the next action starts from its own message.
+pub fn cause(now: Instant) -> Instant {
+    let cause = CAUSE
+        .with(|c| c.take())
+        .filter(|at| now.saturating_duration_since(*at) <= CAUSE_AT_MOST);
+    cause.or_else(|| OUTER.with(|o| o.get())).unwrap_or(now)
+}
+
+/// Times what runs until it's dropped, less what nested scopes took: always, for the counters,
+/// and logged when it's over the threshold
 #[must_use]
 pub struct Scope {
     site: Site,
-    start: Option<Instant>,
+    start: Instant,
     /// NESTED of the scope this one is inside
     outer: Duration,
 }
@@ -427,19 +480,17 @@ pub struct Scope {
 impl Scope {
     #[inline]
     fn new(site: Site) -> Self {
-        if THRESHOLD_MS.load(Ordering::Relaxed) == 0 {
-            return Self {
-                site,
-                start: None,
-                outer: Duration::ZERO,
-            };
-        }
         let outer = NESTED.with(|n| n.replace(Duration::ZERO));
-        Self {
-            site,
-            start: Some(Instant::now()),
-            outer,
+        let start = Instant::now();
+        if DEPTH.with(|d| d.replace(d.get() + 1)) == 0 {
+            OUTER.with(|o| o.set(Some(start)));
         }
+        if let Site::Message(msg) = site {
+            if is_cause(msg) {
+                CAUSE.with(|c| c.set(Some(start)));
+            }
+        }
+        Self { site, start, outer }
     }
 }
 
@@ -464,11 +515,17 @@ pub fn paint(window: usize, part: Part) -> Scope {
 impl Drop for Scope {
     #[inline]
     fn drop(&mut self) {
-        let Some(start) = self.start else { return };
         let now = Instant::now();
-        let total = now.saturating_duration_since(start);
+        let total = now.saturating_duration_since(self.start);
         let nested = NESTED.with(|n| n.replace(self.outer + total));
         let own = total.saturating_sub(nested);
+        let own_ns = own.as_nanos() as u64;
+        crate::counters::timed(self.site, own_ns);
+        if DEPTH.with(|d| d.replace(d.get().saturating_sub(1))) == 1 {
+            OUTER.with(|o| o.set(None));
+        }
+        // The budget: traced while an action waits to be shown, and a task at rest counted
+        crate::budget::timed(self.site, own_ns, now);
         let threshold = THRESHOLD_MS.load(Ordering::Relaxed);
         if threshold != 0 && own > Duration::from_millis(threshold) {
             record(self.site, own, threshold, now);
@@ -750,6 +807,71 @@ mod tests {
         assert_eq!(source_name(r"D:\some where\x.rs"), "some_where/x.rs");
     }
 
+    #[test]
+    fn an_action_starts_from_the_last_press_or_what_runs_now() {
+        let sleep = |ms| std::thread::sleep(Duration::from_millis(ms));
+        // A key's message: the action starts with it, and has taken it
+        let key_start;
+        {
+            let _key = message(0x0100);
+            key_start = OUTER.with(|o| o.get()).unwrap();
+            sleep(2);
+            assert_eq!(cause(Instant::now()), key_start);
+            assert!(CAUSE.with(|c| c.get()).is_none(), "taken");
+        }
+        assert_eq!(DEPTH.with(|d| d.get()), 0);
+        assert!(OUTER.with(|o| o.get()).is_none());
+        // A click, then a task a little later that does what the click asked: from the click
+        let click_start;
+        {
+            let _press = message(0x0201);
+            click_start = OUTER.with(|o| o.get()).unwrap();
+        }
+        {
+            let _move = message(0x0200);
+        }
+        sleep(3);
+        {
+            let _task = task(Location::caller());
+            let task_start = OUTER.with(|o| o.get()).unwrap();
+            assert!(task_start > click_start);
+            assert_eq!(cause(Instant::now()), click_start, "the move between isn't a cause");
+            // Nothing left to take: the task itself
+            assert_eq!(cause(Instant::now()), task_start);
+        }
+        // A press too long ago doesn't count
+        {
+            let _press = message(0x0204);
+        }
+        let later = Instant::now() + CAUSE_AT_MOST + Duration::from_millis(1);
+        assert_eq!(cause(later), later, "nothing running: now");
+    }
+
+    #[test]
+    fn a_key_that_waited_in_the_queue_starts_when_it_was_stamped_less_a_tick() {
+        // Waited 50 ms behind a busy GUI thread, by Windows' stamp: started 34 ms before it
+        // arrived (the stamp's clock is only good to a tick)
+        {
+            let _key = message(0x0100);
+            let arrived = OUTER.with(|o| o.get()).unwrap();
+            queued(0x0100, Duration::from_millis(50));
+            assert_eq!(cause(Instant::now()), arrived - Duration::from_millis(34));
+        }
+        // Two ticks or less could be the clock's own: from its arrival
+        {
+            let _key = message(0x0100);
+            let arrived = OUTER.with(|o| o.get()).unwrap();
+            queued(0x0100, Duration::from_millis(32));
+            assert_eq!(cause(Instant::now()), arrived);
+        }
+        // Not a cause: nothing changes
+        {
+            let _move = message(0x0200);
+            queued(0x0200, Duration::from_millis(500));
+            assert!(CAUSE.with(|c| c.get()).is_none());
+        }
+    }
+
     /// Scopes, timed for real: the global threshold makes this one test
     #[test]
     fn scopes_charge_the_innermost() {
@@ -763,7 +885,11 @@ mod tests {
         }
         assert_eq!(emitted(), Vec::<String>::new(), "0 is off");
 
-        set_threshold_ms(20);
+        // Far over the threshold for what's slow, and far under it for what isn't: the scope round
+        // a slow one owns the time its thread is held up between the two, which on a loaded PC was
+        // 32.6 ms with a threshold of 20 and a sleep of 40, and WM_PAINT was logged as slow too
+        // (lbterm.ps1 test, 2026-11-02). The code was right; the test's margins were too thin
+        set_threshold_ms(150);
         {
             let _quick = message(0x0101);
         }
@@ -773,7 +899,7 @@ mod tests {
         {
             let _msg = message(0x000F);
             let _paint = paint(3, Part::Draw);
-            sleep(40);
+            sleep(300);
         }
         let lines = emitted();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -785,7 +911,7 @@ mod tests {
         // A message whose own time is over, around a quick task
         {
             let _msg = message(0x0214);
-            sleep(40);
+            sleep(300);
             let _task = task(Location::caller());
         }
         let lines = emitted();

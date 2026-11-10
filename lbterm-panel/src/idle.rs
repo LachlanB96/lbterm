@@ -10,6 +10,18 @@ pub enum Bar {
     Red,
 }
 
+impl Bar {
+    /// Its colour's name, as test windows' state files say it
+    pub fn name(self) -> &'static str {
+        match self {
+            Bar::Off => "off",
+            Bar::Green => "green",
+            Bar::Yellow => "yellow",
+            Bar::Red => "red",
+        }
+    }
+}
+
 /// Timer steps lit for an idle age: 1 the moment Claude stops, 9 (all red)
 /// at `full` seconds.
 pub fn level(age: f64, full: f64) -> u8 {
@@ -44,6 +56,14 @@ pub fn bars(level: u8) -> [Bar; 3] {
     } else {
         [0, 1, 2].map(|b| bar(level, b))
     }
+}
+
+/// The bars to draw, bottom first, each with its place (0 the bottom): only those that are lit
+/// (Lachlan's 12a of 2026-11-01, lbterm/NEW-TAB.md, "Landing 4"). An unlit bar is drawn as
+/// nothing, so a pad at work or without Claude has none over it, where each had three dim
+/// stripes saying nothing. The bars light from the bottom, so what's drawn is a stack.
+pub fn lit(bars: [Bar; 3]) -> impl Iterator<Item = (usize, Bar)> {
+    bars.into_iter().enumerate().filter(|&(_, bar)| bar != Bar::Off)
 }
 
 /// How many seconds after `age` the timer next changes step, for waking
@@ -83,6 +103,26 @@ mod test {
         assert_eq!(bars(7), [Red, Yellow, Yellow]);
         assert_eq!(bars(9), [Red, Red, Red]);
         assert_eq!(bars(0), [Off, Off, Off]);
+    }
+
+    #[test]
+    fn only_lit_bars_are_drawn_none_at_rest() {
+        use Bar::*;
+        let drawn = |level: u8| lit(bars(level)).collect::<Vec<_>>();
+        // At work, or no Claude: nothing over the pad
+        assert_eq!(drawn(0), vec![]);
+        // The moment Claude stops, the bottom bar alone; then up the stack
+        assert_eq!(drawn(1), vec![(0, Green)]);
+        assert_eq!(drawn(2), vec![(0, Green), (1, Green)]);
+        assert_eq!(drawn(3), vec![(0, Green), (1, Green), (2, Green)]);
+        // From level 3 every bar is lit, whatever its colour
+        for level in 3..=9 {
+            assert_eq!(drawn(level).len(), 3, "at level {level}");
+            assert_eq!(drawn(level), bars(level).into_iter().enumerate().collect::<Vec<_>>());
+        }
+        assert_eq!(drawn(7), vec![(0, Red), (1, Yellow), (2, Yellow)]);
+        // Each in its own place, never moved down to fill a gap
+        assert_eq!(lit([Off, Green, Off]).collect::<Vec<_>>(), vec![(1, Green)]);
     }
 
     #[test]

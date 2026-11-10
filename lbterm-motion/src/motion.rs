@@ -116,6 +116,37 @@ impl Motion {
         }
     }
 
+    /// When it's first `share` of the way from `from` to `to`, in seconds:
+    /// at once if it's already there or has no way to go, and never past its
+    /// end (`epsilon` as for [`Motion::end`]).
+    pub fn reaches(&self, share: f64, epsilon: f64) -> f64 {
+        let way = self.to - self.from;
+        if share <= 0.0 || way == 0.0 {
+            return 0.0;
+        }
+        let end = self.end(epsilon);
+        let there = |t: f64| (self.value(t) - self.from) / way >= share;
+        // A millisecond at a time (a spring may pass it and come back), then
+        // bisected to a hundredth of one
+        let mut t = 0.0;
+        while t < end && !there(t) {
+            t += 0.001;
+        }
+        if t >= end {
+            return end;
+        }
+        let (mut lo, mut hi) = ((t - 0.001).max(0.0), t);
+        while hi - lo > 0.00001 {
+            let mid = (lo + hi) / 2.0;
+            if there(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
     /// The cubics DComp plays for this motion, one per `step` seconds (the
     /// last one shorter), each through the exact position and velocity at
     /// its ends. The final cubic lands on `to` at rest, so the hand-off to
@@ -145,10 +176,11 @@ impl Motion {
                     }
                 }
                 _ => {
+                    let at = |t: f64| (self.value(t), self.velocity(t));
                     let mut t0 = 0.0;
                     while t0 < end - 1e-9 {
                         let t1 = (t0 + step).min(end);
-                        self.fit(t0, t1, end, epsilon / 4.0, 0, &mut cubics);
+                        fit(&at, self.to, t0, t1, end, epsilon / 4.0, 0, &mut cubics);
                         t0 = t1;
                     }
                 }
@@ -160,33 +192,60 @@ impl Motion {
             end_value: self.to as f32,
         }
     }
+}
 
-    /// One cubic over [t0, t1], halved until it's within `tolerance` of
-    /// the motion (at most four times: steep curves like a fast ease-out
-    /// need it early on, springs rarely do).
-    fn fit(&self, t0: f64, t1: f64, end: f64, tolerance: f64, depth: u32, out: &mut Vec<Cubic>) {
-        let last = t1 >= end - 1e-9;
-        let (p1, m1) = if last {
-            (self.to, 0.0)
-        } else {
-            (self.value(t1), self.velocity(t1))
-        };
-        let cubic = hermite(t0, self.value(t0), self.velocity(t0), t1, p1, m1);
-        // The last cubic bends onto the target, which the motion only
-        // reaches within epsilon, so it isn't held to the tolerance
-        let fits = depth >= 4
-            || last
-            || [0.25, 0.5, 0.75].iter().all(|f| {
-                let t = t0 + (t1 - t0) * f;
-                (cubic.value(t) - self.value(t)).abs() <= tolerance
-            });
-        if fits {
-            out.push(cubic);
-        } else {
-            let mid = (t0 + t1) / 2.0;
-            self.fit(t0, mid, end, tolerance, depth + 1, out);
-            self.fit(mid, t1, end, tolerance, depth + 1, out);
-        }
+/// Any number moving smoothly from now until `end` seconds, where it rests at `end_value`, as
+/// the cubics DComp plays for it: `at` gives its value and velocity at each moment, and it's
+/// fitted as [`Motion::segments`] fits a curve, a cubic per `step` seconds through the exact value
+/// and velocity at both ends, halved where it strays more than a quarter of `epsilon`, the last
+/// bending onto `end_value` at rest. For what no one curve is: the opacity a layer needs to show
+/// its share under others fading on their own (`flight`).
+pub fn sample(at: impl Fn(f64) -> (f64, f64), end: f64, end_value: f64, step: f64, epsilon: f64) -> Segments {
+    let mut cubics = vec![];
+    let mut t0 = 0.0;
+    while t0 < end - 1e-9 {
+        let t1 = (t0 + step).min(end);
+        fit(&at, end_value, t0, t1, end, epsilon / 4.0, 0, &mut cubics);
+        t0 = t1;
+    }
+    Segments {
+        cubics,
+        end: end.max(0.0),
+        end_value: end_value as f32,
+    }
+}
+
+/// One cubic over [t0, t1] of what `at` gives (value and velocity), halved until it's within
+/// `tolerance` of it (at most four times: steep curves like a fast ease-out need it early on,
+/// springs rarely do). The one ending at `end` lands on `to` at rest.
+fn fit(
+    at: &dyn Fn(f64) -> (f64, f64),
+    to: f64,
+    t0: f64,
+    t1: f64,
+    end: f64,
+    tolerance: f64,
+    depth: u32,
+    out: &mut Vec<Cubic>,
+) {
+    let last = t1 >= end - 1e-9;
+    let (p1, m1) = if last { (to, 0.0) } else { at(t1) };
+    let (p0, m0) = at(t0);
+    let cubic = hermite(t0, p0, m0, t1, p1, m1);
+    // The last cubic bends onto the target, which the motion only
+    // reaches within epsilon, so it isn't held to the tolerance
+    let fits = depth >= 4
+        || last
+        || [0.25, 0.5, 0.75].iter().all(|f| {
+            let t = t0 + (t1 - t0) * f;
+            (cubic.value(t) - at(t).0).abs() <= tolerance
+        });
+    if fits {
+        out.push(cubic);
+    } else {
+        let mid = (t0 + t1) / 2.0;
+        fit(at, to, t0, mid, end, tolerance, depth + 1, out);
+        fit(at, to, mid, t1, end, tolerance, depth + 1, out);
     }
 }
 
@@ -225,6 +284,67 @@ impl Segments {
             .unwrap_or(0);
         self.cubics[i].value(t)
     }
+
+    /// The same motion carried onto `offset + scale × value`: several numbers that move as
+    /// one, such as the elements of a colour matrix following one mix (the active outline's
+    /// tint while modifiers are held)
+    pub fn affine(&self, offset: f64, scale: f64) -> Segments {
+        Segments {
+            cubics: self
+                .cubics
+                .iter()
+                .map(|c| {
+                    let [c0, c1, c2, c3] = c.coefficients.map(|k| k as f64);
+                    Cubic {
+                        begin: c.begin,
+                        coefficients: [
+                            (offset + scale * c0) as f32,
+                            (scale * c1) as f32,
+                            (scale * c2) as f32,
+                            (scale * c3) as f32,
+                        ],
+                    }
+                })
+                .collect(),
+            end: self.end,
+            end_value: (offset + scale * self.end_value as f64) as f32,
+        }
+    }
+
+    /// What it plays as numbers: where it starts and ends, and the least and most it reaches on
+    /// the way, read every millisecond of its cubics (at most [`SPAN_SAMPLES`]). The state file
+    /// says it under the animation's name (lbterm/STATE.md, `played`), so a test checks a look's
+    /// values there instead of reading pixels (Lachlan's 3a of 2026-11-09). Worked out only in a
+    /// window with a state file, so it costs Lachlan's nothing
+    pub fn span(&self) -> Span {
+        let Some(first) = self.cubics.first() else {
+            let v = self.end_value as f64;
+            return Span { from: v, to: v, low: v, high: v };
+        };
+        let (begin, end) = (first.begin, self.end.max(first.begin));
+        let from = self.value(begin);
+        let to = self.end_value as f64;
+        let (mut low, mut high) = (from.min(to), from.max(to));
+        let steps = (((end - begin) * 1000.0).ceil() as usize).clamp(1, SPAN_SAMPLES);
+        for k in 0..=steps {
+            let v = self.value(begin + (end - begin) * k as f64 / steps as f64);
+            low = low.min(v);
+            high = high.max(v);
+        }
+        Span { from, to, low, high }
+    }
+}
+
+/// The most points [`Segments::span`] reads: ten seconds of milliseconds
+pub const SPAN_SAMPLES: usize = 10_000;
+
+/// A motion's numbers: [`Segments::span`]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub from: f64,
+    pub to: f64,
+    pub low: f64,
+    pub high: f64,
 }
 
 /// Motions played one after another on one number, each starting where the
@@ -343,6 +463,48 @@ mod test {
     }
 
     #[test]
+    fn a_span_says_where_a_motion_starts_ends_and_reaches() {
+        // A fade out: from 1 to 0, never past either
+        let fade = Motion::new(1.0, 0.0, 0.0, "120ms cubic-bezier(0.23, 1, 0.32, 1)".parse().unwrap()).segments(0.002, 0.001);
+        let s = fade.span();
+        assert!((s.from - 1.0).abs() < 1e-3 && s.to == 0.0, "{s:?}");
+        assert!((s.high - 1.0).abs() < 1e-3 && s.low.abs() < 1e-3, "{s:?}");
+        // A pulse from 0 up to its peak at 1 and down to rest at 0.2, the peak its high
+        let p = pulse().segments(0.002, 0.001).span();
+        assert!(p.from.abs() < 1e-3 && (p.to - 0.2).abs() < 1e-3, "{p:?}");
+        assert!((p.high - 1.0).abs() < 0.02, "{p:?}");
+        assert!(p.low > -0.02, "{p:?}");
+        // A spring that overshoots reaches past where it ends
+        let bounce = Motion::new(0.0, 100.0, 0.0, "spring(300ms, 0.4)".parse().unwrap()).segments(0.002, 0.01).span();
+        assert!(bounce.high > 100.5 && bounce.to == 100.0, "{bounce:?}");
+        // Nothing to play: its end, all four
+        let set = Segments { cubics: vec![], end: 0.0, end_value: 0.4 };
+        assert_eq!(set.span(), Span { from: 0.4f32 as f64, to: 0.4f32 as f64, low: 0.4f32 as f64, high: 0.4f32 as f64 });
+    }
+
+    #[test]
+    fn when_a_motion_is_some_of_the_way() {
+        // The swap's ease-out is three quarters in at 47 ms, the hover spring at 107 ms: a rail
+        // row's old look starts going then (compositor.rs, `DISSOLVE_IN`)
+        let swap = Motion::new(0.0, 1.0, 0.0, "200ms cubic-bezier(0.23, 1, 0.32, 1)".parse().unwrap());
+        let t = swap.reaches(0.75, 0.002);
+        assert!((t - 0.047).abs() < 0.001, "{t}");
+        assert!((swap.value(t) - 0.75).abs() < 0.001);
+        let hover = Motion::new(0.0, 1.0, 0.0, "spring(250ms, 0)".parse().unwrap());
+        let t = hover.reaches(0.75, 0.002);
+        assert!((t - 0.107).abs() < 0.001, "{t}");
+        // Going down, it's the share of the way down
+        let down = Motion::new(1.0, 0.0, 0.0, "200ms cubic-bezier(0.23, 1, 0.32, 1)".parse().unwrap());
+        assert!((down.reaches(0.75, 0.002) - swap.reaches(0.75, 0.002)).abs() < 1e-9);
+        // Already there, nowhere to go, or at once: no wait
+        assert_eq!(swap.reaches(0.0, 0.002), 0.0);
+        assert_eq!(Motion::new(0.5, 0.5, 0.0, swap.curve.clone()).reaches(0.75, 0.002), 0.0);
+        assert_eq!(Motion::new(0.0, 1.0, 0.0, Curve::Instant).reaches(0.75, 0.002), 0.0);
+        // Never past its end
+        assert!(swap.reaches(1.0, 0.002) <= swap.end(0.002) + 1e-9);
+    }
+
+    #[test]
     fn a_pulse_rises_to_its_peak_then_settles() {
         let p = pulse();
         assert_eq!(p.value(0.0), 0.0);
@@ -375,6 +537,24 @@ mod test {
             .fold(0.0, f64::max);
         // Opacity: well under one level of 255
         assert!(worst < 0.004, "{worst}");
+    }
+
+    #[test]
+    fn a_motion_carried_onto_another_number_follows_it_exactly() {
+        // The tint's mix 0 to 1, carried onto a matrix element going 1 to 0 (1 - mix) and an
+        // offset going to 0.24 (0.24 × mix)
+        let mix = Motion::new(0.0, 1.0, 0.0, "80ms cubic-bezier(0.23, 1, 0.32, 1)".parse().unwrap())
+            .segments(1.0 / 120.0, 0.002);
+        let fall = mix.affine(1.0, -1.0);
+        let offset = mix.affine(0.0, 0.24);
+        assert_eq!((fall.end, offset.end), (mix.end, mix.end));
+        assert_eq!(fall.end_value, 0.0);
+        assert!((offset.end_value - 0.24).abs() < 1e-6);
+        for i in 0..=120 {
+            let t = i as f64 / 1000.0;
+            assert!((fall.value(t) - (1.0 - mix.value(t))).abs() < 1e-6, "at {t}");
+            assert!((offset.value(t) - 0.24 * mix.value(t)).abs() < 1e-6, "at {t}");
+        }
     }
 
     #[test]

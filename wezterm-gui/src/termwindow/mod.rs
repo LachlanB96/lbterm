@@ -71,11 +71,21 @@ use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, Termi
 
 pub mod background;
 pub mod box_model;
+pub(crate) mod budget;
 pub mod charselect;
 pub mod clipboard;
 pub mod compositor;
+mod control;
+mod echo;
 mod gpu_lost;
+pub(crate) mod gpu_work;
+mod held;
+mod hop;
+mod frame_wait;
+mod hidden_scan;
+mod panes_drawn;
 pub mod keyevent;
+pub(crate) mod last_tab;
 pub mod modal;
 mod mouseevent;
 pub mod palette;
@@ -87,9 +97,13 @@ mod selection;
 mod notify;
 pub mod spawn;
 mod state;
+mod tab_links;
 mod tab_mouse;
 mod taskbar;
+mod titles;
 pub mod webgpu;
+// LBTerm: the GPU's instance and adapter, once a process (gpu_warm.rs)
+pub mod gpu_warm;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -262,7 +276,8 @@ impl UserData for TabInformation {
             let window = mux.get_window(this.window_id).ok_or_else(|| {
                 mlua::Error::external(format!("window {} not found", this.window_id))
             })?;
-            Ok(window.get_title().to_string())
+            // LBTerm: the server's newest, kept until a take sets it (mux's lbterm_window_titles)
+            Ok(mux::lbterm_window_titles::title(&window))
         });
     }
 }
@@ -441,6 +456,9 @@ pub struct TermWindow {
 
     quad_generation: usize,
     shape_generation: usize,
+    /// LBTerm: bumped when what a link to an InMail message or an image says of it changes:
+    /// only the lines holding one are shaped again (lbterm_extras::link_looks)
+    lbterm_link_states: u64,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
@@ -448,8 +466,32 @@ pub struct TermWindow {
     next_line_state_id: u64,
 
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
+    /// LBTerm: where a pane's line is laid out before it's kept in the line quad cache at its own
+    /// size, emptied for each and its room kept (render/pane.rs)
+    lbterm_line_quads: RefCell<crate::quad::HeapQuadAllocator>,
 
     last_status_call: Instant,
+    /// LBTerm: the title last given to the window, so update_title_impl sets only a new one
+    shown_title: String,
+    /// LBTerm: the title update the alerts since the last are waiting on (titles.rs)
+    lbterm_titles: lbterm_extras::titles::Soon,
+    /// LBTerm: what the tab bar was last made of (titles.rs)
+    lbterm_tab_bar_key: Option<titles::TabBarKey>,
+    /// LBTerm: what the window's handlers read, as the config last loaded says, and the rail's
+    /// rows as the last paint drew them, for the mux subscription, which can't ask Lua or the
+    /// window itself (titles.rs)
+    lbterm_title_watch: Arc<titles::TitleWatch>,
+    /// LBTerm: the mux panes out of view that have printed since their screen was scanned for
+    /// links, for the mux subscription (hidden_scan.rs)
+    lbterm_quiet: hidden_scan::Quiet,
+    /// LBTerm: the view last drawn, and a new one's panes waiting for a held pane's push; whose
+    /// panes this frame draws, and when the wait's wake is armed for (frame_wait.rs)
+    lbterm_frame_wait: lbterm_extras::frame_wait::FrameWait<frame_wait::View>,
+    lbterm_frame_tab: frame_wait::FrameTab,
+    lbterm_frame_wake: Option<Instant>,
+    /// LBTerm: the client panes a paint has read with a push applied since they were last said,
+    /// said to their servers at its end; kept with its room between paints (panes_drawn.rs)
+    lbterm_read: panes_drawn::Read,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -481,6 +523,16 @@ pub struct TermWindow {
     /// LBTerm: a test window (`LBTERM_NO_ACTIVATE`) never has the keyboard, so its outline
     /// shows as though it had until a posted WM_KILLFOCUS or WM_SETFOCUS says otherwise
     pub lbterm_keyboard_assumed: bool,
+    /// LBTerm: the caret the IME's window was last moved to, and whether the window had the
+    /// keyboard then: it's moved only when that changes. Every frame moved it, in a task of its
+    /// own (update_text_cursor; render/conductor_view.rs)
+    pub lbterm_ime: lbterm_extras::work::Told<(::window::Rect, bool)>,
+    /// LBTerm: during a drag of the frame only the tab in view takes each size, the rest the
+    /// one the drag ends at (lbterm_extras::resize; resize.rs)
+    pub lbterm_resize: lbterm_extras::resize::Behind,
+    /// LBTerm: Ctrl, Shift and Alt as the last key or pointer message had them, which tint the
+    /// active outline while held (held.rs)
+    pub lbterm_held: held::Held,
     /// LBTerm: the tab panel (lbterm/TAB-PANEL.md)
     pub lbterm_panel: render::tab_panel::TabPanelState,
     /// LBTerm: the card templates drawn this frame, with the compositor
@@ -492,24 +544,63 @@ pub struct TermWindow {
     pub lbterm_lights: render::lights::LightsState,
     /// LBTerm: prompt marks on the scrollbar (render/marks.rs)
     lbterm_marks: render::marks::MarksState,
+    /// LBTerm: the rows each local pane's last frame copied out of its terminal
+    /// (render/pane_lines.rs)
+    lbterm_line_copies: render::pane_lines::LineCopies,
     /// LBTerm: what triggers matched, and the hearts in flight (render/triggers.rs)
     lbterm_triggers: render::triggers::TriggersState,
+    /// LBTerm: a composition ended with no frame painted since (termwindow/echo.rs)
+    lbterm_composition_ended: bool,
     /// LBTerm: a tab being dragged (tab_mouse.rs)
     lbterm_tab_mouse: tab_mouse::TabMouseState,
+    /// LBTerm: a tab being right-dragged onto another to wait on it, and link changes the links
+    /// file doesn't say yet (tab_links.rs)
+    lbterm_links: tab_links::TabLinksState,
     /// LBTerm: the tab menu (render/tab_menu.rs)
     lbterm_menu: render::tab_menu::TabMenuState,
     /// LBTerm: the window strip's words and detail card (render/strip.rs)
     lbterm_strip: render::strip::StripState,
+    /// LBTerm: the objectives panel down the right (render/objectives.rs)
+    lbterm_objectives: render::objectives::ObjectivesState,
+    /// LBTerm: the scroll strip, left of the objectives panel (render/scroll_strip.rs)
+    lbterm_scroll_strip: render::scroll_strip::ScrollStripState,
+    /// LBTerm: what those two strips draw, and how they were as a tab is left (render/sides.rs)
+    lbterm_sides: render::sides::SidesState,
+    /// LBTerm: the card of what a tab's Claude session has running, beside its row on the
+    /// open tab panel (render/tasks_card.rs)
+    lbterm_tasks: render::tasks_card::TasksCardState,
     /// LBTerm: the strip's last prompt, the list of them, and jumps to them (render/prompt.rs)
     lbterm_prompts: render::prompt::PromptState,
     /// LBTerm: the question colours, while they're shown (render/questions.rs)
     lbterm_questions: render::questions::QuestionsState,
+    /// LBTerm: the voice drafts' cards as last drawn (render/draft.rs)
+    lbterm_drafts: render::draft::DraftsState,
     /// LBTerm: the Conductor's menu, while it's open (render/conductor.rs)
     lbterm_conductor: render::conductor::ConductorState,
+    /// LBTerm: the Conductor's view, while it's open (render/conductor_view.rs)
+    lbterm_view: render::conductor_view::ViewState,
+    /// LBTerm: the InMail button and its list (render/inbox.rs)
+    lbterm_inbox: render::inbox::InboxState,
+    /// LBTerm: the new-tab pad at the rail's foot, its picker, its + menu and the Starting row
+    /// (render/new_tab.rs)
+    lbterm_new_tab: render::new_tab::NewTabState,
+    lbterm_agenda: render::agenda::AgendaState,
+    /// LBTerm: the pill under the InMail button, with the open tab's Claude cost, and its list of
+    /// the files in its context (render/context.rs)
+    lbterm_context: render::context::ContextState,
+    /// LBTerm: what the panes drew of the images they link to (render/thumbnails.rs)
+    lbterm_thumbnails: render::thumbnails::ThumbnailsState,
     /// LBTerm: building the GPU state again after the device went (gpu_lost.rs)
     lbterm_gpu: gpu_lost::GpuLostState,
     /// LBTerm: what it shows, for a test window's state file (lbterm/STATE.md)
     lbterm_state: state::StateProbe,
+    /// LBTerm: the actions timed until a frame shows them, and the clocks it shows
+    /// (termwindow/budget.rs, lbterm/PERF.md)
+    lbterm_budget: RefCell<budget::BudgetState>,
+    /// LBTerm: the frame asked for once the panes fading out are done (render/composited.rs)
+    lbterm_fading_wake: Option<Instant>,
+    /// LBTerm: the motion settings, made once for the config (compositor.rs, `lbterm_motion()`)
+    lbterm_motion_cache: compositor::MotionCache,
     last_fps_check_time: Instant,
     num_frames: usize,
     pub fps: f32,
@@ -582,11 +673,19 @@ impl TermWindow {
         log::trace!("Setting focus to {:?}", focused);
         // LBTerm: the summon key is held only while LBTerm hasn't got the keyboard (summon.rs)
         crate::summon::focus_changed(focused);
+        // LBTerm: the seat's `seat.show` opens the Conductor's view in the window last used
+        if focused {
+            crate::seat_client::focused(self.mux_window_id);
+        }
         self.focused = if focused { Some(Instant::now()) } else { None };
         // LBTerm: the active outline goes out without the keyboard and pulses as it comes back
         self.lbterm_arrival.focus(focused, Instant::now());
         self.lbterm_keyboard_assumed = false;
-        self.quad_generation += 1;
+        // LBTerm: nothing is held without the keyboard (held.rs)
+        self.lbterm_note_held(::window::Modifiers::NONE);
+        // LBTerm: no line is made again for it but the cursor's, whose look it changes: its key
+        // says whether the window has the keyboard (render/pane.rs). quad_generation went up,
+        // and every line of every pane in view was made again
         self.load_os_parameters();
 
         if self.focused.is_none() {
@@ -600,6 +699,8 @@ impl TermWindow {
             }
             // LBTerm: a button let go in another window never comes back here (render/questions.rs)
             self.lbterm_questions_hide();
+            // LBTerm: the new-tab picker and its menu close with the keyboard gone (render/new_tab.rs)
+            self.lbterm_new_tab_focus_lost();
         }
 
         // Reset the cursor blink phase
@@ -622,7 +723,10 @@ impl TermWindow {
         let render_info = ctx.renderer_info();
         self.opengl_info.replace(render_info.clone());
 
-        match RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE) {
+        // LBTerm: at the size this process's windows' atlases have grown to, so a new window's
+        // first frame doesn't grow its own from 128 px a side, drawing everything again each
+        // time (counters.rs's fonts)
+        match RenderState::new(ctx, &self.fonts, &self.render_metrics, crate::counters::fonts::atlas_start(ATLAS_SIZE)) {
             Ok(render_state) => {
                 log::debug!(
                     "OpenGL initialized! {} wezterm version: {}",
@@ -646,9 +750,13 @@ impl TermWindow {
 
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
+        // LBTerm: how long each step of making it takes, said on lbterm::start at debug and kept
+        // for metrics' start (lbterm_extras::start)
+        let mut steps = lbterm_extras::start::Steps::new("window");
         let config = configuration();
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
+        steps.step("fonts");
 
         let mux = Mux::get();
         let size = match mux.get_active_tab_for_window(mux_window_id) {
@@ -663,6 +771,7 @@ impl TermWindow {
 
         let render_metrics = RenderMetrics::new(&fontconfig)?;
         log::trace!("using render_metrics {:#?}", render_metrics);
+        steps.step("metrics");
 
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
@@ -749,20 +858,40 @@ impl TermWindow {
             lbterm_spans: Default::default(),
             lbterm_arrival: lbterm_extras::arrival::Arrival::new(Instant::now()),
             lbterm_keyboard_assumed: std::env::var_os("LBTERM_NO_ACTIVATE").is_some(),
+            lbterm_ime: Default::default(),
+            lbterm_resize: Default::default(),
+            lbterm_held: Default::default(),
             lbterm_panel: Default::default(),
             lbterm_cards: None,
             lbterm_hover: Default::default(),
             lbterm_lights: Default::default(),
             lbterm_marks: Default::default(),
+            lbterm_line_copies: Default::default(),
             lbterm_triggers: Default::default(),
+            lbterm_composition_ended: false,
             lbterm_tab_mouse: Default::default(),
+            lbterm_links: Default::default(),
             lbterm_menu: Default::default(),
             lbterm_strip: Default::default(),
+            lbterm_objectives: Default::default(),
+            lbterm_scroll_strip: Default::default(),
+            lbterm_sides: Default::default(),
+            lbterm_tasks: Default::default(),
             lbterm_prompts: Default::default(),
             lbterm_questions: Default::default(),
+            lbterm_drafts: Default::default(),
             lbterm_conductor: Default::default(),
+            lbterm_view: Default::default(),
+            lbterm_inbox: Default::default(),
+            lbterm_new_tab: Default::default(),
+            lbterm_agenda: Default::default(),
+            lbterm_context: Default::default(),
+            lbterm_thumbnails: Default::default(),
             lbterm_gpu: Default::default(),
             lbterm_state: Default::default(),
+            lbterm_budget: Default::default(),
+            lbterm_fading_wake: None,
+            lbterm_motion_cache: Default::default(),
             fps: 0.,
             config_subscription: None,
             os_parameters: None,
@@ -790,7 +919,7 @@ impl TermWindow {
             leader_is_down: None,
             dead_key_status: DeadKeyStatus::None,
             show_tab_bar,
-            show_scroll_bar: config.enable_scroll_bar,
+            show_scroll_bar: config.enable_scroll_bar && render::scroll_strip::panes_keep_scroll_bar(&config),
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
             right_status: String::new(),
@@ -810,6 +939,7 @@ impl TermWindow {
             lbterm_link_press: None,
             quad_generation: 0,
             shape_generation: 0,
+            lbterm_link_states: 0,
             shape_cache: RefCell::new(LfuCache::new(
                 "shape_cache.hit.rate",
                 "shape_cache.miss.rate",
@@ -829,6 +959,7 @@ impl TermWindow {
                 |config| config.line_quad_cache_size,
                 &config,
             )),
+            lbterm_line_quads: RefCell::default(),
             line_to_ele_shape_cache: RefCell::new(LfuCache::new(
                 "line_to_ele_shape_cache.hit.rate",
                 "line_to_ele_shape_cache.miss.rate",
@@ -836,6 +967,15 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
+            shown_title: String::new(),
+            lbterm_titles: Default::default(),
+            lbterm_tab_bar_key: None,
+            lbterm_title_watch: Arc::new(titles::TitleWatch::default()),
+            lbterm_quiet: hidden_scan::new_quiet(),
+            lbterm_frame_wait: Default::default(),
+            lbterm_frame_tab: Default::default(),
+            lbterm_frame_wake: None,
+            lbterm_read: Vec::new(),
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
@@ -874,19 +1014,36 @@ impl TermWindow {
 
         let tw = Rc::new(RefCell::new(myself));
         let tw_event = Rc::clone(&tw);
+        steps.step("state");
 
         let mut x = None;
         let mut y = None;
         let mut origin = GeometryOrigin::default();
 
+        // LBTerm: where this window was, unless it was asked to open somewhere (placement.rs)
+        let placement = crate::placement::find(mux_window_id);
+        let mut place = placement.as_ref().and_then(|(place, _)| *place);
+        // A restart starts this GUI with the old one's command line, whose --position was for
+        // the first start: the window goes back where it was instead
+        let command_line = POSITION
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|_| place.is_none() || crate::restart::restarted_from().is_none());
         if let Some(position) = mux
             .get_window(mux_window_id)
             .and_then(|window| window.get_initial_position().clone())
-            .or_else(|| POSITION.lock().unwrap().take())
+            .or(command_line)
         {
             x.replace(position.x);
             y.replace(position.y);
             origin = position.origin;
+            place = None;
+        } else if let Some(p) = place {
+            // Made on its screen, so it starts at that screen's DPI; shown at its place
+            x.replace(Dimension::Pixels(p.left as f32));
+            y.replace(Dimension::Pixels(p.top as f32));
+            origin = GeometryOrigin::ScreenCoordinateSystem;
         }
 
         let geometry = RequestedWindowGeometry {
@@ -912,7 +1069,12 @@ impl TermWindow {
             },
         )
         .await?;
+        steps.step("os_window");
         tw.borrow_mut().window.replace(window.clone());
+        // LBTerm: shown at its place, and its place kept from now on (placement.rs)
+        if let Some((_, file)) = placement {
+            crate::placement::keep(&window, place, file);
+        }
 
         Self::apply_icon(&window)?;
 
@@ -946,6 +1108,7 @@ impl TermWindow {
                 )),
                 _ => None,
             };
+            steps.step("gpu");
             myself.config_subscription.replace(config_subscription);
             if config.use_resize_increments {
                 window.set_resize_increments(
@@ -971,16 +1134,19 @@ impl TermWindow {
                 myself.webgpu.replace(Rc::clone(&webgpu));
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
+            steps.step("render_state");
             myself.load_os_parameters();
             window.show();
+            steps.step("show");
+            myself.lbterm_titles_read_update();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
         }
 
         crate::update::start_update_checker();
-        // LBTerm: the first window asks about the tabs a crash left (restore.rs); the others
-        // find nothing to offer
+        // LBTerm: a window asks about the tabs a crash left (restore.rs), once LBTerm's start-up
+        // is done; the others, and this one before that, find nothing to offer
         window.notify(TermWindowNotif::Apply(Box::new(|tw| {
             tw.lbterm_offer_restore();
             // LBTerm: what it came back as, or the tabs it found running (render/strip.rs)
@@ -989,9 +1155,16 @@ impl TermWindow {
             crate::summon::set_key(crate::summon::configured(&tw.config));
             // LBTerm: a test window's state file has it before its first frame (state.rs)
             tw.lbterm_state_created();
-            // LBTerm: the slow-frame log, off until now (lbterm_extras::slow)
+            // LBTerm: the slow-frame log, off until now (lbterm_extras::slow), and the budget
+            // (termwindow/budget.rs)
             lbterm_extras::slow::set_threshold_ms(tw.config.lbterm_slow_ms);
+            tw.lbterm_budget_configure();
+            // LBTerm: where the new-tab picker keeps its recent picks, and the keys it names
+            // (render/new_tab.rs)
+            tw.lbterm_new_tab_configure();
+            tw.lbterm_new_tab_keys();
         })));
+        steps.done();
         // LBTerm: tests only, the GPU device removed as a driver reset would (gpu_lost.rs)
         gpu_lost::schedule_test_removal(&window);
         front_end().record_known_window(window, mux_window_id);
@@ -1005,6 +1178,8 @@ impl TermWindow {
         window: &Window,
     ) -> anyhow::Result<bool> {
         log::debug!("{event:?}");
+        // LBTerm: something happening to the window keeps it busy (termwindow/budget.rs)
+        self.lbterm_budget_event(&event);
         match event {
             WindowEvent::Destroyed => {
                 // Ensure that we cancel any overlays we had running, so
@@ -1013,8 +1188,11 @@ impl TermWindow {
                 // the window is gone and we'll linger forever.
                 // <https://github.com/wezterm/wezterm/issues/3522>
                 self.clear_all_overlays();
-                // LBTerm: out of a test window's state file (state.rs)
+                // LBTerm: out of a test window's state file (state.rs), and owed no frames
+                // (lbterm_extras::counters)
                 self.lbterm_state_closed();
+                lbterm_extras::counters::window_gone(self.lbterm_state_hwnd() as usize);
+                self.lbterm_budget_forget();
                 Ok(false)
             }
             WindowEvent::CloseRequested => {
@@ -1033,8 +1211,16 @@ impl TermWindow {
                 // global config here once per window, which could
                 // be nasty for folks with a lot of windows.
                 // <https://github.com/wezterm/wezterm/issues/2295>
-                config::reload();
-                self.config_was_reloaded();
+                // LBTerm: once a change, by the first window to hear of it, and the reload applies
+                // it to every window (each one's config subscription), this one included, which
+                // applied it a second time here (lbterm_extras::appearance)
+                thread_local! {
+                    static APPEARANCE_RELOADS: RefCell<lbterm_extras::appearance::Reloads<Appearance>> =
+                        RefCell::new(Default::default());
+                }
+                if APPEARANCE_RELOADS.with(|r| r.borrow_mut().wants(appearance)) {
+                    config::reload();
+                }
                 Ok(true)
             }
             WindowEvent::PerformKeyAssignment(action) => {
@@ -1061,6 +1247,9 @@ impl TermWindow {
                 window_state,
                 live_resizing,
             } => {
+                // LBTerm: the window puts the IME's window back at its corner as it says it was
+                // resized (window/src/os/windows/window.rs), so the caret is given it again
+                self.lbterm_ime.forget();
                 self.resize(dimensions, window_state, window, live_resizing);
                 Ok(true)
             }
@@ -1097,11 +1286,16 @@ impl TermWindow {
                 } else {
                     log::trace!("DeadKeyStatus now: {:?}", status);
                 }
+                // LBTerm: a composition's end paints with the composed key's echo, not ahead of
+                // it (termwindow/echo.rs)
+                let frame = self.lbterm_composition_frame(&status, window);
                 self.dead_key_status = status;
                 self.update_title();
                 // Ensure that we repaint so that any composing
                 // text is updated
-                window.invalidate();
+                if frame {
+                    window.invalidate();
+                }
                 Ok(true)
             }
             WindowEvent::NeedRepaint => {
@@ -1116,6 +1310,7 @@ impl TermWindow {
             }
             WindowEvent::Notification(item) => {
                 if let Ok(notif) = item.downcast::<TermWindowNotif>() {
+                    self.lbterm_budget_notif(&notif);
                     self.dispatch_notif(*notif, window)
                         .context("dispatch_notif")?;
                 }
@@ -1228,8 +1423,40 @@ impl TermWindow {
     }
 
     fn do_paint_webgpu_impl(&mut self) -> anyhow::Result<bool> {
+        self.lbterm_follow_window_size();
         self.paint_impl(&mut RenderFrame::WebGpu);
         Ok(true)
+    }
+
+    /// LBTerm: lays the window out again when Windows says it's another size than the layout
+    /// was made for. Every resize reports the size, but one lost as a maximized window was
+    /// restored on its screen (2026-10-28) left the panes, the strips and the window's buttons
+    /// laid out about 100 px short of its right edge, the surface (which takes its size from
+    /// Windows) drawn the whole width
+    fn lbterm_follow_window_size(&mut self) {
+        if self.resizes_pending > 0 {
+            return;
+        }
+        let Some((w, h)) = self.webgpu.as_ref().and_then(|g| g.client_size()) else {
+            return;
+        };
+        if w == 0 || h == 0 || (w, h) == (self.dimensions.pixel_width, self.dimensions.pixel_height) {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        log::warn!(
+            "the layout was made for {}x{}, the window is {w}x{h}: laid out again",
+            self.dimensions.pixel_width,
+            self.dimensions.pixel_height
+        );
+        let dims = Dimensions { pixel_width: w, pixel_height: h, dpi: self.dimensions.dpi };
+        let state = self.window_state;
+        // LBTerm: during a drag of the frame this is the drag's next size, seen before the window
+        // is told of it: a drag's, for the tab in view alone (lbterm_extras::resize)
+        let live = self.lbterm_resize.dragging();
+        self.resize(dims, state, &window, live);
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
@@ -1239,6 +1466,7 @@ impl TermWindow {
 
         match notif {
             TermWindowNotif::InvalidateShapeCache => {
+                crate::counters::fonts::RESHAPES.one();
                 self.shape_generation += 1;
                 self.shape_cache.borrow_mut().clear();
                 self.invalidate_modal();
@@ -1327,7 +1555,15 @@ impl TermWindow {
                     pane_id,
                 } => {
                     // LBTerm: the strip names the session's summary (render/strip.rs)
-                    if name == "claude_session" {
+                    // ...and the tab rail draws each tab's pad from claudehook's `claude_status`
+                    // (render/tab_panel.rs, panel_tab), so a light in any of this window's tabs
+                    // repaints it: the pane's output repaints only the open tab, and nothing
+                    // under the Conductor's view (mux_pane_output_event)
+                    // `claude_quiet` too: a working reply gone quiet rings its pad, a stuck one
+                    // turns it amber
+                    let light = (name == "claude_status" || name == "claude_quiet")
+                        && self.window_contains_pane(pane_id);
+                    if name == "claude_session" || light {
                         if let Some(window) = self.window.as_ref() {
                             window.invalidate();
                         }
@@ -1339,28 +1575,35 @@ impl TermWindow {
                     }
                     self.emit_user_var_event(pane_id, name, value);
                 }
-                MuxNotification::WindowTitleChanged { .. }
-                | MuxNotification::Alert {
+                // LBTerm: the mux window's own title, which only a Lua handler could read
+                // (titles.rs)
+                MuxNotification::WindowTitleChanged { .. } => {
+                    self.lbterm_window_title_changed();
+                }
+                // LBTerm: this window's panes alone, and every alert before the update runs
+                // sharing it (titles.rs)
+                MuxNotification::Alert {
                     alert:
-                        Alert::OutputSinceFocusLost
+                        alert @ (Alert::OutputSinceFocusLost
                         | Alert::CurrentWorkingDirectoryChanged
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
-                    ..
+                        | Alert::Progress(_)),
+                    pane_id,
                 } => {
-                    self.update_title();
+                    self.lbterm_title_alert(pane_id, &alert);
                 }
-                // LBTerm: the tab panel shows it, for every tab
+                // LBTerm: the tab panel shows it, for every tab, reading the records as it paints
+                // (paint_tab_panel, and the strip and the projects card through panel_tab), so a
+                // repaint is all it takes, when what it shows changed (render/tab_panel.rs):
+                // nothing update_title works out reads them, and each new pane's first push
+                // brings one
                 MuxNotification::Alert {
                     alert: Alert::ProgramStatus,
-                    ..
+                    pane_id,
                 } => {
-                    self.update_title();
-                    if let Some(window) = self.window.as_ref() {
-                        window.invalidate();
-                    }
+                    self.lbterm_program_status(pane_id);
                 }
                 // LBTerm: a kitty notification, shown by the window holding its pane
                 MuxNotification::Alert {
@@ -1375,6 +1618,13 @@ impl TermWindow {
                     alert: Alert::PaletteChanged,
                     pane_id,
                 } => {
+                    // LBTerm: only a palette the pane didn't have reaches this now (ClientPane's
+                    // SetPalette), a program's own colours (OSC 4, 10, 11) and not a config save's
+                    // echoes (lbterm/MUX.md, "What a config save costs"). Every window still clears
+                    // its shapes for it: a window's cached quads for a pane's lines don't name its
+                    // palette, so another window could show the pane's old colours once its tab
+                    // moved there
+                    log::debug!(target: "lbterm::palette", "palette pane {pane_id} window {}: shapes cleared", self.mux_window_id);
                     // Shape cache includes color information, so
                     // ensure that we invalidate that as part of
                     // this overall invalidation for the palette
@@ -1465,9 +1715,15 @@ impl TermWindow {
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
+                // LBTerm: a tab of this window parked or unparked: the paint mux's lbterm_repaint
+                // asks for draws its row dimmed or not (park.rs)
+                MuxNotification::LbtermTabParked { .. } => {}
+                MuxNotification::PaneRemoved(pane_id) => {
+                    // LBTerm: the rows kept of it go with it (render/pane_lines.rs)
+                    self.lbterm_lines_gone(pane_id);
+                }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
@@ -1490,6 +1746,9 @@ impl TermWindow {
                 func(self);
             }
             TermWindowNotif::SwitchToMuxWindow(mux_window_id) => {
+                // LBTerm: a test window's state file says the window as it is now, not also as
+                // the mux window it showed before (lbterm/STATE.md)
+                crate::state_probe::forget(self.mux_window_id as u64);
                 self.mux_window_id = mux_window_id;
                 *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
 
@@ -1563,37 +1822,54 @@ impl TermWindow {
     }
 
     fn schedule_status_update(&self) {
+        // LBTerm: no task when neither event has a handler (titles.rs)
+        if !titles::status_handlers() {
+            return;
+        }
         if let Some(window) = self.window.as_ref() {
             window.notify(TermWindowNotif::EmitStatusUpdate);
         }
     }
 
-    fn is_pane_visible(&mut self, pane_id: PaneId) -> bool {
-        let mux = Mux::get();
-        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
-            Some(tab) => tab,
-            None => return false,
-        };
-
-        let tab_id = tab.tab_id();
-        if let Some(tab_overlay) = self
-            .tab_state(tab_id)
-            .overlay
-            .as_ref()
-            .map(|overlay| overlay.pane.clone())
-        {
-            return tab_overlay.pane_id() == pane_id;
-        }
-
-        tab.contains_pane(pane_id)
-    }
+    // LBTerm: upstream's is_pane_visible is panes_drawn.rs's lbterm_pane_shows, which tells a
+    // pane under an overlay apart
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
-        if self.is_pane_visible(pane_id) {
-            if let Some(ref win) = self.window {
-                win.invalidate();
+        // LBTerm: the Conductor's view covers every pane, so what they print shows once it's
+        // left, which repaints (render/conductor_view.rs): a working session's spinner under it
+        // repainted the window and laid the view out a dozen times a second
+        // A push of a pane this window shows is said read at once there, or its server, pacing
+        // it, would hold the next for a frame that doesn't read it (panes_drawn.rs)
+        if self.lbterm_view_is_open() {
+            self.lbterm_output_unpainted(pane_id, false);
+            return;
+        }
+        // LBTerm: is_pane_visible, with a pane of the open tab whose frames read another pane in
+        // its place told apart (a tab overlay, or a pane overlay of its own): said read at once.
+        // Copy mode, search and quick select read the pane's lines, and their frames say it
+        // (panes_drawn.rs)
+        match self.lbterm_pane_shows(pane_id) {
+            panes_drawn::Shows::Drawn => {
+                if let Some(ref win) = self.window {
+                    win.invalidate();
+                }
+                // LBTerm: a window that can't be seen paints once a second, so it says the push at
+                // once and its shown panes are pushed as they print (panes_drawn.rs)
+                if self.lbterm_unseen() {
+                    self.lbterm_output_unpainted(pane_id, true);
+                }
             }
+            // The close-pane confirmation: repainted as upstream did, and said read at once,
+            // since its frames read the confirmation, not the pane
+            panes_drawn::Shows::Overlaid => {
+                if let Some(ref win) = self.window {
+                    win.invalidate();
+                }
+                self.lbterm_output_unpainted(pane_id, true);
+            }
+            panes_drawn::Shows::Covered => self.lbterm_output_unpainted(pane_id, true),
+            panes_drawn::Shows::No => {}
         }
     }
 
@@ -1661,7 +1937,8 @@ impl TermWindow {
                 return true;
             }
             MuxNotification::TabResized(tab_id)
-            | MuxNotification::TabTitleChanged { tab_id, .. } => {
+            | MuxNotification::TabTitleChanged { tab_id, .. }
+            | MuxNotification::LbtermTabParked { tab_id, .. } => {
                 let mux = Mux::get();
                 if mux.window_containing_tab(tab_id) == Some(mux_window_id) {
                     // fall through
@@ -1703,12 +1980,39 @@ impl TermWindow {
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get();
         let dead = Arc::clone(&self.mux_subscription_dead);
+        let title_watch = Arc::clone(&self.lbterm_title_watch);
+        let quiet = Arc::clone(&self.lbterm_quiet);
+        // LBTerm: the client thread asks the same of this window before it hands a title over
+        // (titles.rs, TitleDecider)
+        titles::lbterm_watch_window(&mux_window_id, &title_watch, &dead);
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 // Unsubscribe this handler from the mux
                 return false;
             }
+            // LBTerm: the mux window's own title, which only a Lua handler could read and the
+            // window does nothing for without one (titles.rs): no task and no hop to the window.
+            // On a mux domain the server's window takes the title of whichever pane set one last,
+            // so each working Claude Code's ◐ and ◑ brought one
+            if matches!(n, MuxNotification::WindowTitleChanged { .. })
+                && !title_watch.window_title_read()
+            {
+                return true;
+            }
             let mux_window_id = *mux_window_id.lock().unwrap();
+            // LBTerm: a pane's title alert that changes nothing the window shows or a handler
+            // reads (Claude Code's ◐ and ◑ in a tab out of view), with no task and no hop to the
+            // window, which decided the same there (titles.rs, lbterm_title_alert_dropped)
+            if titles::lbterm_title_alert_dropped(&n, mux_window_id, &title_watch) {
+                return true;
+            }
+            // LBTerm: a mux pane's output out of the open tab is news for the budget, with no
+            // task and no hop to the window (budget.rs), and noted for the scan of its screen
+            // once it's quiet (hidden_scan.rs)
+            if let Some(pane) = budget::lbterm_hidden_output(&n, mux_window_id) {
+                hidden_scan::output(&quiet, &pane, &window);
+                return true;
+            }
             let window = window.clone();
             let dead = dead.clone();
             promise::spawn::spawn_into_main_thread(async move {
@@ -1725,6 +2029,8 @@ impl TermWindow {
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
+        // LBTerm: perf/title-storm.ps1 counts the Lua events a title storm brings
+        log::debug!(target: "lbterm::title", "lua event {name} window {}", self.mux_window_id);
         let window = GuiWin::new(self);
         let pane = match pane_id {
             Some(pane_id) => Mux::get().get_pane(pane_id),
@@ -1798,6 +2104,10 @@ impl TermWindow {
 
     pub fn emit_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
         if self.get_active_pane_or_overlay().is_none() || self.window.is_none() {
+            return;
+        }
+        // LBTerm: nothing to run without a handler, so no task, GuiWin or Lua userdata (titles.rs)
+        if !titles::has_handler(name) {
             return;
         }
 
@@ -1890,7 +2200,21 @@ impl TermWindow {
         );
         self.key_table_state.clear_stack();
         self.connection_name = Connection::get().unwrap().name();
-        let config = match config::overridden_config(&self.config_overrides) {
+        // LBTerm: a window with no overrides of its own takes the config as it is. overridden_config
+        // runs the whole file again, here on the GUI thread and under the config's lock, for the
+        // same config and generation: reload has already handed this thread its Lua state, and
+        // overridden_config's own is thrown away
+        let no_overrides = match &self.config_overrides {
+            wezterm_dynamic::Value::Null => true,
+            wezterm_dynamic::Value::Object(o) => o.is_empty(),
+            _ => false,
+        };
+        let overridden = if no_overrides {
+            Ok(configuration())
+        } else {
+            config::overridden_config(&self.config_overrides)
+        };
+        let config = match overridden {
             Ok(config) => config,
             Err(err) => {
                 log::error!(
@@ -1903,9 +2227,16 @@ impl TermWindow {
         };
         self.config = config.clone();
         self.palette.take();
+        // LBTerm: whether its handlers could read the mux window's title (titles.rs)
+        self.lbterm_titles_read_update();
         // LBTerm: the summon key may have changed (summon.rs), and the slow-frame log's threshold
         crate::summon::set_key(crate::summon::configured(&self.config));
         lbterm_extras::slow::set_threshold_ms(self.config.lbterm_slow_ms);
+        // LBTerm: and where the new-tab picker keeps its recent picks (render/new_tab.rs)
+        self.lbterm_new_tab_configure();
+        // LBTerm: and the budget's, and the reload timed to the frame that shows it
+        self.lbterm_budget_configure();
+        self.lbterm_budget_reload();
 
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -1939,12 +2270,29 @@ impl TermWindow {
             None,
         );
 
-        self.show_scroll_bar = config.enable_scroll_bar;
+        self.show_scroll_bar = config.enable_scroll_bar && render::scroll_strip::panes_keep_scroll_bar(&config);
+        // LBTerm: a config that makes the same fonts keeps them, what their fallback searches
+        // found, the glyph atlas and the shapes made with them (config::lbterm::font_key;
+        // lbterm/PERF.md, "What font setup costs"). Upstream made every font again here through
+        // the system's font lookup, rasterized every glyph again into a new atlas and shaped
+        // every line again, on every save. Done before what follows reads the fonts' config: the
+        // glyph cache's and the modal's own reconfigure below read the new one
+        let fonts_kept = match self.fonts.lbterm_config_changed(&config) {
+            Ok(kept) => kept,
+            Err(err) => {
+                log::error!("Failed to load font configuration: {:#}", err);
+                false
+            }
+        };
+        // The lines are laid out again whatever (their colours come from the config); what each
+        // cluster shaped to is kept when the fonts are
         self.shape_generation += 1;
         {
             let mut shape_cache = self.shape_cache.borrow_mut();
             shape_cache.update_config(&config);
-            shape_cache.clear();
+            if !fonts_kept {
+                shape_cache.clear();
+            }
         }
         self.line_state_cache.borrow_mut().update_config(&config);
         self.line_quad_cache.borrow_mut().update_config(&config);
@@ -1955,13 +2303,11 @@ impl TermWindow {
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
         self.input_map = InputMap::new(&config);
+        // LBTerm: the keys the new-tab pad names, from the table just made (render/new_tab.rs)
+        self.lbterm_new_tab_keys();
         self.leader_is_down = None;
         self.render_state.as_mut().map(|rs| rs.config_changed());
         let dimensions = self.dimensions;
-
-        if let Err(err) = self.fonts.config_changed(&config) {
-            log::error!("Failed to load font configuration: {:#}", err);
-        }
 
         if let Some(window) = mux.get_window(self.mux_window_id) {
             let term_config: Arc<dyn TerminalConfiguration> =
@@ -1985,7 +2331,10 @@ impl TermWindow {
 
         if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
             self.load_os_parameters();
-            self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
+            // LBTerm: kept fonts have the same metrics at the same scale, and their atlas
+            if !fonts_kept {
+                self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
+            }
             self.apply_dimensions(&dimensions, None, &window);
             window.config_did_change(&config);
             window.invalidate();
@@ -2062,18 +2411,19 @@ impl TermWindow {
     }
 
     fn window_contains_pane(&mut self, pane_id: PaneId) -> bool {
-        let mux = Mux::get();
-
-        let (_domain, window_id, _tab_id) = match mux.resolve_pane_id(pane_id) {
-            Some(tuple) => tuple,
-            None => return false,
-        };
-
-        return window_id == self.mux_window_id;
+        // LBTerm: this window's tabs alone, where resolve_pane_id listed every pane of every tab
+        // to find it, for each user var and title (titles.rs)
+        self.lbterm_holds_pane(pane_id)
     }
 
     fn emit_user_var_event(&mut self, pane_id: PaneId, name: String, value: String) {
         if !self.window_contains_pane(pane_id) {
+            return;
+        }
+        // LBTerm: with no handler to run first, the title update alone, shared, and none for a
+        // background tab's with nothing reading every tab (titles.rs)
+        if !titles::has_handler("user-var-changed") {
+            self.lbterm_pane_changed(pane_id, lbterm_extras::titles::Alert::UserVar);
             return;
         }
 
@@ -2083,6 +2433,7 @@ impl TermWindow {
             Some(pane) => mux_lua::MuxPane(pane.pane_id()),
             None => return,
         };
+        log::debug!(target: "lbterm::title", "lua event user-var-changed window {}", self.mux_window_id);
 
         async fn do_event(
             lua: Option<Rc<mlua::Lua>>,
@@ -2122,17 +2473,63 @@ impl TermWindow {
     }
 
     fn update_title_impl(&mut self) {
+        self.lbterm_update_title_impl(true);
+    }
+
+    /// LBTerm: update_title_impl, with the taskbar's progress worked out again only when
+    /// `taskbar` (a title or a folder changes nothing it shows: titles.rs)
+    fn lbterm_update_title_impl(&mut self, taskbar: bool) {
+        // LBTerm: perf/title-storm.ps1 counts and times the passes (WEZTERM_LOG=lbterm::title=debug)
+        let _pass = titles::Pass::start(self.mux_window_id);
         // LBTerm: progress reports and tab switches both come through here
-        self.update_taskbar_progress();
+        if taskbar {
+            self.update_taskbar_progress();
+        }
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,
             _ => return,
         };
-        let tabs = self.get_tab_information();
-        let panes = self.get_pane_information();
+        // LBTerm: every tab's and pane's information (each pane's user vars copied) only for
+        // what reads it: the tab bar's words, or a format-window-title handler. Else the title
+        // is the open pane's, from the open tab alone (titles.rs)
+        let format_window_title = titles::has_handler("format-window-title");
+        let every_tab = lbterm_extras::titles::needs_every_tab(
+            titles::tab_bar_shows_tabs(&self.config),
+            format_window_title,
+        );
+        let tabs = if every_tab {
+            self.get_tab_information()
+        } else {
+            vec![]
+        };
+        let panes = if every_tab {
+            self.get_pane_information()
+        } else {
+            vec![]
+        };
         let active_tab = tabs.iter().find(|t| t.is_active).cloned();
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
+        let open = if every_tab {
+            active_pane.as_ref().zip(active_tab.as_ref()).map(|(pane, tab)| {
+                lbterm_extras::titles::Open {
+                    title: pane.title.clone(),
+                    zoomed: pane.is_zoomed,
+                    tab_index: tab.tab_index,
+                }
+            })
+        } else {
+            let tab_index = window.get_active_tab_idx();
+            self.get_panes_to_render()
+                .into_iter()
+                .find(|pos| pos.is_active)
+                .filter(|_| tab_index < window.count_tabs())
+                .map(|pos| lbterm_extras::titles::Open {
+                    title: pos.pane.get_title(),
+                    zoomed: pos.is_zoomed,
+                    tab_index,
+                })
+        };
 
         let border = self.get_os_border();
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
@@ -2153,26 +2550,31 @@ impl TermWindow {
             None => false,
         };
 
-        let new_tab_bar = TabBarState::new(
-            self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize,
-            if hovering_in_tab_bar {
-                Some(self.last_mouse_coords.0)
-            } else {
-                None
-            },
-            &tabs,
-            &panes,
-            self.config.resolved_palette.tab_bar.as_ref(),
-            &self.config,
-            &self.left_status,
-            &self.right_status,
-        );
-        if new_tab_bar != self.tab_bar {
-            self.tab_bar = new_tab_bar;
-            self.invalidate_fancy_tab_bar();
-            self.invalidate_modal();
-            if let Some(window) = self.window.as_ref() {
-                window.invalidate();
+        let title_width = self.dimensions.pixel_width / self.render_metrics.cell_size.width as usize;
+        let mouse_x = if hovering_in_tab_bar {
+            Some(self.last_mouse_coords.0)
+        } else {
+            None
+        };
+        // LBTerm: made again only when what it's made of changed (titles.rs, TabBarKey)
+        if self.lbterm_tab_bar_changed(title_width, mouse_x) {
+            let new_tab_bar = TabBarState::new(
+                title_width,
+                mouse_x,
+                &tabs,
+                &panes,
+                self.config.resolved_palette.tab_bar.as_ref(),
+                &self.config,
+                &self.left_status,
+                &self.right_status,
+            );
+            if new_tab_bar != self.tab_bar {
+                self.tab_bar = new_tab_bar;
+                self.invalidate_fancy_tab_bar();
+                self.invalidate_modal();
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
             }
         }
 
@@ -2183,7 +2585,8 @@ impl TermWindow {
         drop(window);
 
         let title = match config::run_immediate_with_lua_config(|lua| {
-            if let Some(lua) = lua {
+            // LBTerm: every tab and pane as Lua and the whole config cloned, only for a handler
+            if let Some(lua) = lua.filter(|_| format_window_title) {
                 let tabs = lua.create_sequence_from(tabs.clone().into_iter())?;
                 let panes = lua.create_sequence_from(panes.clone().into_iter())?;
 
@@ -2217,27 +2620,19 @@ impl TermWindow {
 
         let title = match title {
             Some(title) => title,
-            None => {
-                if let (Some(pos), Some(tab)) = (active_pane, active_tab) {
-                    if tabs_count == 1 {
-                        format!("{}{}", if pos.is_zoomed { "[Z] " } else { "" }, pos.title)
-                    } else {
-                        format!(
-                            "{}[{}/{}] {}",
-                            if pos.is_zoomed { "[Z] " } else { "" },
-                            tab.tab_index + 1,
-                            tabs_count,
-                            pos.title
-                        )
-                    }
-                } else {
-                    "".to_string()
-                }
-            }
+            // LBTerm: upstream's, from `open` (lbterm_extras::titles::window_title)
+            None => lbterm_extras::titles::window_title(open.as_ref(), tabs_count),
         };
 
         if let Some(window) = self.window.as_ref() {
-            window.set_title(&title);
+            // LBTerm: only a title the window hasn't got: each set_title is a task of its own and
+            // a SetWindowTextW, about 1 ms, and update_title runs for every tab a resync changes
+            // (28 to 36 of them per window resize at 15 tabs, 2026-10-29). Nothing else here sets
+            // the window's title.
+            if title != self.shown_title {
+                window.set_title(&title);
+                self.shown_title = title;
+            }
 
             let show_tab_bar = if tabs_count == 1 {
                 self.config.enable_tab_bar && !self.config.hide_tab_bar_if_only_one_tab
@@ -2263,10 +2658,13 @@ impl TermWindow {
                 let interval = Duration::from_millis(self.config.status_update_interval);
                 let target = now + interval;
                 self.last_status_call = target;
+                // LBTerm: on purpose at rest, once an interval (termwindow/budget.rs)
+                let per_second = 1000.0 / self.config.status_update_interval.max(1) as f64;
+                self.lbterm_budget_tick(lbterm_extras::budget::Purpose::Status, target, per_second);
 
                 let window = window.clone();
                 promise::spawn::spawn(async move {
-                    Timer::at(target).await;
+                    lbterm_extras::counters::timer(Timer::at(target)).await;
                     window.notify(TermWindowNotif::EmitStatusUpdate);
                 })
                 .detach();
@@ -2296,7 +2694,10 @@ impl TermWindow {
                 ),
                 self.render_metrics.cell_size,
             );
-            win.set_text_cursor_position(r);
+            // LBTerm: only when it moved (lbterm_ime)
+            if self.lbterm_ime.tell((r, self.focused.is_some())) {
+                win.set_text_cursor_position(r);
+            }
         }
     }
 
@@ -2358,6 +2759,8 @@ impl TermWindow {
         };
 
         if tab_idx < max {
+            // LBTerm: timed to the frame that shows it (termwindow/budget.rs)
+            self.lbterm_budget_tab(window.get_active_tab_idx() != tab_idx);
             window.remember_and_set_active_tab_idx(tab_idx);
 
             drop(window);
@@ -2938,6 +3341,11 @@ impl TermWindow {
             ReloadConfiguration => config::reload(),
             LbtermRestart => crate::restart::restart(),
             LbtermQuestions(mode) => self.lbterm_questions(pane, *mode),
+            LbtermConductorView(mode) => self.lbterm_view_action(*mode),
+            LbtermDraft(what) => self.lbterm_draft_key(pane, *what),
+            LbtermNewTab(what) => self.lbterm_new_tab_action(*what),
+            LbtermPark(how) => self.lbterm_park_action(*how),
+            LbtermTab(how) => self.lbterm_tab_action(*how),
             MoveTab(n) => self.move_tab(*n)?,
             MoveTabRelative(n) => self.move_tab_relative(*n)?,
             ScrollByPage(n) => self.scroll_by_page(**n, pane)?,
@@ -3337,7 +3745,12 @@ impl TermWindow {
                 )]);
             }
             OpenUri(link) => {
-                wezterm_open_url::open_url(link);
+                // LBTerm: never its own links, which Windows has no app for (lbterm_extras::own_links)
+                if lbterm_extras::own_links::windows_opens(link) {
+                    wezterm_open_url::open_url(link);
+                } else {
+                    log::warn!("OpenUri {link}: LBTerm's own links go to open-uri, never to Windows");
+                }
             }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
@@ -3383,7 +3796,12 @@ impl TermWindow {
                     }
                     None => true,
                 };
-                if default_click {
+                if default_click && !lbterm_extras::own_links::windows_opens(&link) {
+                    // LBTerm: one of its own links that no open-uri handler took (a test window's
+                    // config with none of its own, PITFALLS 69) opens nothing: handed to Windows,
+                    // which has no app for it, it would put a dialog up in front
+                    log::warn!("no open-uri handler took {link}, and LBTerm's own links never go to Windows");
+                } else if default_click {
                     log::info!("clicking {}", link);
                     wezterm_open_url::open_url(&link);
                 }
@@ -3410,6 +3828,8 @@ impl TermWindow {
 
         let pane_id = pane.pane_id();
         if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
+            // LBTerm: the question shows where it stays (render/tab_panel.rs)
+            self.tab_panel_fold();
             let window = self.window.clone().unwrap();
             let (overlay, future) = start_overlay_pane(self, &pane, move |pane_id, term| {
                 confirm_close_pane(pane_id, term, mux_window_id, window)
@@ -3417,7 +3837,12 @@ impl TermWindow {
             self.assign_overlay_for_pane(pane_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
-            mux.remove_pane(pane_id);
+            // LBTerm: its Claude session is marked closed by hand (last_tab.rs)
+            self.lbterm_mark_pane(pane_id);
+            if !self.lbterm_close_last_pane(pane_id) {
+                // LBTerm: unless it's the last tab's only pane, which a new tab replaces
+                mux.remove_pane(pane_id);
+            }
         }
     }
 
@@ -3441,6 +3866,8 @@ impl TermWindow {
                 return;
             }
 
+            // LBTerm: the question shows where it stays (render/tab_panel.rs)
+            self.tab_panel_fold();
             let window = self.window.clone().unwrap();
             let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
                 confirm_close_tab(tab_id, term, mux_window_id, window)
@@ -3448,7 +3875,10 @@ impl TermWindow {
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
-            mux.remove_tab(tab_id);
+            // LBTerm: its Claude sessions are marked closed by hand, and the last tab gives way
+            // to a new one while the Conductor's pad stays (last_tab.rs)
+            self.lbterm_mark_tab(tab_id);
+            self.lbterm_remove_tab(tab_id);
         }
     }
 
@@ -3461,6 +3891,8 @@ impl TermWindow {
         let tab_id = tab.tab_id();
         let mux_window_id = self.mux_window_id;
         if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
+            // LBTerm: the question shows where it stays (render/tab_panel.rs)
+            self.tab_panel_fold();
             let window = self.window.clone().unwrap();
             let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
                 confirm_close_tab(tab_id, term, mux_window_id, window)
@@ -3468,7 +3900,10 @@ impl TermWindow {
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
-            mux.remove_tab(tab_id);
+            // LBTerm: its Claude sessions are marked closed by hand, and the last tab gives way
+            // to a new one while the Conductor's pad stays (last_tab.rs)
+            self.lbterm_mark_tab(tab_id);
+            self.lbterm_remove_tab(tab_id);
         }
     }
 
@@ -3553,6 +3988,8 @@ impl TermWindow {
     }
 
     fn maybe_scroll_to_bottom_for_input(&mut self, pane: &Arc<dyn Pane>) {
+        // LBTerm: input to a pane, timed to the frame after its echo (termwindow/budget.rs)
+        self.lbterm_budget_key(pane);
         if self.config.scroll_to_bottom_on_input {
             self.scroll_to_bottom(pane);
         }

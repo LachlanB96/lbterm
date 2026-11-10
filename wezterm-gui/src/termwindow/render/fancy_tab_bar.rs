@@ -129,7 +129,10 @@ impl crate::TermWindow {
                 | TabBarItem::LbtermRestart
                 | TabBarItem::LbtermSummary
                 | TabBarItem::LbtermPrompt
-                | TabBarItem::LbtermPromptList => element
+                | TabBarItem::LbtermPromptList
+                | TabBarItem::LbtermInbox
+                | TabBarItem::LbtermAgenda
+                | TabBarItem::LbtermContext => element
                     .item_type(UIItemType::TabBar(TabBarItem::None))
                     .line_height(Some(1.75))
                     .margin(BoxDimension {
@@ -442,6 +445,26 @@ impl crate::TermWindow {
             }
         }
 
+        // LBTerm: the title bar left of the window buttons kept clear for ITMan's always-on-top
+        // pin (config::lbterm::CAPTION_PIN_GAP), before anything else goes on the right, so the
+        // pill, the mic mark and the strip's caption (which lays itself out against right_eles)
+        // all stand left of it. Only where the buttons are on the right, Windows' way
+        let buttons_at_right = self
+            .config
+            .window_decorations
+            .contains(window::WindowDecorations::INTEGRATED_BUTTONS)
+            && self.config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Right
+            && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative;
+        if buttons_at_right {
+            let gap = config::lbterm::CAPTION_PIN_GAP * self.dimensions.dpi as f32 / 96.0;
+            right_eles.insert(
+                0,
+                Element::new(&font, ElementContent::Text(String::new()))
+                    .min_width(Some(Dimension::Pixels(gap)))
+                    .colors(bar_colors.clone()),
+            );
+        }
+
         // LBTerm: "Restart to update" while another build is installed, left of the window
         // buttons (restart.rs)
         if crate::restart::other_build_installed() {
@@ -451,6 +474,15 @@ impl crate::TermWindow {
                 self.config.window_frame.active_titlebar_bg.into()
             };
             right_eles.insert(0, crate::restart::pill_element(&font, &metrics, surface));
+        }
+        // LBTerm: the mic mark while Earshot listens, left of the pill (mic.rs)
+        if let Some(state) = crate::mic::shown() {
+            let surface = if hide_tabs {
+                palette.background
+            } else {
+                self.config.window_frame.active_titlebar_bg.into()
+            };
+            right_eles.insert(0, crate::mic::element(&font, surface, state));
         }
 
         let mut children = vec![];
@@ -479,6 +511,19 @@ impl crate::TermWindow {
             &self.dimensions,
             &self.render_metrics,
         ) as usize);
+        // and the objectives panel's down the right, so the window's buttons stay at its edge
+        // (render/objectives.rs)
+        border.right -= ::window::ULength::new(super::objectives::strip_width(
+            &self.config,
+            &self.dimensions,
+            &self.render_metrics,
+        ) as usize);
+        // and the scroll strip's beside it (render/scroll_strip.rs)
+        border.right -= ::window::ULength::new(super::scroll_strip::strip_width(
+            &self.config,
+            &self.dimensions,
+            &self.render_metrics,
+        ) as usize);
         let bounds = euclid::rect(
             border.left.get() as f32,
             0.,
@@ -491,6 +536,9 @@ impl crate::TermWindow {
         // prompt (render/strip.rs)
         let mut strip_indent = None;
         let mut prompt_row = None;
+        // LBTerm: the InMail button and the agenda's before the words, over the tab rail
+        // (render/inbox.rs, render/agenda.rs)
+        let mut inbox_x = None;
         if hide_tabs && !window_buttons_at_left {
             let first_row = euclid::rect(
                 bounds.min_x(),
@@ -508,13 +556,21 @@ impl crate::TermWindow {
                 if let Some(caption) = strip.caption {
                     right_eles.insert(0, caption);
                 }
+                if let Some((x, button)) =
+                    self.lbterm_strip_buttons(&font, &metrics, palette.background, first_row, strip.indent)?
+                {
+                    left_eles.extend(button);
+                    inbox_x = Some(x);
+                }
                 left_eles.push(strip.words);
                 strip_indent = Some(strip.indent);
                 prompt_row = strip.prompt_row;
             }
         }
 
-        let left_padding = if let Some(indent) = strip_indent {
+        let left_padding = if let Some(x) = inbox_x {
+            Dimension::Pixels(x)
+        } else if let Some(indent) = strip_indent {
             Dimension::Pixels(indent)
         } else if window_buttons_at_left {
             if self.config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative

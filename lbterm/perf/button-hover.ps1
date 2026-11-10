@@ -85,6 +85,7 @@ return {
   cursor_blink_rate = 0,
   default_cursor_style = 'SteadyBlock',
   lbterm_crash_restore = false,
+  wsl_domains = {},
   lbterm_tab_panel = { enabled = true },
   default_prog = { 'C:/Program Files/PowerShell/7/pwsh.exe', '-NoProfile' },
   default_cwd = 'C:/Windows',

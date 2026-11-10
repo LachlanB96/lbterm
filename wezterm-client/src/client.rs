@@ -1,4 +1,5 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
+use crate::lbterm_backlog::{Applied, Backlog};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
 use async_ossl::AsyncSslStream;
@@ -6,7 +7,6 @@ use async_trait::async_trait;
 use codec::*;
 use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::FutureExt;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
@@ -30,6 +30,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -39,6 +40,16 @@ use wezterm_uds::UnixStream;
 #[error("Timeout")]
 struct Timeout;
 
+/// LBTerm: what's told of each PDU the client sends or receives: its type, its payload bytes, and
+/// whether it was sent. wezterm-gui sets it to its counters (lbterm_extras::counters)
+pub type TrafficHook = fn(name: &'static str, bytes: usize, sent: bool);
+static LBTERM_TRAFFIC: std::sync::OnceLock<TrafficHook> = std::sync::OnceLock::new();
+
+/// LBTerm: tell `hook` of every PDU from now on
+pub fn lbterm_set_traffic_hook(hook: TrafficHook) {
+    let _ = LBTERM_TRAFFIC.set(hook);
+}
+
 #[derive(Error, Debug)]
 #[error("ChannelSendError")]
 struct ChannelSendError;
@@ -47,13 +58,31 @@ enum ReaderMessage {
     SendPdu {
         pdu: Pdu,
         promise: Sender<anyhow::Result<Pdu>>,
+        /// LBTerm: a read's ask of a held pane's push, which the GUI thread may wait on with
+        /// nothing else running: read on for its answer (lbterm_current.rs, `Input::awaited`)
+        awaited: bool,
     },
     Readable,
+    /// LBTerm: the GUI thread has applied enough of what it was handed to read on
+    /// (lbterm_backlog.rs)
+    Room,
+    /// LBTerm: a notice of the pushes a frame read (codec's PanesDrawn), sent at serial 0 with no
+    /// promise, since the server answers nothing, and only while this connection's server knows
+    /// it (lbterm_drawn.rs, `GateWatch`)
+    Drawn(codec::PanesDrawn),
 }
 
 #[derive(Clone)]
 pub struct Client {
     sender: Sender<ReaderMessage>,
+    /// LBTerm: whether the connection is up, for the scroll strip's seek (lbterm_link.rs)
+    link: Arc<crate::lbterm_link::Link>,
+    /// LBTerm: what a read of a held pane shares with the client thread: the backlog, and
+    /// whether an ask ran out its bound (lbterm_current.rs)
+    lbterm_reads: Arc<crate::lbterm_current::Reads>,
+    /// LBTerm: whether this connection's server knows PanesDrawn, which the client thread says
+    /// (lbterm_drawn.rs)
+    lbterm_gate: Arc<crate::lbterm_drawn::Gate>,
     local_domain_id: Option<DomainId>,
     pub client_id: ClientId,
     client_domain_config: ClientDomainConfig,
@@ -113,12 +142,27 @@ macro_rules! rpc {
     };
 }
 
-fn process_unilateral_inner(pane_id: PaneId, local_domain_id: DomainId, decoded: DecodedPdu) {
-    promise::spawn::spawn(async move {
+fn process_unilateral_inner(
+    pane_id: PaneId,
+    local_domain_id: DomainId,
+    decoded: DecodedPdu,
+    mut applied: Applied,
+) {
+    // LBTerm: the pane waits for it until it's applied, even by a task that goes on (below), so a
+    // push of its title alone isn't applied on the client thread ahead of it (lbterm_names.rs)
+    let waits = applied.goes_on();
+    let mut task = Box::pin(async move {
+        let _waits = waits;
         process_unilateral_inner_async(pane_id, local_domain_id, decoded).await?;
         Ok::<(), anyhow::Error>(())
-    })
-    .detach();
+    });
+    // LBTerm: applied here, on the GUI thread, as the backlog's task takes it (lbterm_backlog.rs);
+    // one that waits on the server (a resync, an image's data) goes on as a task of its own, as
+    // upstream's each did, and counts as applied, since the client thread must read on for it
+    if futures::FutureExt::now_or_never(&mut task).is_none() {
+        promise::spawn::spawn(task).detach();
+    }
+    drop(applied);
 }
 
 async fn process_unilateral_inner_async(
@@ -194,6 +238,8 @@ async fn process_unilateral_inner_async(
 fn process_unilateral(
     local_domain_id: Option<DomainId>,
     decoded: DecodedPdu,
+    backlog: &Arc<Backlog>,
+    first: Option<PaneId>,
 ) -> anyhow::Result<()> {
     let local_domain_id = match local_domain_id {
         Some(id) => id,
@@ -208,6 +254,72 @@ fn process_unilateral(
             return Ok(());
         }
     };
+    // LBTerm: handed to the GUI thread through the connection's backlog, which merges a pane's
+    // pushes as they come and gives them to the GUI thread in order, which hands each on as
+    // upstream did here (lbterm_backlog.rs); one this can't handle still ends the connection
+    // here, as it did
+    match &decoded.pdu {
+        Pdu::WindowWorkspaceChanged(_)
+        | Pdu::WindowTitleChanged(_)
+        | Pdu::RenameWorkspace(_)
+        | Pdu::TabTitleChanged(_)
+        | Pdu::TabResized(_)
+        | Pdu::TabParked(_)
+        | Pdu::TabAddedToWindow(_) => {}
+        pdu if pdu.pane_id().is_some() => {}
+        _ => bail!("don't know how to handle {:?}", decoded),
+    }
+    // LBTerm: a push of a pane's title and folder alone (a tab out of view's title) is applied
+    // here as it's read, when nothing older of the pane waits, and handed to nothing: no take,
+    // no wake, no task on the GUI thread (lbterm_names.rs; lbterm/FLOWS.md, "A title out of
+    // view", What could go 13, part 1)
+    if crate::lbterm_names::applied_here(local_domain_id, &decoded.pdu, backlog) {
+        return Ok(());
+    }
+    // LBTerm: its title alert, dropped here when no window would do anything for it, and the
+    // server's mux window title, kept here while nothing reads it as it changes: neither handed
+    // (lbterm_titles.rs; What could go 13, parts 2 and 3)
+    if crate::lbterm_titles::decided_here(local_domain_id, &decoded.pdu, backlog) {
+        return Ok(());
+    }
+    let handed = backlog.hand(decoded, first);
+    if let (true, Some(pane_id)) = (handed.take_first, first) {
+        // The pushes of the pane typed into, ahead of the rest and their gap: its echo. Only its
+        // pushes: everything else keeps its place among the other panes' (lbterm_backlog.rs)
+        let backlog = Arc::clone(backlog);
+        promise::spawn::spawn_into_main_thread(async move {
+            for (decoded, applied) in backlog.take_first(pane_id) {
+                process_unilateral_now(local_domain_id, decoded, applied);
+            }
+            // LBTerm: the mux window titles the client thread kept (lbterm_titles.rs)
+            crate::lbterm_titles::set_kept();
+        })
+        .detach();
+    }
+    if handed.take_all {
+        let backlog = Arc::clone(backlog);
+        promise::spawn::spawn_into_main_thread(async move {
+            // Right after a long one, the loop turns first: a frame waiting paints
+            // (lbterm_backlog::GAP, GAP_AFTER)
+            if let Some(wait) = backlog.gap(std::time::Instant::now()) {
+                async_io::Timer::after(wait).await;
+            }
+            let started = std::time::Instant::now();
+            for (decoded, applied) in backlog.take() {
+                process_unilateral_now(local_domain_id, decoded, applied);
+            }
+            // LBTerm: the mux window titles the client thread kept (lbterm_titles.rs)
+            crate::lbterm_titles::set_kept();
+            backlog.drained(started, std::time::Instant::now());
+        })
+        .detach();
+    }
+    Ok(())
+}
+
+/// What upstream's process_unilateral did with a unilateral PDU, now on the GUI thread as its
+/// backlog's task takes it
+fn process_unilateral_now(local_domain_id: DomainId, decoded: DecodedPdu, applied: Applied) {
     match &decoded.pdu {
         Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
             window_id,
@@ -238,7 +350,7 @@ fn process_unilateral(
             })
             .detach();
 
-            return Ok(());
+            return;
         }
         Pdu::WindowTitleChanged(WindowTitleChanged { window_id, title }) => {
             let title = title.to_string();
@@ -259,7 +371,7 @@ fn process_unilateral(
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
-            return Ok(());
+            return;
         }
         Pdu::RenameWorkspace(RenameWorkspace {
             old_workspace,
@@ -274,7 +386,7 @@ fn process_unilateral(
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
-            return Ok(());
+            return;
         }
         Pdu::TabTitleChanged(TabTitleChanged { tab_id, title }) => {
             let title = title.to_string();
@@ -295,7 +407,21 @@ fn process_unilateral(
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
-            return Ok(());
+            return;
+        }
+        // LBTerm: a tab parked or unparked at the server, this window's own park included: the
+        // local tab takes its flag from here alone (lbterm/MUX.md, "Parked tabs"). Already on
+        // the GUI thread, outside any notification
+        Pdu::TabParked(TabParked { tab_id, parked }) => {
+            match Mux::try_get()
+                .and_then(|mux| mux.get_domain(local_domain_id))
+                .as_ref()
+                .and_then(|d| d.downcast_ref::<ClientDomain>())
+            {
+                Some(domain) => domain.lbterm_remote_tab_parked(*tab_id, *parked),
+                None => log::error!("parked: no client domain {local_domain_id} for {:?}", decoded.pdu),
+            }
+            return;
         }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
@@ -315,20 +441,15 @@ fn process_unilateral(
             })
             .detach();
 
-            return Ok(());
+            return;
         }
         _ => {}
     }
 
     if let Some(pane_id) = decoded.pdu.pane_id() {
-        promise::spawn::spawn_into_main_thread(async move {
-            process_unilateral_inner(pane_id, local_domain_id, decoded)
-        })
-        .detach();
-    } else {
-        bail!("don't know how to handle {:?}", decoded);
+        // LBTerm: on the GUI thread already, as upstream's task here was
+        process_unilateral_inner(pane_id, local_domain_id, decoded, applied);
     }
-    Ok(())
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -337,18 +458,73 @@ enum NotReconnectableError {
     ClientWasDestroyed,
 }
 
+/// What the client thread does once its connection to the server has ended.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterDisconnect {
+    /// Give up: the domain detaches and its panes leave the window
+    Detach(&'static str),
+    /// Connect again, at most this many times (None: until it works)
+    Reconnect { attempts: Option<usize> },
+}
+
+/// LBTerm: how many times a unix domain tries to connect again before it
+/// detaches, a second apart and doubling to 10 s: about a minute in all
+const UNIX_RECONNECT_ATTEMPTS: usize = 8;
+
+/// LBTerm: upstream detaches a unix domain at once, and any domain on a
+/// plain EOF. LBTerm's tabs live in a long-running lbterm-mux-server, which
+/// can hang up on a GUI it still has tabs for: on 2026-10-23 the PC hit its
+/// commit limit four times in 25 minutes, the server failed to encode a PDU
+/// each time and dropped the GUI (an EOF to the GUI), and the window closed
+/// with all 22 of its tabs although the server and the tabs ran on. So a
+/// unix domain tries again after any error, EOF included, and detaches only
+/// when no server has answered `UNIX_RECONNECT_ATTEMPTS` times.
+fn after_disconnect(
+    unix: bool,
+    reconnectable: bool,
+    has_local_domain: bool,
+    err: &anyhow::Error,
+) -> AfterDisconnect {
+    if !reconnectable || !has_local_domain {
+        return AfterDisconnect::Detach("client thread ended");
+    }
+    if err
+        .root_cause()
+        .downcast_ref::<NotReconnectableError>()
+        .is_some()
+    {
+        return AfterDisconnect::Detach("won't try to reconnect");
+    }
+    if unix {
+        return AfterDisconnect::Reconnect {
+            attempts: Some(UNIX_RECONNECT_ATTEMPTS),
+        };
+    }
+    if let Some(ioerr) = err.root_cause().downcast_ref::<std::io::Error>() {
+        if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
+            // Don't reconnect for a simple EOF
+            return AfterDisconnect::Detach("server closed connection");
+        }
+    }
+    AfterDisconnect::Reconnect { attempts: None }
+}
+
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
+    reads: &crate::lbterm_current::Reads,
+    gate: &crate::lbterm_drawn::Gate,
 ) -> anyhow::Result<()> {
-    block_on(client_thread_async(reconnectable, local_domain_id, rx))
+    block_on(client_thread_async(reconnectable, local_domain_id, rx, reads, gate))
 }
 
 async fn client_thread_async(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
+    reads: &crate::lbterm_current::Reads,
+    gate: &crate::lbterm_drawn::Gate,
 ) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
 
@@ -375,40 +551,84 @@ async fn client_thread_async(
     };
 
     let mut stream = reconnectable.take_stream().unwrap();
+    // LBTerm: the server's PDUs come off a read at a time, not a byte at a
+    // time (codec's PduReader), so frames read already wait there, and the
+    // stream's readiness says nothing of them
+    let mut reader = PduReader::new();
+    // LBTerm: what's handed to the GUI thread and not yet applied (lbterm_backlog.rs)
+    let backlog = Backlog::new();
+    // A read of a held pane applies its pushes from here (lbterm_current.rs)
+    reads.connected(&backlog);
+    // LBTerm: input waiting on its answer, and the echo after it, which reading isn't held for
+    // (lbterm_backlog::Input)
+    let mut input = crate::lbterm_backlog::Input::default();
+    // LBTerm: whether this connection's server knows PanesDrawn, shut until it answers a
+    // SetShownPanes (lbterm_drawn.rs)
+    let mut drawn_gate = crate::lbterm_drawn::GateWatch::connected(gate);
 
     loop {
         let rx_msg = rx.recv();
-        let wait_for_read = stream
-            .wait_for_readable()
-            .map(|_| Ok(ReaderMessage::Readable));
+        let buffered = reader.has_buffered();
+        // LBTerm: once the GUI thread has the backlog's limit to apply, no reading until it has
+        // applied them all, unless input waits on its answer or its echo; what's sent goes on
+        // meanwhile
+        let held = backlog.full() && !input.reads_on(std::time::Instant::now());
+        let wait_for_read = async {
+            if held {
+                backlog.wait_until_applied().await;
+                return Ok(ReaderMessage::Room);
+            }
+            if !buffered {
+                let _ = stream.wait_for_readable().await;
+            }
+            Ok(ReaderMessage::Readable)
+        };
 
         match smol::future::or(rx_msg, wait_for_read).await {
-            Ok(ReaderMessage::SendPdu { pdu, promise }) => {
+            Ok(ReaderMessage::SendPdu { pdu, promise, awaited }) => {
                 let serial = next_serial;
                 next_serial += 1;
                 promises.map.insert(serial, promise);
+                input.sent(serial, &pdu);
+                drawn_gate.sent(serial, &pdu);
+                if awaited {
+                    input.awaited(serial);
+                }
 
                 pdu.encode_async(&mut stream, serial)
                     .await
                     .context("encoding a PDU to send to the server")?;
+                if let Some(hook) = LBTERM_TRAFFIC.get() {
+                    hook(pdu.pdu_name(), codec::lbterm_last_size(), true);
+                }
                 stream.flush().await.context("flushing PDU to server")?;
             }
             Ok(ReaderMessage::Readable) => {
-                match Pdu::decode_async(&mut stream, Some(next_serial)).await {
+                match reader.decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
                         log::debug!(
                             "decoded serial {} {}",
                             decoded.serial,
                             decoded.pdu.pdu_name()
                         );
+                        if let Some(hook) = LBTERM_TRAFFIC.get() {
+                            hook(decoded.pdu.pdu_name(), codec::lbterm_last_size(), false);
+                        }
                         if decoded.serial == 0 {
-                            process_unilateral(local_domain_id, decoded)
+                            if let Pdu::GetPaneRenderChangesResponse(push) = &decoded.pdu {
+                                input.pushed(push.pane_id);
+                            }
+                            process_unilateral(local_domain_id, decoded, &backlog, input.first())
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
                                     log::error!("process_unilateral: {:?}", e);
                                     e
                                 })?;
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
+                            if input.answered(decoded.serial, std::time::Instant::now()) {
+                                reads.answered();
+                            }
+                            drawn_gate.answered(decoded.serial, &decoded.pdu);
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
                                 return Err(NotReconnectableError::ClientWasDestroyed.into());
                             }
@@ -425,6 +645,29 @@ async fn client_thread_async(
                         promises.fail_all(&reason);
                         return Err(err).context("Error while decoding response pdu");
                     }
+                }
+            }
+            Ok(ReaderMessage::Room) => {}
+            // LBTerm: a notice: at serial 0, nothing put in `promises` and `next_serial` left
+            // where it is, since the server answers nothing (PITFALLS 227); dropped on a
+            // connection whose server hasn't said it knows it, one queued before a reconnect
+            // included
+            Ok(ReaderMessage::Drawn(drawn)) => {
+                if drawn_gate.open() {
+                    Pdu::PanesDrawn(drawn)
+                        .encode_async(&mut stream, 0)
+                        .await
+                        .context("encoding PanesDrawn to send to the server")?;
+                    if let Some(hook) = LBTERM_TRAFFIC.get() {
+                        hook("PanesDrawn", codec::lbterm_last_size(), true);
+                    }
+                    stream.flush().await.context("flushing PanesDrawn to server")?;
+                } else {
+                    log::debug!(
+                        target: "lbterm::drawn",
+                        "PanesDrawn for {} panes not sent: this connection's server hasn't said it knows it",
+                        drawn.panes.len()
+                    );
                 }
             }
             Err(_) => {
@@ -640,10 +883,11 @@ impl Reconnectable {
 
     fn reconnectable(&mut self) -> bool {
         match &self.config {
-            // It doesn't make sense to reconnect to a unix socket; we only
-            // get disconnected it it dies, so respawning it would not preserve
-            // the set of tabs and we'd have confusing and inconsistent state
-            ClientDomainConfig::Unix(_) => false,
+            // LBTerm: upstream never reconnects a unix domain, reasoning that
+            // its server only goes away by dying. LBTerm's server can hang up
+            // on a live GUI (`after_disconnect`), so it reconnects, never
+            // starting a server, and gives up when none answers
+            ClientDomainConfig::Unix(_) => true,
             ClientDomainConfig::Tls(_) => true,
             // It *does* make sense to reconnect with an ssh session, but we
             // need to grow some smarts about whether the disconnect was because
@@ -750,7 +994,24 @@ impl Reconnectable {
 
         let max_attempts = if no_auto_start { Some(1) } else { None };
 
-        let stream = match unix_connect_with_retry(&target, false, max_attempts) {
+        // LBTerm: a first connect that may start the server holds the socket's lock for starting
+        // it until it's connected, tries the socket once, and starts the server at once when
+        // none holds it, where upstream tried ten times over 2.25 s first (lbterm_start.rs;
+        // lbterm/PERF.md, finding 25)
+        let lbterm = crate::lbterm_start::begin(
+            &target,
+            initial && !no_auto_start && !unix_dom.no_serve_automatically,
+            ui,
+        )?;
+        let tried = match &lbterm {
+            Some(start) => match start.first_try()? {
+                crate::lbterm_start::First::Connected(stream) => Ok(stream),
+                crate::lbterm_start::First::NoServer(e) => Err(e),
+            },
+            None => unix_connect_with_retry(&target, false, max_attempts),
+        };
+
+        let stream = match tried {
             Ok(stream) => stream,
             Err(e) => {
                 if no_auto_start || unix_dom.no_serve_automatically || !initial {
@@ -815,11 +1076,17 @@ impl Reconnectable {
                     }
                 });
 
-                unix_connect_with_retry(&target, true, None).with_context(|| {
+                // LBTerm: tried every 10 ms, where upstream waited 200 ms and then 50 to 450
+                match &lbterm {
+                    Some(start) => start.after_start(),
+                    None => unix_connect_with_retry(&target, true, None),
+                }
+                .with_context(|| {
                     format!("(after spawning server) failed to connect to {:?}", target)
                 })?
             }
         };
+        drop(lbterm);
 
         ui.output_str("Connected!\n");
         stream.set_read_timeout(Some(unix_dom.read_timeout))?;
@@ -1066,6 +1333,12 @@ impl Client {
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
+        let link = Arc::new(crate::lbterm_link::Link::default());
+        let thread_link = Arc::clone(&link);
+        let lbterm_reads = Arc::new(crate::lbterm_current::Reads::default());
+        let thread_reads = Arc::clone(&lbterm_reads);
+        let lbterm_gate = Arc::new(crate::lbterm_drawn::Gate::default());
+        let thread_gate = Arc::clone(&lbterm_gate);
 
         thread::spawn(move || {
             const BASE_INTERVAL: Duration = Duration::from_secs(1);
@@ -1073,31 +1346,49 @@ impl Client {
 
             let mut backoff = BASE_INTERVAL;
             loop {
-                if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
-                    if !reconnectable.reconnectable() || local_domain_id.is_none() {
-                        log::debug!("client thread ended: {}", e);
-                        break;
-                    }
+                if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver, &thread_reads, &thread_gate) {
+                    // LBTerm: down from here: every request waits in the channel for the next
+                    // connection, a write as a key does, and the scroll strip seeks nowhere
+                    // meanwhile (lbterm_link.rs)
+                    thread_link.went_down();
+                    let attempts = match after_disconnect(
+                        is_local,
+                        reconnectable.reconnectable(),
+                        local_domain_id.is_some(),
+                        &e,
+                    ) {
+                        AfterDisconnect::Detach(why) => {
+                            if local_domain_id.is_some() {
+                                log::error!("{} ({:#})", why, e);
+                            } else {
+                                log::debug!("{}: {}", why, e);
+                            }
+                            break;
+                        }
+                        AfterDisconnect::Reconnect { attempts } => attempts,
+                    };
+                    // LBTerm: said only of a connection that's tried again, not at every cli's end
+                    log::warn!(
+                        "the connection to the mux server ended ({:#}): {} requests, keys and \
+                         writes alike, wait for it to come back",
+                        e,
+                        receiver.len()
+                    );
 
                     let local_domain_id = local_domain_id.expect("checked above");
 
-                    if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
-                        if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                            // Don't reconnect for a simple EOF
-                            log::error!("server closed connection ({})", e);
-                            break;
-                        }
-                    }
-
-                    if let Some(err) = e.root_cause().downcast_ref::<NotReconnectableError>() {
-                        log::error!("{}; won't try to reconnect", err);
-                        break;
-                    }
-
-                    let mut ui = ConnectionUI::new();
+                    // LBTerm: a unix domain reconnects without a window. The
+                    // connection window would come up in front and take the
+                    // keyboard while Lachlan types elsewhere; the log has it
+                    let mut ui = if is_local {
+                        ConnectionUI::new_headless()
+                    } else {
+                        ConnectionUI::new()
+                    };
                     ui.title("wezterm: Reconnecting...");
 
-                    loop {
+                    let mut failures = 0;
+                    let reconnected = loop {
                         ui.sleep_with_reason(
                             &format!("client disconnected {}; will reconnect", e),
                             backoff,
@@ -1109,24 +1400,55 @@ impl Client {
                             Ok(_) => {
                                 backoff = BASE_INTERVAL;
                                 log::error!("Reconnected!");
+                                // LBTerm: what waited goes first, in its order (lbterm_link.rs)
+                                thread_link.came_up();
                                 promise::spawn::spawn_into_main_thread(async move {
-                                    ClientDomain::reattach(local_domain_id, ui).await.ok();
+                                    if let Err(err) =
+                                        ClientDomain::reattach(local_domain_id, ui).await
+                                    {
+                                        log::error!("reattaching after a reconnect: {:#}", err);
+                                    }
                                 })
                                 .detach();
-                                break;
+                                break true;
                             }
                             Err(err) => {
+                                failures += 1;
+                                if attempts.map_or(false, |most| failures >= most) {
+                                    log::error!(
+                                        "problem reconnecting: {}; no server answered {} times, giving up",
+                                        err,
+                                        failures
+                                    );
+                                    ui.close();
+                                    break false;
+                                }
                                 backoff = (backoff + backoff).min(MAX_INTERVAL);
-                                ui.output_str(&format!(
-                                    "problem reconnecting: {}; will reconnect in {:?}\n",
+                                let what = format!(
+                                    "problem reconnecting: {}; will reconnect in {:?}",
                                     err, backoff
-                                ));
+                                );
+                                if is_local {
+                                    log::warn!("{}", what);
+                                }
+                                ui.output_str(&format!("{}\n", what));
                             }
                         }
+                    };
+                    if !reconnected {
+                        break;
                     }
                 } else {
                     log::error!("client_thread returned without any error condition");
                     break;
+                }
+            }
+            // LBTerm: what waited for a connection that won't come is failed as never sent,
+            // rather than dropped, so a write says it never went, not that it may have
+            // (lbterm_link.rs, GaveUp)
+            while let Ok(request) = receiver.try_recv() {
+                if let ReaderMessage::SendPdu { promise, .. } = request {
+                    let _ = promise.try_send(Err(crate::lbterm_link::GaveUp.into()));
                 }
             }
 
@@ -1155,6 +1477,9 @@ impl Client {
 
         Self {
             sender,
+            link,
+            lbterm_reads,
+            lbterm_gate,
             local_domain_id,
             is_reconnectable,
             is_local,
@@ -1326,11 +1651,90 @@ impl Client {
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
         let (promise, rx) = bounded(1);
         self.sender
-            .send(ReaderMessage::SendPdu { pdu, promise })
+            .send(ReaderMessage::SendPdu {
+                pdu,
+                promise,
+                awaited: false,
+            })
             .await
             .map_err(|_| ChannelSendError)
             .context("send_pdu send")?;
         rx.recv().await.context("send_pdu recv")?
+    }
+
+    /// LBTerm: whether the connection is down, its requests waiting for the next (lbterm_link.rs)
+    pub fn lbterm_link_down(&self) -> bool {
+        self.link.is_down()
+    }
+
+    /// LBTerm: what reads of held panes share with the client thread (lbterm_current.rs)
+    pub fn lbterm_reads(&self) -> &crate::lbterm_current::Reads {
+        &self.lbterm_reads
+    }
+
+    /// LBTerm: whether this connection's server knows PanesDrawn (lbterm_drawn.rs), an atomic
+    /// load: the GUI thread builds no notice for one that doesn't
+    pub fn lbterm_says_drawn(&self) -> bool {
+        self.lbterm_gate.is_open()
+    }
+
+    /// LBTerm: the pushes a frame read, each pane by the server's id and the seqno of its newest
+    /// push applied, sent as one PanesDrawn without waiting (the server answers nothing): the
+    /// client thread sends it only while its server knows it (lbterm_drawn.rs)
+    pub fn lbterm_panes_drawn(&self, panes: Vec<codec::PaneDrawn>) {
+        if panes.is_empty() || !self.lbterm_gate.is_open() {
+            return;
+        }
+        let _ = self
+            .sender
+            .try_send(ReaderMessage::Drawn(codec::PanesDrawn { panes }));
+    }
+
+    /// LBTerm: a held pane's push asked of the server for a read (GetPaneRenderChanges, which
+    /// the server answers after the push), sent without waiting, so from Lua's synchronous
+    /// methods too; the client thread reads on for its answer whatever its backlog holds. Where
+    /// the answer comes, which must be kept until it does (PITFALLS 224); None when the client
+    /// thread has ended (it gave up reconnecting)
+    pub fn lbterm_ask_changes(&self, pane_id: PaneId) -> Option<Receiver<anyhow::Result<Pdu>>> {
+        let (promise, answer) = bounded(1);
+        self.sender
+            .try_send(ReaderMessage::SendPdu {
+                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }),
+                promise,
+                awaited: true,
+            })
+            .ok()?;
+        Some(answer)
+    }
+
+    /// LBTerm: the pushes of `pane_id` (the server's id) the client thread has handed over and
+    /// the GUI thread hasn't taken, applied now, as the backlog's task would apply them, ahead of
+    /// what's for other panes, as the typed pane's are (lbterm_backlog.rs, `Backlog::take_pane`):
+    /// a read that asked for the pane's push and has its answer, on the GUI thread
+    pub fn lbterm_apply_handed(&self, pane_id: PaneId) {
+        let (Some(domain_id), Some(backlog)) = (self.local_domain_id, self.lbterm_reads.backlog()) else {
+            return;
+        };
+        for (decoded, applied) in backlog.take_pane(pane_id) {
+            process_unilateral_now(domain_id, decoded, applied);
+        }
+    }
+
+    /// LBTerm: write to a pane and hear what came of it (lbterm_link.rs), counted as
+    /// `write_to_pane` was
+    pub async fn lbterm_write_to_pane(&self, pdu: WriteToPane) -> Option<crate::lbterm_link::Failure> {
+        let start = std::time::Instant::now();
+        // A client whose thread has ended (it gave up reconnecting) can't queue it: never sent
+        let answer = self.send_pdu(Pdu::WriteToPane(pdu)).await.map_err(|err| {
+            if err.root_cause().is::<ChannelSendError>() {
+                crate::lbterm_link::GaveUp.into()
+            } else {
+                err
+            }
+        });
+        metrics::histogram!("rpc", "method" => "write_to_pane").record(start.elapsed());
+        metrics::counter!("rpc.count", "method" => "write_to_pane").increment(1);
+        crate::lbterm_link::Failure::of(answer)
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
@@ -1383,6 +1787,7 @@ impl Client {
         LivenessResponse
     );
     rpc!(get_lines, GetLines, GetLinesResponse);
+    rpc!(get_prompt_rows, GetPromptRows, GetPromptRowsResponse);
     rpc!(
         get_dimensions,
         GetPaneRenderableDimensions,
@@ -1400,6 +1805,11 @@ impl Client {
     rpc!(list_clients, GetClientList = (), GetClientListResponse);
     rpc!(set_window_workspace, SetWindowWorkspace, UnitResponse);
     rpc!(set_focused_pane_id, SetFocusedPane, UnitResponse);
+    // LBTerm: what the windows show (lbterm_shown.rs)
+    rpc!(set_shown_panes, SetShownPanes, UnitResponse);
+    // LBTerm: parked tabs (lbterm/MUX.md, "Parked tabs")
+    rpc!(get_parked_tabs, GetParkedTabs, ParkedTabs);
+    rpc!(set_tab_parked, TabParked, UnitResponse);
     rpc!(get_image_cell, GetImageCell, GetImageCellResponse);
     rpc!(set_configured_palette_for_pane, SetPalette, UnitResponse);
     rpc!(set_tab_title, TabTitleChanged, UnitResponse);
@@ -1412,4 +1822,102 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+#[cfg(test)]
+impl Client {
+    /// LBTerm: a client with no thread and no connection, for tests of what its panes keep: what
+    /// it would send goes nowhere
+    pub(crate) fn lbterm_unconnected() -> Self {
+        let (sender, _receiver) = unbounded();
+        Self {
+            sender,
+            link: Default::default(),
+            lbterm_reads: Default::default(),
+            lbterm_gate: Default::default(),
+            local_domain_id: None,
+            client_id: ClientId::new(),
+            client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
+            is_reconnectable: false,
+            is_local: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn eof() -> anyhow::Error {
+        // What the GUI got each time the server hung up on 2026-10-23
+        anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "EOF while reading leb128 encoded value",
+        ))
+        .context("decode_raw_async failed to read PDU length")
+        .context("decoding a PDU")
+    }
+
+    fn reset() -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(10054))
+            .context("decode_raw_async failed to read PDU length")
+    }
+
+    const UNIX: bool = true;
+    const TLS: bool = false;
+
+    #[test]
+    fn lbterm_unix_domain_reconnects_when_the_server_hangs_up() {
+        for err in [eof(), reset(), anyhow!("got serial 7 without a corresponding promise")] {
+            assert_eq!(
+                after_disconnect(UNIX, true, true, &err),
+                AfterDisconnect::Reconnect {
+                    attempts: Some(UNIX_RECONNECT_ATTEMPTS)
+                },
+                "{err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn lbterm_unix_domain_detaches_when_the_client_is_gone() {
+        let err = anyhow::Error::new(NotReconnectableError::ClientWasDestroyed);
+        assert!(matches!(
+            after_disconnect(UNIX, true, true, &err),
+            AfterDisconnect::Detach(_)
+        ));
+    }
+
+    #[test]
+    fn lbterm_cli_connections_never_reconnect() {
+        // `lbterm cli` has no domain of its own: it ends with its connection
+        assert!(matches!(
+            after_disconnect(UNIX, true, false, &eof()),
+            AfterDisconnect::Detach(_)
+        ));
+    }
+
+    #[test]
+    fn tls_and_ssh_keep_upstream_behaviour() {
+        assert!(matches!(
+            after_disconnect(TLS, true, true, &eof()),
+            AfterDisconnect::Detach("server closed connection")
+        ));
+        assert_eq!(
+            after_disconnect(TLS, true, true, &reset()),
+            AfterDisconnect::Reconnect { attempts: None }
+        );
+        // ssh isn't reconnectable
+        assert!(matches!(
+            after_disconnect(TLS, false, true, &reset()),
+            AfterDisconnect::Detach(_)
+        ));
+    }
+
+    #[test]
+    fn lbterm_unix_domain_is_reconnectable() {
+        let mut r = Reconnectable::new(ClientDomainConfig::Unix(UnixDomain::default()), None);
+        assert!(r.reconnectable());
+        assert!(r.is_local());
+    }
 }

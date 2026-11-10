@@ -1258,6 +1258,9 @@ pub enum MousePress {
     Left,
     Right,
     Middle,
+    /// LBTerm: the mouse's side buttons, back (XBUTTON1) and forward (XBUTTON2)
+    Back,
+    Forward,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

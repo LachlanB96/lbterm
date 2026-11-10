@@ -342,7 +342,30 @@ pub fn resolve_gui_sock_path(class_name: &str) -> anyhow::Result<PathBuf> {
 /// The list is pruned of any entries that are not live
 /// and then sorted with the eldest instance first.
 pub fn discover_gui_socks() -> Vec<PathBuf> {
+    discover_gui_socks_in(&config::RUNTIME_DIR)
+}
+
+/// LBTerm: a GUI's socket is `gui-sock-<pid>` and nothing more. Other files beside it whose names
+/// start the same way aren't sockets and are never swept as dead ones: the GUI's own
+/// `gui-sock-<pid>.parked.json` (mux's lbterm_parked.rs, Lachlan's 8a) was deleted by every GUI's
+/// update checker 10 s after it started (lbterm/PITFALLS.md, 254)
+fn lbterm_is_gui_sock(name: &str) -> bool {
+    name.strip_prefix("gui-sock-")
+        .map_or(false, |pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// LBTerm: a file LBTerm put beside a GUI's socket, `gui-sock-<pid>.<more>`
+/// (`gui-sock-<pid>.parked.json` and its `.tmp`): the socket's name. It lives as long as its
+/// socket does, and the sweep takes it once the socket's gone, now or before
+fn lbterm_beside_gui_sock(name: &str) -> Option<&str> {
+    let (sock, _) = name.split_once('.')?;
+    lbterm_is_gui_sock(sock).then_some(sock)
+}
+
+fn discover_gui_socks_in(runtime_dir: &Path) -> Vec<PathBuf> {
     let mut socks = vec![];
+    // LBTerm: the files beside a socket, its name, their path and age
+    let mut beside = vec![];
 
     #[derive(Debug)]
     struct Entry {
@@ -368,11 +391,11 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
         }
     }
 
-    if let Ok(dir) = std::fs::read_dir(&*config::RUNTIME_DIR) {
+    if let Ok(dir) = std::fs::read_dir(runtime_dir) {
         for entry in dir {
             if let Ok(entry) = entry {
                 if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("gui-sock-") {
+                    if lbterm_is_gui_sock(name) {
                         let path = entry.path();
                         if let Ok(meta) = entry.metadata() {
                             let age = meta_age(&meta);
@@ -382,9 +405,23 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
                                 socks.push(Entry { path, age });
                             }
                         }
+                    } else if let Some(sock) = lbterm_beside_gui_sock(name) {
+                        if let Ok(meta) = entry.metadata() {
+                            beside.push((sock.to_string(), entry.path(), meta_age(&meta)));
+                        }
                     }
                 }
             }
+        }
+    }
+    // LBTerm: a file beside a socket swept now, or gone before, goes with it; one beside a live
+    // socket stays, and so does one just written (a GUI's first file before its socket's listed)
+    for (sock, path, age) in beside {
+        let live = socks
+            .iter()
+            .any(|e| e.path.file_name().and_then(|n| n.to_str()) == Some(sock.as_str()));
+        if !live && age > Duration::from_secs(1) {
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -395,4 +432,68 @@ pub fn discover_gui_socks() -> Vec<PathBuf> {
 
 fn is_sock_dead(sock: &std::path::Path) -> bool {
     UnixStream::connect(sock).is_err()
+}
+
+#[cfg(test)]
+mod lbterm_test {
+    use super::*;
+
+    #[test]
+    fn only_gui_sock_and_a_pid_is_a_guis_socket() {
+        assert!(lbterm_is_gui_sock("gui-sock-12"));
+        assert!(lbterm_is_gui_sock("gui-sock-31776"));
+        for name in [
+            "gui-sock-",
+            "gui-sock-12.parked.json",
+            "gui-sock-12.parked.json.tmp",
+            "gui-sock-x",
+            "sock",
+            "sock.parked.json",
+        ] {
+            assert!(!lbterm_is_gui_sock(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_file_beside_a_socket_is_named_by_it() {
+        assert_eq!(lbterm_beside_gui_sock("gui-sock-12.parked.json"), Some("gui-sock-12"));
+        assert_eq!(lbterm_beside_gui_sock("gui-sock-12.parked.json.tmp"), Some("gui-sock-12"));
+        for name in ["gui-sock-12", "gui-sock-x.parked.json", "sock.parked.json", "gui-sock-.json"] {
+            assert_eq!(lbterm_beside_gui_sock(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_keeps_a_live_guis_files_and_takes_a_dead_ones_with_its_socket() {
+        let dir = std::env::temp_dir().join(format!("lbterm-discovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A live GUI's socket, listening, and its parked file beside it
+        let live = dir.join("gui-sock-12");
+        let _listener = wezterm_uds::UnixListener::bind(&live).unwrap();
+        // A dead GUI's: a file that takes no connect where its socket was, and its parked file;
+        // a GUI's parked file whose socket went before; the daily server's file, never the sweep's
+        for name in [
+            "gui-sock-12.parked.json",
+            "gui-sock-12.parked.json.tmp",
+            "gui-sock-13",
+            "gui-sock-13.parked.json",
+            "gui-sock-14.parked.json",
+            "sock.parked.json",
+        ] {
+            std::fs::write(dir.join(name), "{}").unwrap();
+        }
+        // Each is over a second old, as the update checker's sweep 10 s after a GUI starts finds
+        // its own file (the review's probe of 2026-11-09: there at 4 s, gone at 13 s)
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(discover_gui_socks_in(&dir), vec![live.clone()]);
+        for name in ["gui-sock-12", "gui-sock-12.parked.json", "gui-sock-12.parked.json.tmp", "sock.parked.json"] {
+            assert!(dir.join(name).exists(), "{name} was swept");
+        }
+        for name in ["gui-sock-13", "gui-sock-13.parked.json", "gui-sock-14.parked.json"] {
+            assert!(!dir.join(name).exists(), "{name} was left");
+        }
+        drop(_listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

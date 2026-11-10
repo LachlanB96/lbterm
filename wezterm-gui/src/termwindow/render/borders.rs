@@ -116,6 +116,14 @@ impl crate::TermWindow {
                 })
                 .ceil() as usize,
         );
+        // LBTerm: so does the objectives panel's down the right (render/objectives.rs)
+        border.right += ULength::new(
+            super::objectives::strip_width(config, dimensions, render_metrics) as usize,
+        );
+        // and the scroll strip's, left of it (render/scroll_strip.rs)
+        border.right += ULength::new(
+            super::scroll_strip::strip_width(config, dimensions, render_metrics) as usize,
+        );
         border.top += ULength::new(
             config
                 .window_frame

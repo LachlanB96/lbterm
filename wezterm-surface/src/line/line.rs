@@ -1,5 +1,5 @@
 use crate::cellcluster::CellCluster;
-use crate::hyperlink::Rule;
+use crate::hyperlink::{Rule, RuleMatch};
 use crate::line::cellref::CellRef;
 use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
@@ -212,6 +212,31 @@ impl Line {
     /// Wrap the line so that it fits within the provided width.
     /// Returns the list of resultant line(s)
     pub fn wrap(self, width: usize, seqno: SequenceNo) -> Vec<Self> {
+        // LBTerm: a clustered line is cut a run at a time (ClusteredLine::lbterm_wrap), each row
+        // left as the cell-at-a-time way below leaves it
+        if let CellStorage::C(cl) = &self.cells {
+            if let Some(rows) = cl.lbterm_wrap(width) {
+                if rows.is_empty() {
+                    return vec![self];
+                }
+                let n = rows.len();
+                return rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut cl)| {
+                        if i + 1 < n {
+                            cl.set_last_cell_was_wrapped(true);
+                        }
+                        let mut line = Line::new(seqno);
+                        if cl.any_attrs(|a| a.hyperlink().is_some()) {
+                            line.bits |= LineBits::HAS_HYPERLINK;
+                        }
+                        line.cells = CellStorage::C(cl);
+                        line
+                    })
+                    .collect();
+            }
+        }
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
@@ -482,6 +507,18 @@ impl Line {
         &self.zones
     }
 
+    /// LBTerm: whether any of the line's cells is of `semantic_type`, which is whether
+    /// semantic_zone_ranges has a zone of it, without working the zones out or keeping them: a
+    /// line in the scrollback is read off its runs of attributes, not a cell at a time
+    pub fn has_semantic_type(&self, semantic_type: SemanticType) -> bool {
+        match &self.cells {
+            CellStorage::V(_) => self
+                .visible_cells()
+                .any(|cell| cell.attrs().semantic_type() == semantic_type),
+            CellStorage::C(cl) => cl.any_attrs(|attrs| attrs.semantic_type() == semantic_type),
+        }
+    }
+
     /// If we have any cells with an implicit hyperlink, remove the hyperlink
     /// from the cell attributes but leave the remainder of the attributes alone.
     #[inline]
@@ -529,6 +566,17 @@ impl Line {
     /// is the responsibility of the caller to call `invalidate_implicit_hyperlinks`
     /// if it wishes to call this function with different `rules`.
     pub fn scan_and_create_hyperlinks(&mut self, rules: &[Rule]) {
+        self.lbterm_scan_and_create_hyperlinks_with(&mut |line| Rule::match_hyperlinks(line, rules))
+    }
+
+    /// LBTerm: scan_and_create_hyperlinks with the matches for the line's text from `find`,
+    /// rather than the rules run over it there and then: a mux client keeps the matches of the
+    /// lines it scanned by their text, so a line that only moved isn't matched again
+    /// (wezterm-client's pane/lbterm_links.rs)
+    pub fn lbterm_scan_and_create_hyperlinks_with(
+        &mut self,
+        find: &mut dyn FnMut(&str) -> Vec<RuleMatch>,
+    ) {
         if (self.bits & LineBits::SCANNED_IMPLICIT_HYPERLINKS)
             == LineBits::SCANNED_IMPLICIT_HYPERLINKS
         {
@@ -544,15 +592,23 @@ impl Line {
         self.bits &= !LineBits::HAS_IMPLICIT_HYPERLINKS;
         let line = self.as_str();
 
-        let matches = Rule::match_hyperlinks(&line, rules);
+        let matches = find(&line);
         if matches.is_empty() {
             return;
         }
 
         let line = line.into_owned();
+        // LBTerm: a clustered line goes back to clustered once its links are on its cells, as
+        // apply_hyperlink_rules does for the lines it splits: left a cell at a time, a line with
+        // a path in it held 24 bytes a cell, and a heap block for each linked cell, in every copy
+        // of it the GUI made from then on
+        let was_clustered = matches!(&self.cells, CellStorage::C(_));
         let cells = self.coerce_vec_storage();
         if cells.scan_and_create_hyperlinks(&line, matches) {
             self.bits |= LineBits::HAS_IMPLICIT_HYPERLINKS;
+        }
+        if was_clustered {
+            self.compress_for_scrollback();
         }
     }
 
@@ -765,12 +821,25 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.set_cell_grapheme_ref(idx, text, width, &attr, seqno)
+    }
+
+    /// LBTerm: set_cell_grapheme with the attributes by reference, copied only where they're
+    /// kept: an append to a clustered line that continues its last cluster keeps none
+    pub fn set_cell_grapheme_ref(
+        &mut self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
 
         if let CellStorage::C(cl) = &mut self.cells {
-            if idx > cl.len() && text == " " && attr == CellAttributes::blank() {
+            if idx > cl.len() && text == " " && *attr == CellAttributes::blank() {
                 // Appending blank beyond end of line; is already
                 // implicitly blank
                 return;
@@ -778,7 +847,7 @@ impl Line {
             while cl.len() < idx {
                 // Fill out any implied blanks until we can append
                 // their intended cell content
-                cl.append_grapheme(" ", 1, CellAttributes::blank());
+                cl.append_grapheme(" ", 1, &CellAttributes::blank());
             }
             if idx == cl.len() {
                 cl.append_grapheme(text, width, attr);
@@ -789,7 +858,77 @@ impl Line {
             }
         }
 
-        self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+        self.set_cell(
+            idx,
+            Cell::new_grapheme_with_width(text, width, attr.clone()),
+            seqno,
+        );
+    }
+
+    /// LBTerm: `text`, printable ASCII, written from `idx` a cell a character, all in `attr`:
+    /// what set_cell_grapheme_ref does for each character in turn, done for the run at once.
+    /// Appended to a clustered line's end as one stretch of its text and at most one cluster;
+    /// written over a line's cells with their bookkeeping (its links and zones forgotten, its
+    /// sequence number, a wide character before it cut) done once, not a character at a time
+    pub fn set_cells_ascii(
+        &mut self,
+        mut idx: usize,
+        mut text: &str,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        debug_assert!(text.bytes().all(|b| (0x20..0x7f).contains(&b)));
+        if text.is_empty() {
+            return;
+        }
+        if attr.hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+
+        if let CellStorage::C(cl) = &mut self.cells {
+            if idx > cl.len() && *attr == CellAttributes::blank() {
+                // Blanks beyond the end are already implicitly blank: skipped, as
+                // set_cell_grapheme_ref skips each, up to the first that isn't one
+                let spaces = text.bytes().take_while(|&b| b == b' ').count();
+                idx += spaces;
+                text = &text[spaces..];
+                if text.is_empty() {
+                    return;
+                }
+            }
+            if idx >= cl.len() {
+                while cl.len() < idx {
+                    cl.append_grapheme(" ", 1, &CellAttributes::blank());
+                }
+                cl.append_ascii(text, attr);
+                self.invalidate_implicit_hyperlinks(seqno);
+                self.invalidate_zones();
+                self.update_last_change_seqno(seqno);
+                return;
+            }
+        }
+
+        let end = idx + text.len();
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        {
+            let cells = self.coerce_vec_storage();
+            if end > cells.len() {
+                cells.resize_with(end, Cell::blank);
+            }
+        }
+        // Each character after the first follows one a cell wide, so only the first can land
+        // on the second half of a wide character
+        self.invalidate_grapheme_at_or_before(idx);
+        let cells = self.coerce_vec_storage();
+        for i in 0..text.len() {
+            cells.set_cell(
+                idx + i,
+                Cell::new_grapheme_with_width(&text[i..i + 1], 1, attr.clone()),
+                false,
+            );
+        }
     }
 
     pub fn set_cell_clearing_image_placements(
@@ -831,7 +970,7 @@ impl Line {
             while cl.len() < idx {
                 // Fill out any implied blanks until we can append
                 // their intended cell content
-                cl.append_grapheme(" ", 1, CellAttributes::blank());
+                cl.append_grapheme(" ", 1, &CellAttributes::blank());
             }
             if idx == cl.len() {
                 cl.append(cell);
@@ -1086,6 +1225,11 @@ impl Line {
     /// Return true if the last cell in the line has the wrapped attribute,
     /// indicating that the following line is logically a part of this one.
     pub fn last_cell_was_wrapped(&self) -> bool {
+        // LBTerm: a clustered line's last cell has its last run's attributes, without the walk
+        // (ClusteredLine::lbterm_last_wrapped)
+        if let CellStorage::C(cl) = &self.cells {
+            return cl.lbterm_last_wrapped();
+        }
         self.visible_cells()
             .last()
             .map(|c| c.attrs().wrapped())
@@ -1126,11 +1270,15 @@ impl Line {
                     }
                 }
             }
-            CellStorage::C(cl) => {
-                for cell in other.visible_cells() {
-                    cl.append(cell.as_cell());
+            CellStorage::C(cl) => match &other.cells {
+                // LBTerm: a run at a time (ClusteredLine::lbterm_append_line)
+                CellStorage::C(other) => cl.lbterm_append_line(other),
+                CellStorage::V(_) => {
+                    for cell in other.visible_cells() {
+                        cl.append(cell.as_cell());
+                    }
                 }
-            }
+            },
         }
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
@@ -1217,3 +1365,8 @@ impl<'a> From<&'a str> for Line {
         Line::from_text(s, &CellAttributes::default(), SEQ_ZERO, None)
     }
 }
+
+/// LBTerm: the rewrap a run at a time held to the cell-at-a-time ways (ClusteredLine's lbterm_*)
+#[cfg(test)]
+#[path = "lbterm_rewrap_test.rs"]
+mod lbterm_rewrap_test;

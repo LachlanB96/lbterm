@@ -1,8 +1,9 @@
 use crate::domain::ClientInner;
 use crate::pane::clientpane::ClientPane;
+use crate::pane::lbterm_poll::PollPace;
 use anyhow::anyhow;
 use codec::*;
-use config::{configuration, ConfigHandle};
+use config::configuration;
 use lru::LruCache;
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
@@ -14,18 +15,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
+use termwiz::hyperlink::Rule;
 use termwiz::image::{ImageCell, ImageData};
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, StableRowIndex};
-
-const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
-const BASE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 enum LineEntry {
@@ -53,19 +52,242 @@ impl LineEntry {
     }
 }
 
+/// Every line `lines` holds made stale where it is, the cache's size and order kept. LBTerm:
+/// upstream's make_all_stale emptied it into an unbounded cache, so after a pane's first resize (a
+/// mux domain's every tab is resized as its window lays it out) or palette change, every line
+/// ever pushed to the pane stayed in the window for good: six tabs printing without a pause grew a
+/// test window by 20 to 30 MB a second (perf/mux-flood.ps1, 2026-10-30), 11.5 GB in seven minutes
+/// on 2026-10-29. perf/mux-server kept the size by emptying it into a new cache of the same size,
+/// which still freed and made a node for every line held, for every pane of every tab at each step
+/// of a window's resize, a zoom or a palette (perf/mux-client): now each entry changes in place,
+/// and nothing is freed or made
+fn all_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, now: Instant) {
+    for (_, entry) in lines.iter_mut() {
+        if let LineEntry::Line(_) = entry {
+            if let LineEntry::Line(old) = std::mem::replace(entry, LineEntry::Fetching(now)) {
+                *entry = LineEntry::Stale(old);
+            }
+        }
+    }
+}
+
+/// LBTerm: what a push's dirty rows above the viewport do to the cache: each leaves it (upstream
+/// popped the row, then asked make_stale to keep it Stale, which popped it again and found
+/// nothing), so a line is fetched again when it's next read. Upstream walked every row of the
+/// range, which after a resize is the pane's whole scrollback; this walks the range or the cache,
+/// whichever is shorter, and leaves the cache as upstream's walk did
+fn drop_rows_above(lines: &mut LruCache<StableRowIndex, LineEntry>, rows: Range<StableRowIndex>) {
+    if rows.is_empty() {
+        return;
+    }
+    if (rows.end - rows.start) as usize > lines.len() {
+        let held: Vec<StableRowIndex> = lines
+            .iter()
+            .map(|(row, _)| *row)
+            .filter(|row| rows.contains(row))
+            .collect();
+        for row in held {
+            lines.pop(&row);
+        }
+    } else {
+        for row in rows {
+            lines.pop(&row);
+        }
+    }
+}
+
+/// LBTerm: the rows a push that moves the cursor names besides its own: the row it moves to, whose
+/// line the push brings, and the row it leaves only when local echo drew a guess into that row
+/// (`predicted`), which only the server's line puts right. Upstream fetched the row left at every
+/// move, the server's word that it hadn't changed overruled: after a resize, whose rewrap can move
+/// the cursor down a row and leave the row it was on as it was, each pane fetched that row
+/// (perf/mux-resize-rows.ps1's drag, the three tabs out of view taking the drag's last size, one
+/// GetLines each). A guess is drawn only while the server is slow to answer (should_predict)
+fn cursor_moved(
+    dirty: &mut RangeSet<StableRowIndex>,
+    predicted: &RangeSet<StableRowIndex>,
+    left: StableRowIndex,
+    to: StableRowIndex,
+) {
+    if predicted.contains(left) {
+        dirty.add(left);
+    }
+    dirty.add(to);
+}
+
+/// LBTerm: what a push's dirty rows do to the cache, its bonus lines put already and taken out of
+/// `dirty` (apply_changes_to_surface, upstream's loop): a row above the viewport (`physical_top`)
+/// leaves it, to be fetched when it's next read; a row in view is fetched, the line held kept to
+/// draw meanwhile. Returns the rows to fetch. These are the rows a resize's rewrap changed too:
+/// the push after it is the server's word on which (term's lbterm_rewrap; PITFALLS 142), so a
+/// resize makes nothing else stale (clientpane.rs, resize)
+fn rows_named(
+    lines: &mut LruCache<StableRowIndex, LineEntry>,
+    dirty: &RangeSet<StableRowIndex>,
+    physical_top: StableRowIndex,
+    now: Instant,
+) -> RangeSet<StableRowIndex> {
+    let mut to_fetch = RangeSet::new();
+    for r in dirty.iter() {
+        // LBTerm: a dirty row above the viewport only leaves the cache, so only rows the cache
+        // holds are looked at there: after a resize the server says the pane's whole
+        // scrollback is dirty (50,000 rows), which this walked a row at a time, two lookups a
+        // row, for each pane's push (drop_rows_above)
+        let above = r.start..r.end.min(physical_top).max(r.start);
+        drop_rows_above(lines, above);
+        for stable_row in r.start.max(physical_top)..r.end {
+            // If a line is in the (probable) viewport region,
+            // then we'll likely want to fetch it.
+            // If it is outside that region, remove it from our cache
+            // so that we'll fetch it on demand later.
+            let prior = lines.pop(&stable_row);
+            let prior_kind = prior.as_ref().map(|e| e.kind());
+            to_fetch.add(stable_row);
+            let entry = match prior {
+                Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(now),
+                Some(LineEntry::LineAndFetching(old, ..))
+                | Some(LineEntry::Stale(old))
+                | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, now),
+            };
+            log::trace!(
+                "row {} {:?} -> {:?} due to dirty and IN viewport",
+                stable_row,
+                prior_kind,
+                entry.kind()
+            );
+            lines.put(stable_row, entry);
+        }
+    }
+    to_fetch
+}
+
+/// LBTerm: each line held for `rows` scanned for `rules`' implicit hyperlinks, in place, once
+/// (a line says it was scanned until it's replaced). Upstream scanned every line as it came
+/// (put_line), so every push of a busy tab out of view, and every line replaced before it was
+/// ever drawn, was scanned on the GUI thread: with Lachlan's rules (WezTerm's and two of his) a
+/// flooding tab's line took about 80 µs and its push 3.3 ms, and six of them out of view held
+/// the GUI thread 64% of the time, 0.2 ms a push with no rules (perf/mux-flood.ps1, 2026-10-31).
+/// Now a line is scanned when it's drawn or looked at for a link (ClientPane::apply_hyperlinks,
+/// which the renderer and the pointer call first, as for a local pane), the same way as before:
+/// each line on its own. A line whose text this pane matched in the last two screens of rows it
+/// drew (`shown` a screen) takes those matches, as a line that only moved (lbterm_links.rs)
+fn scan_rows(
+    lines: &mut LruCache<StableRowIndex, LineEntry>,
+    rows: Range<StableRowIndex>,
+    rules: &[Rule],
+    kept: &mut lbterm_links::KeptScans,
+    shown: usize,
+) {
+    if rules.is_empty() {
+        return;
+    }
+    for row in rows {
+        match lines.peek_mut(&row) {
+            Some(LineEntry::Line(line))
+            | Some(LineEntry::LineAndFetching(line, _))
+            | Some(LineEntry::Stale(line)) => kept.scan(line, rules, shown),
+            Some(LineEntry::Fetching(_)) | None => {}
+        }
+    }
+}
+
+/// LBTerm: the server holds the pane from its push of `seqno`, the pane's last push applied
+/// being `applied`'s: held (`held` set to `seqno` plus one) unless a push past it is applied
+/// already. Whether it's held
+fn lbterm_hold_from(held: &AtomicU64, applied: SequenceNo, seqno: SequenceNo) -> bool {
+    if applied > seqno {
+        return false;
+    }
+    held.store(seqno as u64 + 1, Ordering::Release);
+    true
+}
+
+/// LBTerm: the connection that said the pane is held has ended, and a new one is up: a hold of
+/// it (`held`) is said again from no push, so the new connection's first push of the pane, of
+/// whatever seqno, ends it (a server started afresh numbers from its own start). Whether it was
+/// held, and so needs that push asked for: the new connection owes nothing for a pane quiet since
+/// and holds nothing of it, so nothing would come unasked (PITFALLS 201)
+pub(crate) fn lbterm_hold_reconnected(held: &AtomicU64) -> bool {
+    held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |from| {
+        (from != 0).then_some(1)
+    })
+    .is_ok()
+}
+
+/// LBTerm: a push of `seqno` applied: the server's hold of the pane (`held`, its seqno plus one)
+/// ends when it's past the seqno the hold was said from, counted in `ended`
+fn lbterm_hold_ends(held: &AtomicU64, ended: &AtomicU64, seqno: SequenceNo) {
+    let from = held.load(Ordering::Acquire);
+    if from != 0 && seqno as u64 >= from {
+        held.store(0, Ordering::Release);
+        ended.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// LBTerm: a push or a fetch answer brought the pane rows (`RenderableInner::lbterm_rows`)
+fn lbterm_rows_news(rows: &AtomicU64) {
+    rows.fetch_add(1, Ordering::Release);
+}
+
+/// LBTerm: whether any line a push carries reads otherwise than the line held at its row. The
+/// server sends the cursor's row in every push ("always send the cursor's row", sessionhandler.rs),
+/// so a push of a title alone carries that line again as it was. Its text alone, since a scan for
+/// links sees only that (lbterm_links.rs); a row held stale, being fetched with no line, or not
+/// held counts as new. Stops at the first new one, so a push of new output compares one line
+fn brings_new_text(
+    lines: &LruCache<StableRowIndex, LineEntry>,
+    carried: &[(StableRowIndex, Line)],
+) -> bool {
+    carried.iter().any(|(row, line)| match lines.peek(row) {
+        Some(LineEntry::Line(held)) | Some(LineEntry::LineAndFetching(held, _)) => {
+            held.as_str() != line.as_str()
+        }
+        _ => true,
+    })
+}
+
+#[cfg(test)]
+#[path = "lbterm_renderable_test.rs"]
+mod lbterm_test;
+
 pub struct RenderableInner {
     pub client: Arc<ClientInner>,
     remote_pane_id: PaneId,
     local_pane_id: PaneId,
-    last_poll: Instant,
     pub dead: bool,
     poll_in_progress: AtomicBool,
-    poll_interval: Duration,
+    /// LBTerm: when to poll, upstream's last_poll and poll_interval (lbterm_poll.rs)
+    poll: PollPace,
 
     cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
 
     lines: LruCache<StableRowIndex, LineEntry>,
+    /// LBTerm: the links found in the lines drawn, kept by text (lbterm_links.rs)
+    link_scans: lbterm_links::KeptScans,
+    /// LBTerm: the rows local echo drew a guess into (predict_from_key_event, predict_from_paste)
+    /// that no push has named since: only the server's line puts one right (cursor_moved)
+    lbterm_predicted: RangeSet<StableRowIndex>,
+    /// LBTerm: how many pushes and fetch answers have brought this pane rows, a line whose text
+    /// it didn't hold or a row named changed (`lbterm_rows_news`, `brings_new_text`): a push of
+    /// the title, the folder or the cursor alone, which carries the cursor's row as it was,
+    /// leaves it. `ClientPane` keeps a clone and reads it in the GUI's mux subscription, which a
+    /// push's PaneOutput reaches while this is borrowed, for whether a tab out of view has a
+    /// screen to scan again (lbterm_extras::hidden_scan)
+    pub(crate) lbterm_rows: Arc<AtomicU64>,
+    /// LBTerm: the server's word that it holds this pane's lines (PaneHeld): the seqno it holds
+    /// them from, plus one, or 0 while it holds none. Set by `lbterm_held_from`, cleared by the
+    /// first push past it as that push is applied, before its PaneOutput. `ClientPane` keeps a
+    /// clone, read without this one's lock by the window's frame wait (lbterm/MUX.md, "Tabs out
+    /// of view: output held at the server")
+    pub(crate) lbterm_held: Arc<AtomicU64>,
+    /// LBTerm: how many of those holds a push ended, for hidden_scan's scan at once
+    /// (`ClientPane::lbterm_holds_ended`)
+    pub(crate) lbterm_holds_ended: Arc<AtomicU64>,
+    /// LBTerm: the newest push applied and whether it's been said read since, for the server's
+    /// pace of a shown pane (lbterm_drawn.rs): set here as each push is applied, taken without
+    /// this one's lock through `ClientPane`'s clone by the window's paint
+    pub(crate) lbterm_drawn: Arc<crate::lbterm_drawn::Drawn>,
     pub title: String,
     pub working_dir: Option<Url>,
     pub seqno: SequenceNo,
@@ -99,10 +321,15 @@ impl RenderableInner {
             client: Arc::clone(client),
             remote_pane_id,
             local_pane_id,
-            last_poll: now,
             dead: false,
             poll_in_progress: AtomicBool::new(false),
-            poll_interval: BASE_POLL_INTERVAL,
+            poll: PollPace::new(client.client.is_local, now),
+            link_scans: lbterm_links::KeptScans::new(),
+            lbterm_predicted: RangeSet::new(),
+            lbterm_rows: Arc::new(AtomicU64::new(0)),
+            lbterm_held: Arc::new(AtomicU64::new(0)),
+            lbterm_holds_ended: Arc::new(AtomicU64::new(0)),
+            lbterm_drawn: Arc::new(crate::lbterm_drawn::Drawn::default()),
             cursor_position: StableCursorPosition::default(),
             dimensions,
             lines: LruCache::new(
@@ -126,7 +353,8 @@ impl RenderableInner {
     /// showing.
     pub fn is_tardy(&self) -> bool {
         let elapsed = self.last_recv_time.elapsed();
-        if elapsed > self.poll_interval.max(Duration::from_secs(3)) {
+        // LBTerm: 3 s after input, as upstream's came to (lbterm_poll.rs, tardy_after)
+        if elapsed > self.poll.tardy_after() {
             self.last_send_time > self.last_recv_time
         } else {
             false
@@ -135,7 +363,9 @@ impl RenderableInner {
 
     /// Predictive echo can be noisy when the link is working well,
     /// so we only employ it when it looks like the latency is high.
-    fn should_predict(&self) -> bool {
+    /// LBTerm: public, so the GUI asks a key's own frame for the guess (wezterm-gui's
+    /// termwindow/echo.rs)
+    pub fn should_predict(&self) -> bool {
         self.client
             .local_echo_threshold_ms
             .map(|thresh| self.last_input_rtt >= thresh)
@@ -161,6 +391,10 @@ impl RenderableInner {
             // from their password
             return;
         }
+        // LBTerm: the guess changes the line without moving its sequence number, and the GUI
+        // keeps the key its shapes are cached by on the line itself, by that number
+        // (lbterm_lent.rs): forgotten, so the guess is drawn
+        line.clear_appdata();
 
         match c {
             KeyCode::Enter => {
@@ -234,11 +468,13 @@ impl RenderableInner {
             Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
                 self.apply_prediction(c, &mut line);
                 self.lines.put(row, LineEntry::Line(line));
+                self.lbterm_predicted.add(row);
             }
             Some(LineEntry::LineAndFetching(mut line, instant)) => {
                 self.apply_prediction(c, &mut line);
                 self.lines
                     .put(row, LineEntry::LineAndFetching(line, instant));
+                self.lbterm_predicted.add(row);
             }
             Some(entry) => {
                 self.lines.put(row, entry);
@@ -253,6 +489,8 @@ impl RenderableInner {
             .clone();
 
         let text_line = Line::from_text(text, &attrs, SEQ_ZERO, None);
+        // LBTerm: as apply_prediction
+        line.clear_appdata();
 
         if row == 0 {
             for cell in text_line.visible_cells() {
@@ -282,11 +520,13 @@ impl RenderableInner {
                 Some(LineEntry::Stale(mut line)) | Some(LineEntry::Line(mut line)) => {
                     self.apply_paste_prediction(idx, paste_line, &mut line);
                     self.lines.put(row, LineEntry::Line(line));
+                    self.lbterm_predicted.add(row);
                 }
                 Some(LineEntry::LineAndFetching(mut line, instant)) => {
                     self.apply_paste_prediction(idx, paste_line, &mut line);
                     self.lines
                         .put(row, LineEntry::LineAndFetching(line, instant));
+                    self.lbterm_predicted.add(row);
                 }
                 Some(entry) => {
                     self.lines.put(row, entry);
@@ -299,13 +539,71 @@ impl RenderableInner {
 
     pub fn update_last_send(&mut self) {
         self.last_send_time = Instant::now();
-        self.poll_interval = BASE_POLL_INTERVAL;
+        self.poll.sent();
     }
 
+    /// LBTerm: the push applied last said read to the server now, when it hasn't been, as one
+    /// PanesDrawn of this pane alone (lbterm_drawn.rs): for a push no frame will read
+    pub(crate) fn lbterm_say_drawn(&self) {
+        if !self.client.client.lbterm_says_drawn() {
+            return;
+        }
+        if let Some(seqno) = self.lbterm_drawn.take() {
+            self.client.client.lbterm_panes_drawn(vec![codec::PaneDrawn {
+                pane_id: self.remote_pane_id,
+                seqno,
+            }]);
+        }
+    }
+
+    /// LBTerm: `delta` applied here, on the client thread as it's read, when it's a push of the
+    /// pane's title and folder alone that changes nothing else this pane holds
+    /// (lbterm_names.rs): what `apply_changes_to_surface` would leave, without its PaneOutput,
+    /// which for such a push only told the window of a title it hears of in the alert after it.
+    /// Its title and folder are where `get_title` and `get_current_working_dir` read them
+    /// (PITFALLS 163), and its word is said as every push's is (lbterm_drawn.rs). Whether it
+    /// was; when not, it goes to the GUI thread as any push. The pane's mouse and screen flags,
+    /// which ClientPane keeps, are the caller's to compare (`flags_same`)
+    pub(crate) fn lbterm_names_here(
+        &mut self,
+        delta: &GetPaneRenderChangesResponse,
+        flags_same: bool,
+    ) -> bool {
+        if !flags_same
+            || self.should_predict()
+            || !crate::lbterm_names::current(
+                delta,
+                self.seqno,
+                &self.cursor_position,
+                &self.dimensions,
+                self.lbterm_held.load(Ordering::Acquire),
+            )
+        {
+            return false;
+        }
+        let changes = delta.seqno != self.seqno
+            || delta.title != self.title
+            || delta.working_dir.as_ref().map(|u| &u.url) != self.working_dir.as_ref();
+        self.poll.pushed();
+        self.last_recv_time = Instant::now();
+        self.title = delta.title.clone();
+        self.working_dir = delta.working_dir.clone().map(Into::into);
+        self.seqno = delta.seqno;
+        self.lbterm_drawn.applied(delta.seqno);
+        if !changes {
+            // As the apply says a push that changes nothing: no frame will read it
+            self.lbterm_say_drawn();
+        }
+        true
+    }
+
+    /// LBTerm: `flags_changed` says the delta changed whether the mouse is grabbed or the
+    /// alternate screen is up, which the GUI draws from too (the scrollbar hides for either)
     pub fn apply_changes_to_surface(
         &mut self,
         delta: GetPaneRenderChangesResponse,
         bonus_lines: Vec<(StableRowIndex, Line)>,
+        flags_changed: bool,
     ) {
         log::trace!(
             "apply_changes_to_surface local={} remote={}",
@@ -313,25 +611,56 @@ impl RenderableInner {
             self.remote_pane_id
         );
         let now = Instant::now();
-        self.poll_interval = BASE_POLL_INTERVAL;
+        self.poll.pushed();
         self.last_recv_time = now;
 
+        // LBTerm: for whether it changes anything (below)
+        let lbterm_dirty = !delta.dirty_lines.is_empty();
         let mut dirty = RangeSet::new();
         for r in delta.dirty_lines {
             dirty.add_range(r.clone());
         }
         if delta.cursor_position != self.cursor_position {
-            dirty.add(self.cursor_position.y);
             // But note that the server may have sent this in bonus_lines;
             // we'll address that below
-            dirty.add(delta.cursor_position.y);
+            // LBTerm: the row left is fetched again only when local echo drew a guess into it
+            // (cursor_moved)
+            cursor_moved(
+                &mut dirty,
+                &self.lbterm_predicted,
+                self.cursor_position.y,
+                delta.cursor_position.y,
+            );
         }
+        // LBTerm: each row this push names is put right, by its line or a fetch, a guess drawn
+        // into it with it
+        self.lbterm_predicted.remove_set(&dirty);
 
         // Keep track of the approximate round trip time by recording how
         // long it took for this response to come back
         if let Some(serial) = delta.input_serial {
             self.last_input_rtt = serial.elapsed_millis();
         }
+
+        // LBTerm: whether the delta changes anything the pane shows (lbterm/PERF.md, finding
+        // 68). The server answers every key with one straight away, before the program has
+        // echoed it, for local echo's cursor, and its PaneOutput painted a frame that drew
+        // nothing new and held the frame that drew the echo a pacing period behind it. A delta
+        // with the server's seqno where it was, no lines dirty, the cursor, the size, the title
+        // and the folder as they were, and every line it brings one held already says nothing:
+        // no frame for it. Local echo (a guess the GUI drew, which the server's answer puts
+        // right) and a line the cache doesn't hold still notify, as upstream did for every delta.
+        let lbterm_changes = flags_changed
+            || delta.seqno != self.seqno
+            || lbterm_dirty
+            || delta.cursor_position != self.cursor_position
+            || delta.dimensions != self.dimensions
+            || delta.title != self.title
+            || delta.working_dir.as_ref().map(|u| &u.url) != self.working_dir.as_ref()
+            || bonus_lines
+                .iter()
+                .any(|(row, _)| !matches!(self.lines.peek(row), Some(LineEntry::Line(_))))
+            || self.should_predict();
 
         // When it comes to updating the cursor position, if the update was tagged
         // with keyboard input, we'll only take the position if the update comes from
@@ -359,52 +688,50 @@ impl RenderableInner {
             self.local_pane_id
         );
         self.seqno = delta.seqno;
+        // LBTerm: the next frame that reads the pane says this push (lbterm_drawn.rs)
+        self.lbterm_drawn.applied(delta.seqno);
+        // LBTerm: a push past the seqno the server said it holds the pane from ends the hold,
+        // before its PaneOutput, which the window's frame wait and hidden_scan take it from
+        lbterm_hold_ends(&self.lbterm_held, &self.lbterm_holds_ended, delta.seqno);
 
-        let config = configuration();
+        // LBTerm: whether a line it carries reads otherwise than the one held, looked at before
+        // they go in (brings_new_text)
+        let lbterm_new_text = brings_new_text(&self.lines, &bonus_lines);
+
         for (stable_row, line) in bonus_lines {
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
-            self.put_line(stable_row, line, &config, None);
+            self.put_line(stable_row, line, None);
             dirty.remove(stable_row);
+        }
+
+        // LBTerm: news for the scan of a tab out of view (lbterm_rows): a line whose text is new,
+        // or a row named changed that it didn't carry. Every push carries the cursor's row, so
+        // one of the title, the folder or the cursor alone brings that line again and isn't
+        // news. Counted before its PaneOutput, which the GUI's subscription takes as it's
+        // notified
+        if lbterm_new_text || !dirty.is_empty() {
+            lbterm_rows_news(&self.lbterm_rows);
         }
 
         log::trace!(
             "apply_changes_to_surface: Generate PaneOutput event for local={}",
             self.local_pane_id
         );
-        Mux::get().notify(mux::MuxNotification::PaneOutput(self.local_pane_id));
-
-        let mut to_fetch = RangeSet::new();
-        log::trace!("dirty as of seq {} -> {:?}", delta.seqno, dirty);
-        for r in dirty.iter() {
-            for stable_row in r.clone() {
-                // If a line is in the (probable) viewport region,
-                // then we'll likely want to fetch it.
-                // If it is outside that region, remove it from our cache
-                // so that we'll fetch it on demand later.
-                let fetchable = stable_row >= delta.dimensions.physical_top;
-                let prior = self.lines.pop(&stable_row);
-                let prior_kind = prior.as_ref().map(|e| e.kind());
-                if !fetchable {
-                    log::trace!("make {} stale bcos not fetchable", stable_row);
-                    self.make_stale(stable_row);
-                    continue;
-                }
-                to_fetch.add(stable_row);
-                let entry = match prior {
-                    Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(now),
-                    Some(LineEntry::LineAndFetching(old, ..))
-                    | Some(LineEntry::Stale(old))
-                    | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, now),
-                };
-                log::trace!(
-                    "row {} {:?} -> {:?} due to dirty and IN viewport",
-                    stable_row,
-                    prior_kind,
-                    entry.kind()
-                );
-                self.lines.put(stable_row, entry);
-            }
+        if lbterm_changes {
+            Mux::get().notify(mux::MuxNotification::PaneOutput(self.local_pane_id));
+        } else {
+            log::debug!(
+                target: "lbterm::echo",
+                "pane {}: a delta that changes nothing, no PaneOutput",
+                self.local_pane_id
+            );
+            // LBTerm: it asks for no frame, so nothing a frame will read is new: said read now,
+            // or a server pacing the pane would wait on a frame that never comes (lbterm_drawn.rs)
+            self.lbterm_say_drawn();
         }
+
+        log::trace!("dirty as of seq {} -> {:?}", delta.seqno, dirty);
+        let to_fetch = rows_named(&mut self.lines, &dirty, delta.dimensions.physical_top, now);
         if !to_fetch.is_empty() {
             if self.fetch_limiter.non_blocking_admittance_check(1) {
                 self.schedule_fetch_lines(to_fetch, now);
@@ -422,16 +749,16 @@ impl RenderableInner {
         }
     }
 
+    /// LBTerm: the server says it holds this pane's lines from its push of `seqno` (PaneHeld):
+    /// held until a push past it, unless one is applied already, which the client thread's
+    /// merge of a pane's pushes into the first one waiting can bring ahead of the word
+    /// (lbterm_backlog.rs). Whether it's held
+    pub fn lbterm_held_from(&mut self, seqno: SequenceNo) -> bool {
+        lbterm_hold_from(&self.lbterm_held, self.seqno, seqno)
+    }
+
     pub fn make_all_stale(&mut self) {
-        let mut lines = LruCache::unbounded();
-        while let Some((stable_row, entry)) = self.lines.pop_lru() {
-            let entry = match entry {
-                LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
-                entry => entry,
-            };
-            lines.put(stable_row, entry);
-        }
-        self.lines = lines;
+        all_stale(&mut self.lines, Instant::now());
     }
 
     fn make_stale(&mut self, stable_row: StableRowIndex) {
@@ -445,15 +772,25 @@ impl RenderableInner {
         }
     }
 
+    /// LBTerm: each line held for `rows` scanned for implicit hyperlinks, once (scan_rows): what
+    /// put_line did to every line as it came
+    pub fn apply_hyperlinks(&mut self, rows: Range<StableRowIndex>, rules: &[Rule]) {
+        scan_rows(
+            &mut self.lines,
+            rows,
+            rules,
+            &mut self.link_scans,
+            self.dimensions.viewport_rows,
+        );
+    }
+
     fn put_line(
         &mut self,
         stable_row: StableRowIndex,
         mut line: Line,
-        config: &ConfigHandle,
         fetch_start: Option<Instant>,
     ) {
-        line.scan_and_create_hyperlinks(&config.hyperlink_rules);
-
+        // LBTerm: not scanned for hyperlinks here, but as it's drawn (scan_rows)
         let entry = if let Some(fetch_start) = fetch_start {
             // If we're completing a fetch, only replace entries that were
             // set to fetching as part of our fetch.  If they are now longer
@@ -546,11 +883,13 @@ impl RenderableInner {
 
             match result {
                 Ok(lines) => {
-                    let config = configuration();
-
                     log::trace!("fetch complete for {:?} at {:?}", to_fetch, now);
+                    // LBTerm: lines the pane holds now, news for a scan (lbterm_rows)
+                    if !lines.is_empty() {
+                        lbterm_rows_news(&inner.lbterm_rows);
+                    }
                     for (stable_row, line) in lines.into_iter() {
-                        inner.put_line(stable_row, line, &config, Some(now));
+                        inner.put_line(stable_row, line, Some(now));
                     }
                 }
                 Err(err) => {
@@ -589,51 +928,60 @@ impl RenderableInner {
             return Ok(());
         }
 
-        if self.last_poll.elapsed() < self.poll_interval {
+        if !self.poll.due(Instant::now()) {
             return Ok(());
         }
 
-        let interval = self.poll_interval;
-        let interval = (interval + interval).min(MAX_POLL_INTERVAL);
-        self.poll_interval = interval;
-
-        self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
-        promise::spawn::spawn(async move {
-            let alive = match client
-                .client
-                .get_pane_render_changes(GetPaneRenderChanges {
-                    pane_id: remote_pane_id,
-                })
-                .await
-            {
-                Ok(resp) => resp.is_alive,
-                // if we got a timeout on a reconnectable, don't
-                // consider the tab to be dead; that helps to
-                // avoid having a tab get shuffled around
-                Err(_) => client.client.is_reconnectable,
-            };
-
-            let mux = Mux::get();
-            let tab = mux
-                .get_pane(local_pane_id)
-                .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
-            if let Some(client_tab) = tab.downcast_ref::<ClientPane>() {
-                let renderable = client_tab.renderable.lock();
-                let mut inner = renderable.inner.borrow_mut();
-
-                inner.dead = !alive;
-                inner.last_recv_time = Instant::now();
-                inner.poll_in_progress.store(false, Ordering::SeqCst);
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        promise::spawn::spawn(ask_changes(client, remote_pane_id, local_pane_id, true)).detach();
         Ok(())
     }
+}
+
+/// LBTerm: the pane's changes asked of its server now (GetPaneRenderChanges), and what the answer
+/// does: upstream's poll, which `poll` sends at the pace lbterm_poll.rs keeps and a resize sends
+/// once the server has answered it, so a push comes to say what the rewrap changed
+/// (clientpane.rs; lbterm/MUX.md, "A window's resize"). The changes come as a push of their own,
+/// before the answer, which says only whether the pane lives. `poll` says the poll sent it, so the
+/// answer lets the next one go
+pub(crate) async fn ask_changes(
+    client: Arc<ClientInner>,
+    remote_pane_id: PaneId,
+    local_pane_id: PaneId,
+    poll: bool,
+) -> anyhow::Result<()> {
+    let alive = match client
+        .client
+        .get_pane_render_changes(GetPaneRenderChanges {
+            pane_id: remote_pane_id,
+        })
+        .await
+    {
+        Ok(resp) => resp.is_alive,
+        // if we got a timeout on a reconnectable, don't
+        // consider the tab to be dead; that helps to
+        // avoid having a tab get shuffled around
+        Err(_) => client.client.is_reconnectable,
+    };
+
+    let mux = Mux::get();
+    let tab = mux
+        .get_pane(local_pane_id)
+        .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
+    if let Some(client_tab) = tab.downcast_ref::<ClientPane>() {
+        let renderable = client_tab.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+
+        inner.dead = !alive;
+        inner.last_recv_time = Instant::now();
+        if poll {
+            inner.poll_in_progress.store(false, Ordering::SeqCst);
+        }
+    }
+    Ok(())
 }
 
 lazy_static::lazy_static! {
@@ -731,35 +1079,19 @@ impl RenderableState {
         let now = Instant::now();
 
         for idx in lines.clone() {
-            let entry = match inner.lines.pop(&idx) {
-                Some(LineEntry::Line(line)) => {
-                    result.push(line.clone());
-                    if line.changed_since(inner.seqno) {
-                        to_fetch.add(idx);
-                        LineEntry::Stale(line)
-                    } else {
-                        LineEntry::Line(line)
-                    }
-                }
-                Some(LineEntry::LineAndFetching(line, then)) => {
-                    result.push(line.clone());
-                    LineEntry::LineAndFetching(line, then)
-                }
-                Some(LineEntry::Fetching(then)) => {
-                    result.push(Line::with_width(inner.dimensions.cols, SEQ_ZERO));
-                    LineEntry::Fetching(then)
-                }
-                Some(LineEntry::Stale(line)) => {
-                    result.push(line.clone());
-                    to_fetch.add(idx);
-                    LineEntry::LineAndFetching(line, now)
-                }
-                None => {
-                    result.push(Line::with_width(inner.dimensions.cols, SEQ_ZERO));
-                    to_fetch.add(idx);
-                    LineEntry::Fetching(now)
-                }
-            };
+            // LBTerm: what reading the row does to its entry is read_row's, which a frame lent
+            // its rows uses too (lbterm_lent.rs); a line newer than the pane is marked as fetching,
+            // where upstream marked it stale and threw the line it fetched away
+            let (entry, fetch) = lbterm_lent::read_row(inner.lines.pop(&idx), inner.seqno, now);
+            if fetch {
+                to_fetch.add(idx);
+            }
+            result.push(match &entry {
+                LineEntry::Line(line)
+                | LineEntry::LineAndFetching(line, _)
+                | LineEntry::Stale(line) => line.clone(),
+                LineEntry::Fetching(_) => Line::with_width(inner.dimensions.cols, SEQ_ZERO),
+            });
 
             if inner.client.overlay_lag_indicator && idx == inner.dimensions.physical_top {
                 if inner.is_tardy() {
@@ -858,3 +1190,16 @@ impl RenderableState {
         self.inner.borrow().dimensions
     }
 }
+
+// LBTerm: the lines held, looked at without a fetch, and a pane's prompt rows asked of the server
+// (the scroll strip's marks)
+#[path = "lbterm_held.rs"]
+mod lbterm_held;
+
+// LBTerm: a frame's rows lent where they're held, not copied (wezterm-gui's render/pane_lines.rs)
+#[path = "lbterm_lent.rs"]
+mod lbterm_lent;
+
+// LBTerm: the links found in a pane's lines, kept by text, so a line that moved isn't matched again
+#[path = "lbterm_links.rs"]
+mod lbterm_links;

@@ -1,0 +1,695 @@
+{
+  "version": 1,
+  "about": "LBTerm's performance budgets (lbterm/PERF.md, 'The budget runner'). lbterm.ps1 budgets sets each scenario up in a test window (perf/budgets.ps1), measures it -Runs times and holds each metric's median to its max. At rest the defaults are what rest should cost, not what a build measured: nothing paints, and the terminal's processes spend next to nothing. A scenario that repaints at rest on purpose (a blinking cursor) has its own, from what the build measured with headroom. Never raise one to pass a scenario: a failure at rest is a bug to fix (its bug says which).",
+  "pc": {
+    "why": "When a span or a run counts as measured on a busy PC, and is taken again (PERF.md, 'The PC while it measured'). A test window runs at below-normal priority on its warden job's CPUs, so whatever else wants them comes first: with others on half of their time, all four are taken at once about one moment in sixteen, and a wake waits. Lachlan's PC runs 8 or more Claude sessions beside the tests, which took 14 to 40% of every CPU on 2026-11-03, so the rules are where the measuring starts to suffer, not where the PC is quiet. A scenario judged on too few calm ones that's over budget is busy, not a failure.",
+    "others_max": 0.5,
+    "pc_max": 0.75,
+    "retakes": 3
+  },
+  "rest": {
+    "seconds": 5,
+    "runs": 3,
+    "settle_ms": 2000,
+    "budgets": {
+      "frames": { "max": 0.2, "why": "at rest nothing paints: one stray frame in a 5 s span at most" },
+      "requests": { "max": 1, "why": "nothing asks for a frame at rest" },
+      "timers": { "max": 0.5, "why": "Lachlan's update-status tick (every 20 s) and little else" },
+      "tasks": { "max": 2, "why": "the update-status tick's few Lua runs, and the cli listener answering a connection now and then (PERF.md, finding 9)" },
+      "task_ms": { "max": 1, "why": "what those few tasks take" },
+      "gui_thread_ms": { "max": 2, "why": "the GUI thread asleep: 0.2% of a core" },
+      "cpu_ms": { "max": 5, "why": "the GUI process asleep, its other threads included: 0.5% of a core" },
+      "server_cpu_ms": { "max": 3, "why": "the mux server asleep" },
+      "conpty_cpu_ms": { "max": 2, "why": "the conpty hosts asleep, with nothing printed" }
+    }
+  },
+  "busy": {
+    "about": "A busy scenario paints on purpose: its open tab rewrites a line every 50 ms, as a working Claude Code session's spinner turns, so the window paints a frame for each (20 a second measured) and whatever is open over the panes is drawn again with it. What's held is what a frame costs with it open (frame_ms, against busy-one-tab's and busy-tabs' with nothing open) and that nothing is laid out again while what it shows stays the same (words); these are the budgets every busy scenario has, over the rest's, from the seven scenarios' two rounds on 2026-10-31 (06:09 to 06:18, interleaved with the build before; PERF.md, \"What the cards cost\"), and each scenario holds its own frame_ms and pass_ms",
+    "budgets": {
+      "frames": { "max": 30, "why": "the ticker's frames: a line every 50 ms, 19.9 to 20.5 a second measured" },
+      "requests": { "max": 30, "why": "a request a frame, the ticker's output asking for it: 19.8 to 20.2 a second measured" },
+      "timers": { "max": 2, "why": "nothing the ticker does arms a timer: 0 to 0.4 a second measured, as at rest" },
+      "tasks": { "max": 180, "why": "six task runs a frame (the mux client's poll of the pane and its replies, the frame's own): 119 to 123 a second measured" },
+      "task_ms": { "max": 15, "why": "what those take, 2.9 to 4.9 ms a second measured (a paint isn't a task's)" },
+      "gui_thread_ms": { "max": 150, "why": "1.5 times the busiest scenario's slowest round, 96.1 ms (busy-inbox-list); each scenario's frame_ms holds it closer" },
+      "cpu_ms": { "max": 165, "why": "1.5 times the slowest round's, 109.1 ms (busy-inbox-list)" },
+      "server_cpu_ms": { "max": 110, "why": "the mux server reading the ticker's output and handing the GUI each frame's changes: 1.5 times the slowest round's, 72.1 ms" },
+      "conpty_cpu_ms": { "max": 3, "why": "the ticker's conpty host, 1.1 to 1.3 ms a second measured" },
+      "words": { "max": 1, "why": "nothing the cards, lists or the rail show changes while the ticker turns: no word laid out again (lbterm_extras::kept), an age moving on now and then at most" }
+    }
+  },
+  "actions": {
+    "runs": 15,
+    "warmup": 1,
+    "budgets": {
+      "missed": { "max": 0, "why": "every refresh of the window's screen while its motion plays gets a frame: DWM plays it, whatever the GUI thread does (lbterm/COMPOSITOR.md), so one missed is DWM or the GPU falling behind. Judged only where the window could be seen (PERF.md, \"What's hard to time\")" }
+    }
+  },
+  "scenarios": [
+    { "name": "one-tab", "domain": "mux", "what": "One tab at a pwsh prompt, the window with the keyboard (a posted WM_SETFOCUS), as Lachlan's sits between his keys" },
+    { "name": "one-tab-local", "domain": "local", "what": "The same, its tab the GUI's own, with no mux server" },
+    { "name": "twelve-tabs", "domain": "mux", "what": "Twelve tabs, eleven of them Claude stand-ins (motion/demo-tab.ps1: working, waiting and idle, their states five minutes old, labels in the summaries folder), the rail with twelve pads" },
+    { "name": "cursor-blink", "domain": "mux", "what": "One tab with a blinking cursor (BlinkingBlock, cursor_blink_rate 800), the window with the keyboard: upstream's own frames, on purpose",
+      "budgets": {
+        "frames": { "max": 2, "why": "its blink, on purpose: a frame a turn on or off, 1.25 a second at cursor_blink_rate 800 (measured 1.3), with headroom" },
+        "requests": { "max": 2, "why": "a request a blink" },
+        "timers": { "max": 2, "why": "the blink's own timer, 1.25 a second" },
+        "tasks": { "max": 4, "why": "the blink's timer and its frame, a few runs each" },
+        "task_ms": { "max": 2, "why": "what those take" },
+        "gui_thread_ms": { "max": 5, "why": "a cursor's cell changing: no more than about 4 ms of the GUI thread a blink" },
+        "cpu_ms": { "max": 8, "why": "the same with the process's other threads" }
+      },
+      "bug": "each blink paints a whole frame, about 5.4 ms of the GUI thread and four or five task runs a blink since main's fixes (13 to 18 ms and eight runs before them: perf/conductor-inbox draws only the visuals that changed, perf/frame-loop no longer moves the IME's window every frame or arms an async timer for the next), over the 4 ms a blink a cursor's cell changing should cost (PERF.md, findings 8 and 14). The server's 2 to 3.5 ms a blink went with main's fix of the process walks (finding 13)" },
+    { "name": "rail-open", "domain": "mux", "what": "The pointer resting on the rail under its pads: the panel open" },
+    { "name": "rail-pad", "domain": "mux", "what": "The pointer resting on the first tab's pad: the panel open, that row lit" },
+    { "name": "rail-hidden", "domain": "mux", "what": "twelve-tabs with the Conductor's pad, its stand-in button.json listing the first two tabs' sessions as hidden from it (lbterm/NEW-TAB.md, section 8): their eye-off marks on the closed rail, the open tab's among them, on a build with Hide from Conductor; a build without reads the same file and draws neither" },
+    { "name": "rail-hidden-open", "domain": "mux", "what": "rail-hidden with the pointer resting on the first tab's pad: the panel open, that row lit, the two hidden rows' Hidden chips and marks" },
+    { "name": "rail-parked", "domain": "mux", "what": "twelve-tabs with the Conductor's pad accepting all from a stand-in button.json and no hub acting, and the second tab parked (lbterm/NEW-TAB.md, \"Landing 4\"): on a build with Lachlan's 7a, 8a and 12a the pad a still red hairline, the parked row dimmed and only the idle timer's lit bars over the pads; a build without turns the pad's spectrum, parks nothing and draws every bar",
+      "budgets": {
+        "loops": { "max": 0, "why": "the Conductor's pad at rest in Accept all is a still hairline, its spectrum only while the Conductor acts (Lachlan's 7a), and nothing else on the closed rail plays: a loop would keep DWM composing every refresh for nothing (lbterm/COMPOSITOR.md, \"Loops\")" }
+      } },
+    { "name": "rail-parked-open", "domain": "mux", "what": "rail-parked with the pointer resting on the first tab's pad: the panel open, that row lit, the parked row's Parked chip, the labels under the pads covered by the open words (12a)",
+      "budgets": {
+        "loops": { "max": 0, "why": "as rail-parked's: the open panel adds no loop, and the pad at rest in Accept all plays none (Lachlan's 7a)" }
+      } },
+    { "name": "objectives", "domain": "mux", "what": "The objectives strip with three stand-in sessions' marks (open, drifted, done) and a plain tab's none" },
+    { "name": "scroll-strip", "domain": "mux", "what": "perf/fake-claude.ps1 in the tab, its transcript's twelve prompts and answers as marks on the scroll strip" },
+    { "name": "conductor-pad", "domain": "mux", "what": "The Conductor's pad on, accepting most, against a hub played here thinking about one session's tab and acting on another's: the hues and the light DWM turns" },
+    { "name": "conductor-pad-minimized", "domain": "mux", "what": "The same with the first tab's program waiting on a task of its own (its pad's arc), the window then minimized without anything activated: the arc, the hues and the light held still while it can't be seen",
+      "budgets": {
+        "loops": { "max": 0, "why": "a loop DWM plays keeps it composing every refresh of the fastest screen, minimized or not: none plays while the window can't be seen (lbterm/COMPOSITOR.md, \"Loops\")" }
+      } },
+    { "name": "conductor-view", "domain": "mux", "what": "The Conductor's view open over the tab, against a seat played here sending its view every 250 ms as the real one does while the hub's guesses move (one session's time left counting down, which the view shows as ~4 min): the conversation, an ask, two questions, sessions, events, a suggestion and a note", "bug": "with the view open LBTerm used about 80% of a core (2026-10-29). Main's fix of the view (it lays out only when what it's made from changes, and the panes under it don't repaint) took a frame from 18 to 20 ms of the GUI thread to 7 to 10, but every update the seat sends still bumps its generation and repaints every window (seat_client.rs, changed), and the view lays itself out again for it, though nothing it shows changes: 4 frames a second, 27 to 40 ms a second of the GUI thread, 6 tasks a second since perf/frame-loop where it was 19 to 26 (PERF.md, finding 12)" },
+    { "name": "conductor-view-quiet", "domain": "mux", "what": "The same view, the seat sending nothing after it opened: what the view itself costs at rest" },
+    { "name": "inbox-list", "domain": "mux", "what": "The InMail button's list open from a click on it, one message waiting in a folder of the test's own" },
+    { "name": "projects-card", "domain": "mux", "what": "The projects card open, the pointer resting on its pad: two projects of the test's own, one with mail, a stand-in session in each" },
+    { "name": "tasks-card", "domain": "mux", "what": "The card of what a tab is running open beside its row: a subagent with its transcript, a command and a Monitor, all minutes old, the pointer resting on the row", "bug": "the card repaints every second to read its subagent's transcript again, changed or not (render/tasks_card.rs: its next look is a frame), though every age on it moves by the minute: each frame about 5 ms of the GUI thread and five task runs since main's fixes (17 to 20 ms and eight runs before them) (PERF.md, finding 15)" },
+    { "name": "thumbnail", "domain": "mux", "what": "A thumbnail of a linked picture in view (lbterm://image links), its program holding the mouse as Claude Code does" },
+    { "name": "strip-card", "domain": "mux", "what": "The strip's detail card pinned open by expanded.flag (Alt+S's), a stand-in session's summary on the strip" },
+    { "name": "link-hover", "domain": "mux", "what": "The pointer resting on a link a pane printed (OSC 8)" },
+    { "name": "search", "domain": "mux", "what": "Search open over the pane (Search with the selection or nothing)" },
+    { "name": "copy-mode", "domain": "mux", "what": "Copy mode on the pane (ActivateCopyMode)" },
+    { "name": "palette", "domain": "mux", "what": "The command palette open (ActivateCommandPalette)" },
+    { "name": "zoomed", "domain": "mux", "what": "A tab split in two, one pane zoomed (TogglePaneZoomState)" },
+    { "name": "unfocused", "domain": "mux", "what": "One tab, the keyboard given and taken away again (posted WM_SETFOCUS, then WM_KILLFOCUS)" },
+    { "name": "minimized", "domain": "mux", "what": "One tab, the window minimized without anything activated (SW_SHOWMINNOACTIVE)" },
+    { "name": "four-windows", "domain": "mux", "what": "Four windows of one GUI, a tab each, the first with the keyboard" },
+    { "name": "busy-one-tab", "domain": "mux", "busy": true, "what": "One tab rewriting a line every 50 ms (busy), nothing open: what a frame costs the GUI thread with nothing over the panes",
+      "budgets": {
+        "frame_ms": { "max": 2.5, "why": "1.25 times the slowest round's median, 1.97 ms (perf/paint's 2 rounds on 2026-11-01: 1.92, 1.97: the templates kept in their layers, a layer's buffer written only where it changed, the bind groups kept, a pass a visual, the curves read once); main's build then 3.92 and 4.04, and 3.76 and 3.72 when perf/lbterm-layers set it; the build before that, 5.00 and 5.19 ms: the rail's ring, glow, lit gradient and running light made again every frame" },
+        "pass_ms": { "max": 0.7, "why": "1.25 times the slowest round's median, 0.54 ms (perf/paint's 2 rounds: 0.54, 0.54); main's build then 1.28 and 1.35" }
+      } },
+    { "name": "busy-tabs", "domain": "mux", "busy": true, "what": "The ticker in the open tab beside fourteen Claude stand-ins (working, waiting, idle, each in one of 47 projects), 70 messages waiting in 38 projects' InMail, the rail closed and nothing open: what a frame costs with a window like Lachlan's",
+      "budgets": {
+        "frame_ms": { "max": 3.1, "why": "1.25 times the slowest round's median, 2.44 ms (perf/paint's 2 rounds on 2026-11-01: 2.41, 2.44); main's build then 4.64 and 4.87, and 4.26 and 4.36 when perf/lbterm-layers set it; the build before that, 5.52 and 5.51 ms: the panel's chrome, rows and words made again every frame" },
+        "pass_ms": { "max": 1.1, "why": "1.25 times the slowest round's median, 0.87 ms (perf/paint's 2 rounds: 0.86, 0.87); main's build then 1.73 and 1.84" }
+      } },
+    { "name": "busy-projects-card", "domain": "mux", "busy": true, "what": "busy-tabs with the projects card open, the pointer resting on its pad: 47 projects, their sessions and mail",
+      "budgets": {
+        "frame_ms": { "max": 5.9, "why": "1.25 times the slowest round's median, 4.73 ms (this build's 2 rounds: 4.50, 4.73); the build before, 17.91 and 17.91 ms: the card counting every project's mail and tabs by making every folder key again, built twice a frame and its words shaped again" },
+        "pass_ms": { "max": 2.4, "why": "1.25 times the slowest round's median, 1.90 ms (this build's 2 rounds: 1.78, 1.90)" }
+      } },
+    { "name": "busy-inbox-list", "domain": "mux", "busy": true, "what": "busy-tabs with the InMail button's list of 70 open from a click on it",
+      "budgets": {
+        "frame_ms": { "max": 6.0, "why": "1.25 times the slowest round's median, 4.76 ms (this build's 2 rounds: 4.43, 4.76); the build before, 47.01 and 47.41 ms: the list laid out twice a frame, each time asking which project every message's folder is in by making every project's folder key again, and its words shaped again" },
+        "pass_ms": { "max": 2.3, "why": "1.25 times the slowest round's median, 1.79 ms (this build's 2 rounds: 1.64, 1.79)" }
+      } },
+    { "name": "busy-rail-open", "domain": "mux", "busy": true, "what": "busy-tabs with the panel open, the pointer resting on the second row's pad",
+      "budgets": {
+        "frame_ms": { "max": 3.1, "why": "1.25 times the slowest round's median, 2.47 ms (perf/paint's 2 rounds on 2026-11-01: 2.47, 2.34); main's build then 4.30 and 4.38, and 4.18 and 4.41 when perf/lbterm-layers set it; the build before that, 5.47 and 5.78 ms: the open panel's rows, chips, bars and words made again every frame" },
+        "pass_ms": { "max": 1.2, "why": "1.25 times the slowest round's median, 0.89 ms (perf/paint's 2 rounds: 0.89, 0.83); main's build then 1.62 and 1.60" }
+      } },
+    { "name": "busy-strip-card", "domain": "mux", "busy": true, "what": "The ticker's tab holding a stand-in session, its summary on the strip and the detail card pinned open by expanded.flag (Alt+S's)",
+      "budgets": {
+        "frame_ms": { "max": 5.0, "why": "1.25 times the slowest round's median, 4.00 ms (this build's 2 rounds: 3.98, 4.00); the build before, 5.36 and 5.67 ms: the card's words shaped again every frame, and the rail's chrome" },
+        "pass_ms": { "max": 1.7, "why": "1.25 times the slowest round's median, 1.36 ms (this build's 2 rounds: 1.34, 1.36)" }
+      } },
+    { "name": "busy-objectives", "domain": "mux", "busy": true, "what": "The ticker's tab and two more, three sessions with objectives, the objectives list open with the second row's detail beside it, the pointer resting on the strip",
+      "budgets": {
+        "frame_ms": { "max": 5.1, "why": "1.25 times the slowest round's median, 4.03 ms (this build's 2 rounds: 4.03, 3.98); the build before, 6.11 and 6.02 ms: the list's and the detail card's words shaped again every frame, and the rail's chrome" },
+        "pass_ms": { "max": 1.8, "why": "1.25 times the slowest round's median, 1.42 ms (this build's 2 rounds: 1.40, 1.42)" }
+      } },
+
+    { "name": "busy-lines", "domain": "mux", "busy": true, "what": "The ticker under 26 lines of text as long as busy-links' and busy-triggers', with no link and nothing a trigger matches: what a screen of text costs a frame, for them to be held against",
+      "budgets": {
+        "frame_ms": { "max": 5.9, "why": "1.25 times the slowest round's median, 4.71 ms (this build's 2 rounds: 4.71, 4.61); stage 1's build, 4.64 and 4.73 ms: the reference, plain text costing the same on both" },
+        "pass_ms": { "max": 2.8, "why": "1.25 times the slowest round's median, 2.21 ms (this build's 2 rounds: 2.21, 2.21); stage 1's build, 2.19 and 2.24 ms" },
+        "lines": { "max": 30, "why": "the line the ticker changes, one a frame: 19.9 to 20.3 a second measured" }
+      } },
+    { "name": "busy-links", "domain": "mux", "busy": true, "what": "The ticker under 26 lines each holding a link printed as OSC 8 (a file, as Claude Code links every path it names with FORCE_HYPERLINK=1) and a URL Lachlan's hyperlink_rules make a link of, the pointer on none of them: what a frame costs with links on the screen",
+      "budgets": {
+        "frame_ms": { "max": 7.0, "why": "1.25 times the slowest round's median, 5.59 ms (this build's 2 rounds: 5.57, 5.59); stage 1's build, 6.89 and 7.70 ms: every linked line laid out again on every frame with the pointer on no link, 542 lines a second" },
+        "pass_ms": { "max": 3.9, "why": "1.25 times the slowest round's median, 3.12 ms (this build's 2 rounds: 3.08, 3.12); stage 1's build, 4.53 and 5.13 ms" },
+        "lines": { "max": 30, "why": "the line the ticker changes, one a frame: 19.9 to 20.3 a second measured" }
+      } },
+    { "name": "busy-triggers", "domain": "mux", "busy": true, "what": "The ticker under 26 lines each holding four of the easter eggs' rainbow matches (LBTerm, its folder's path, LBTERM_TRY), as a Claude session about LBTerm shows: what a frame costs with a trigger's matches on the screen",
+      "budgets": {
+        "frame_ms": { "max": 5.7, "why": "1.25 times the slowest round's median, 4.56 ms (this build's 2 rounds: 4.56, 4.54); stage 1's build, 4.87 and 5.00 ms: every matched line copied, recoloured and hashed again on every frame, and its matches told to what's new" },
+        "pass_ms": { "max": 2.7, "why": "1.25 times the slowest round's median, 2.10 ms (this build's 2 rounds: 2.10, 2.09); stage 1's build, 2.39 and 2.46 ms" },
+        "lines": { "max": 30, "why": "the line the ticker changes, one a frame: 19.9 to 20.3 a second measured" }
+      } },
+    { "name": "busy-scroll", "domain": "mux", "busy": true, "what": "Claude Code's fullscreen view scrolling, its every row drawn again a line on every 50 ms, no trigger's match among them: what a frame of every line changing costs, for busy-triggers-scroll to be held against",
+      "budgets": {
+        "frame_ms": { "max": 10.1, "why": "1.25 times the slowest round's median, 8.05 ms (this build's 2 rounds: 8.05, 7.59); stage 1's build, 8.61 and 8.02 ms: the reference for busy-triggers-scroll" },
+        "pass_ms": { "max": 5.0, "why": "1.25 times the slowest round's median, 3.98 ms (this build's 2 rounds: 3.98, 3.67); stage 1's build, 4.05 and 4.02 ms" },
+        "lines": { "max": 700, "why": "every row each frame, the whole view scrolling: 583 to 604 a second measured when it was set; since the line quad cache keyed by what a row shows (PERF.md finding 97) a row the scroll brings again is found there, and its rows repeat, so 5 to 6 a second (its spans 44 to 45, 5 to 6 and 0 a second, 2026-11-09)" },
+        "task_ms": { "max": 46, "why": "the mux client taking each frame's 29 changed lines: 1.25 times the slowest round's median, 36.1 ms a second" },
+        "gui_thread_ms": { "max": 205, "why": "1.25 times the slowest round's median, 161.9 ms a second" },
+        "cpu_ms": { "max": 260, "why": "1.25 times the slowest round's median, 205.8 ms a second" },
+        "server_cpu_ms": { "max": 145, "why": "the server reading the view and sending every line each frame: 1.25 times the slowest round's median, 114.8 ms a second" },
+        "conpty_cpu_ms": { "max": 10, "why": "the conpty host drawing the whole view every 50 ms: 1.25 times the slowest round's median, 7.5 ms a second" }
+      } },
+    { "name": "busy-triggers-scroll", "domain": "mux", "busy": true, "what": "The same scrolling, each line holding four of the easter eggs' rainbow matches: every line a trigger looks at again on every frame, each match on a new row",
+      "budgets": {
+        "frame_ms": { "max": 10.7, "why": "1.25 times the slowest round's median, 8.52 ms (this build's 2 rounds: 8.52, 8.00); stage 1's build, 8.24 and 12.30 ms (the second round with other sessions' builds beside it): each changed line matched, recoloured and hashed as here, and its matches taken for new at each row they moved to, a Lua event's task each with no handler" },
+        "pass_ms": { "max": 5.4, "why": "1.25 times the slowest round's median, 4.26 ms (this build's 2 rounds: 4.26, 4.15); stage 1's build, 4.26 and 5.99 ms" },
+        "lines": { "max": 700, "why": "every row each frame, the whole view scrolling: 583 to 604 a second measured when it was set (597 to 608 to 2026-11-03); since the line quad cache keyed by what a row shows (PERF.md finding 97) a row the scroll brings again is found there, and its rows repeat, so 4 to 5 a second (target/budgets/history.jsonl: 5.08 and 4.87 on 2026-11-05, 4.58 and 4.38 on 2026-11-08), as busy-scroll's" },
+        "task_ms": { "max": 48, "why": "the mux client taking each frame's 29 changed lines: 1.25 times the slowest round's median, 38.3 ms a second" },
+        "gui_thread_ms": { "max": 215, "why": "1.25 times the slowest round's median, 171.2 ms a second" },
+        "cpu_ms": { "max": 265, "why": "1.25 times the slowest round's median, 212.1 ms a second" },
+        "server_cpu_ms": { "max": 145, "why": "the server reading the view and sending every line each frame: 1.25 times the slowest round's median, 114.6 ms a second" },
+        "conpty_cpu_ms": { "max": 10, "why": "the conpty host drawing the whole view every 50 ms: 1.25 times the slowest round's median, 7.6 ms a second" }
+      } },
+    { "name": "busy-split", "domain": "mux", "busy": true, "what": "The Claude stand-in of busy-draft and the ticker in a pane split beside it, with no draft: busy-draft's panes, for it to be held against",
+      "budgets": {
+        "frame_ms": { "max": 5.3, "why": "1.25 times the slowest round's median, 4.20 ms (this build's 2 rounds: 4.06, 4.20); stage 1's build, 4.29 and 5.37 ms: the reference for busy-draft" },
+        "pass_ms": { "max": 2.0, "why": "1.25 times the slowest round's median, 1.58 ms (this build's 2 rounds: 1.56, 1.58); stage 1's build, 1.67 and 2.03 ms" },
+        "lines": { "max": 30, "why": "the line the ticker changes, one a frame: 19.9 to 20.3 a second measured" }
+      } },
+    { "name": "busy-draft", "domain": "mux", "busy": true, "what": "A voice draft answering Q1 over a Claude stand-in (perf/fake-prompt.ps1), its card and the question colours showing with Q1 ticked and Q2 ringed, the ticker in a pane split beside it: what the draft costs a frame its pane didn't change",
+      "budgets": {
+        "frame_ms": { "max": 5.6, "why": "1.25 times the slowest round's median, 4.46 ms (this build's 2 rounds: 4.16, 4.46); stage 1's build, 4.51 and 4.56 ms: the pane's screen read again, the questions' colours looked up and the card's words shaped on every frame" },
+        "pass_ms": { "max": 2.2, "why": "1.25 times the slowest round's median, 1.69 ms (this build's 2 rounds: 1.54, 1.69); stage 1's build, 1.89 and 1.92 ms" },
+        "lines": { "max": 30, "why": "the line the ticker changes, one a frame: 19.9 to 20.3 a second measured" }
+      } },
+    { "name": "busy-draft-own", "domain": "mux", "busy": true, "what": "The same draft, the stand-in's own status line turning every 50 ms as Claude Code's does while it works, under the prompt and outside the conversation the questions are found in",
+      "budgets": {
+        "frame_ms": { "max": 5.6, "why": "1.25 times the slowest round's median, 4.47 ms (this build's 2 rounds: 4.34, 4.47); stage 1's build, 4.51 and 6.55 ms: the question colours laid out again for every turn of the status line" },
+        "pass_ms": { "max": 2.1, "why": "1.25 times the slowest round's median, 1.66 ms (this build's 2 rounds: 1.59, 1.66); stage 1's build, 1.85 and 2.70 ms" },
+        "lines": { "max": 30, "why": "the line the ticker changes, one a frame: 19.9 to 20.3 a second measured" }
+      } },
+    { "name": "busy-shell", "domain": "mux", "busy": true, "what": "A shell's tab printing a build's log, a line every 50 ms and a shell's prompt (OSC 133) every 40th, over 100 lines of it, the scroll strip marking its prompts: what a frame costs at a shell, for busy-scrollback to be held against",
+      "budgets": {
+        "frame_ms": { "max": 7.1, "why": "1.25 times the slowest round's median, 5.71 ms (this build's 3 rounds: 4.68, 5.71, 5.37); the build before, 4.75 and 5.66 ms" },
+        "pass_ms": { "max": 2.4, "why": "1.25 times the slowest round's median, 1.91 ms (this build's 3 rounds: 1.59, 1.91, 1.85)" }
+      } },
+    { "name": "busy-shell-local", "domain": "local", "busy": true, "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "frame_ms": { "max": 8.0, "why": "1.25 times the slowest round's median, 6.42 ms (this build's 3 rounds: 4.72, 5.06, 6.42, the last with 14 other sessions' test windows open); the build before, 4.60 and 5.51 ms" },
+        "pass_ms": { "max": 2.8, "why": "1.25 times the slowest round's median, 2.21 ms (this build's 3 rounds: 1.60, 1.74, 2.21)" },
+        "cpu_ms": { "max": 250, "why": "the GUI process reads the pane's output itself here, the lines scrolling every 50 ms: 1.25 times the slowest round's median, 199 ms a second (this build's 3 rounds: 151, 161, 199)" }
+      } },
+    { "name": "busy-scrollback", "domain": "mux", "busy": true, "what": "The same over 50,000 lines of the log (Lachlan's scrollback_lines), a prompt every 500, so the scrollback is full and its first rows go as lines come: what a frame costs with them behind it",
+      "budgets": {
+        "frame_ms": { "max": 7.1, "why": "1.25 times the slowest round's median, 5.69 ms (this build's 3 rounds: 5.11, 4.53, 5.69), busy-shell's with 100 rows behind it; the build before, 6.86 and 6.54 ms, and 40 frames a second where 20 changed: each frame went through every row for the strip's prompt marks, and asked the server again for the rows it no longer held, each answer a frame (PERF.md, finding 65)" },
+        "pass_ms": { "max": 2.5, "why": "1.25 times the slowest round's median, 1.96 ms (this build's 3 rounds: 1.71, 1.54, 1.96); the build before, 3.91 and 3.66 ms" }
+      } },
+    { "name": "busy-scrollback-local", "domain": "local", "busy": true, "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "frame_ms": { "max": 6.8, "why": "1.25 times the slowest round's median, 5.47 ms (this build's 3 rounds: 4.74, 5.30, 5.47), busy-shell-local's with 100 rows behind it; the build before, 5.18 and 6.29 ms: every row looked at for each frame" },
+        "pass_ms": { "max": 2.5, "why": "1.25 times the slowest round's median, 1.98 ms (this build's 3 rounds: 1.69, 1.92, 1.98); the build before, 2.26 and 2.72 ms" },
+        "cpu_ms": { "max": 215, "why": "the GUI process reads the pane's output itself here: 1.25 times the slowest round's median, 171 ms a second (this build's 3 rounds: 153, 169, 171)" }
+      } },
+
+    { "name": "key-echo", "kind": "action", "gui": "key", "what": "A character typed at pwsh's prompt (a posted WM_KEYDOWN and WM_KEYUP), to the frame with the cursor one on",
+      "budgets": {
+        "ms": { "max": 16, "why": "1.5 times the slowest round's median, 10.4 ms (this build's 2 rounds: 10.4, 9.8): the echo's own frame, the first after the key, since the key's frame and the server's answer to it no longer hold it a pacing period behind one that drew nothing and the parser's wait ends when it's due (PERF.md, findings 35, 67 and 68; 22.1 to 22.3 before)" },
+        "p95_ms": { "max": 26, "why": "1.5 times the slowest round's p95, 17.3 ms (this build's 2 rounds: 12.4, 17.3)" },
+        "gui_ms": { "max": 16, "why": "1.5 times the slowest round's median, 10.3 ms (this build's 2 rounds: 10.3, 10)" },
+        "gui_p95_ms": { "max": 26, "why": "1.5 times the slowest round's p95, 17.3 ms (this build's 2 rounds: 12.4, 17.3)" },
+        "gui_thread_ms": { "max": 10, "why": "1.5 times the slowest round's median, 6.4 ms (this build's 2 rounds: 5.6, 6.4): one frame of one line changing, where the key's own frame and the server's answer to it painted one more each (findings 35 and 68)" },
+        "cpu_ms": { "max": 13, "why": "1.5 times the slowest round's median, 8.3 ms (this build's 2 rounds: 7.1, 8.3)" },
+        "server_cpu_ms": { "max": 2, "why": "what an echo should cost the server: its pane's one changed line read and pushed, and the key's answer, about 1 to 2 ms on its main thread (17 to 25 ms measured while each key walked every process on the PC, finding 49; 1.65 to 1.74 since perf/key-latency, the walk gone)" },
+        "frames": { "max": 2, "why": "the floor of 2: one a key, the echo's (this build's 2 rounds: 1, 1; 2 before, the key's own and the echo's, finding 35)" },
+        "messages": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3): the key's two and the echo frame's WM_PAINT" }
+      } },
+    { "name": "key-echo-local", "kind": "action", "domain": "local", "gui": "key", "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "ms": { "max": 15, "why": "1.5 times the slowest round's median, 9.4 ms (this build's 2 rounds: 8.9, 9.4): the echo's own frame, the first after the key, since the key's frame no longer holds it a pacing period behind one that drew nothing and the parser's wait ends when it's due (PERF.md, findings 35 and 67; 22.3 to 22.7 before)" },
+        "p95_ms": { "max": 23, "why": "1.5 times the slowest round's p95, 15 ms (this build's 2 rounds: 11.4, 15)" },
+        "gui_ms": { "max": 14, "why": "1.5 times the slowest round's median, 9.2 ms (this build's 2 rounds: 9.1, 9.2)" },
+        "gui_p95_ms": { "max": 22, "why": "1.5 times the slowest round's p95, 14.6 ms (this build's 2 rounds: 11.2, 14.6)" },
+        "gui_thread_ms": { "max": 10, "why": "1.5 times the slowest round's median, 6.3 ms (this build's 2 rounds: 5.1, 6.3): one frame of one line changing, where the key's own frame painted one more (finding 35)" },
+        "cpu_ms": { "max": 12, "why": "1.5 times the slowest round's median, 7.8 ms (this build's 2 rounds: 6, 7.8)" },
+        "frames": { "max": 2, "why": "the floor of 2: one a key, the echo's (this build's 2 rounds: 1, 1; 2 before, the key's own and the echo's, finding 35)" },
+        "messages": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3): the key's two and the echo frame's WM_PAINT" }
+      } },
+    { "name": "key-echo-load", "kind": "action", "gui": "key", "what": "A character typed at pwsh's prompt with a writer at full speed in a pane beside it (lines of 104 bytes, 64 KB a write, no pause), to the frame with the cursor one on: latency under load",
+      "budgets": {
+        "ms": { "max": 55, "why": "1.5 times the slowest round's median, 35.4 ms (this build's 2 rounds: 33.2, 35.4): with frames coming every refresh for the writer, an echo waits at most a refresh more than alone" },
+        "p95_ms": { "max": 90, "why": "1.5 times the slowest round's p95, 59.3 ms (this build's 2 rounds: 59.3, 51.1)" },
+        "gui_ms": { "max": 55, "why": "1.5 times the slowest round's median, 33.7 ms (this build's 2 rounds: 33.6, 33.7)" },
+        "gui_p95_ms": { "max": 90, "why": "the same as the time to the frame's" },
+        "gui_thread_ms": { "max": 390, "why": "1.5 times the slowest round's median, 259 ms (this build's 2 rounds: 259, 176): the writer's frames in the 300 ms either side of the key are in it, so it says what a run under load costs, not a key" },
+        "frames": { "max": 35, "why": "1.5 times the slowest round's median, 22 (this build's 2 rounds: 22, 22): the writer's, a frame a refresh" }
+      } },
+    { "name": "key-echo-load-local", "kind": "action", "domain": "local", "gui": "key", "what": "The same, the tabs the GUI's own",
+      "budgets": {
+        "ms": { "max": 85, "why": "1.5 times the slowest round's median, 56.5 ms (this build's 2 rounds: 56.5, 51.7); its own GUI's time is 37 to 47, so the key waits 5 to 19 ms in the queue before the GUI takes it (PERF.md, finding 44)" },
+        "p95_ms": { "max": 205, "why": "1.5 times the slowest round's p95, 135 ms (this build's 2 rounds: 135, 66.2)" },
+        "gui_ms": { "max": 75, "why": "1.5 times the slowest round's median, 47.2 ms (this build's 2 rounds: 37.3, 47.2)" },
+        "gui_p95_ms": { "max": 205, "why": "the same as the time to the frame's" },
+        "gui_thread_ms": { "max": 225, "why": "1.5 times the slowest round's median, 149 ms (this build's 2 rounds: 149, 115): the writer's frames in the 300 ms either side of the key are in it" },
+        "frames": { "max": 25, "why": "1.5 times the slowest round's median, 16 (this build's 2 rounds: 12, 16)" }
+      } },
+    { "name": "key-burst", "kind": "action", "what": "Ten characters typed at pwsh's prompt 15 ms apart (67 a second, faster than a refresh of the test windows' 60 Hz screen), each from its own post to the first frame that drew its echo; ms is the last key's",
+      "budgets": {
+        "echo_ms": { "max": 20, "why": "what a key's echo should take, as key-echo's: its output's own frame, never held behind one that drew nothing (PERF.md, findings 35 and 68). Keys faster than a refresh share frames paced to it, each falling 1.7 ms further behind the last: 17.5 and 17.6 ms (this build's 2 rounds; 27.7 and 28.5 before)" },
+        "echo_max_ms": { "max": 35, "why": "two refreshes of the test windows' 60 Hz screen: keys faster than a refresh wait one refresh at most for their echo's frame, never two (this build's 2 rounds: 26.1, 26)" },
+        "ms": { "max": 35, "why": "the last key caught up with, as the slowest (this build's 2 rounds: 24.4, 24.5)" },
+        "p95_ms": { "max": 39, "why": "1.5 times the slowest round's p95, 26 ms (this build's 2 rounds: 25.8, 26)" },
+        "gui_thread_ms": { "max": 81, "why": "1.5 times the slowest round's median, 53.6 ms (this build's 2 rounds: 53.6, 52.3): a frame a key" },
+        "cpu_ms": { "max": 90, "why": "1.5 times the slowest round's median, 60 ms (this build's 2 rounds: 60, 59.6)" },
+        "server_cpu_ms": { "max": 24, "why": "1.5 times the slowest round's median, 15.5 ms (this build's 2 rounds: 15.5, 15.2): about 1.5 ms a key" },
+        "frames": { "max": 15, "why": "1.5 times the slowest round's median, 10 (this build's 2 rounds: 10, 10)" },
+        "messages": { "max": 59, "why": "1.5 times the slowest round's median, 39 (this build's 2 rounds: 39, 39)" }
+      } },
+    { "name": "key-burst-local", "kind": "action", "domain": "local", "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "echo_ms": { "max": 20, "why": "what a key's echo should take, as key-echo-local's: its output's own frame, never held behind one that drew nothing, its output not held for more on Windows' timer tick (PERF.md, findings 35 and 67): 16.3 and 16.6 ms (this build's 2 rounds; 23.8 and 27.4 before)" },
+        "echo_max_ms": { "max": 35, "why": "two refreshes of the test windows' 60 Hz screen: keys faster than a refresh wait one refresh at most for their echo's frame, never two (this build's 2 rounds: 25.7, 25)" },
+        "ms": { "max": 35, "why": "the last key caught up with, as the slowest (this build's 2 rounds: 23.9, 24.1)" },
+        "p95_ms": { "max": 39, "why": "1.5 times the slowest round's p95, 25.7 ms (this build's 2 rounds: 25.7, 25)" },
+        "gui_thread_ms": { "max": 82, "why": "1.5 times the slowest round's median, 54.4 ms (this build's 2 rounds: 51.7, 54.4): a frame a key" },
+        "cpu_ms": { "max": 88, "why": "1.5 times the slowest round's median, 58.6 ms (this build's 2 rounds: 56.8, 58.6)" },
+        "frames": { "max": 15, "why": "1.5 times the slowest round's median, 10 (this build's 2 rounds: 10, 10)" },
+        "messages": { "max": 59, "why": "1.5 times the slowest round's median, 39 (this build's 2 rounds: 39, 39)" }
+      } },
+    { "name": "key-held", "kind": "action", "what": "A character key held at pwsh's prompt at Lachlan's repeat rate (KeyboardDelay 1 and KeyboardSpeed 31: its press, 500 ms, then fifteen repeats 33.3 ms apart, posted as Windows posts them), each from its own post to the first frame that drew its echo; ms is the last repeat's",
+      "budgets": {
+        "echo_ms": { "max": 20, "why": "what a key's echo should take, as key-echo's: repeats 33.3 ms apart are two refreshes apart, so each echo has a frame of its own at once (PERF.md, findings 35 and 68): 9.4 and 9.4 ms (this build's 2 rounds; 22.3 and 22.4 before)" },
+        "echo_max_ms": { "max": 35, "why": "two refreshes of the test windows' 60 Hz screen, as key-echo's p95 was (this build's 2 rounds: 23.9, 21.2)" },
+        "ms": { "max": 20, "why": "the last repeat's echo, as any key's (this build's 2 rounds: 9.3, 9.7)" },
+        "p95_ms": { "max": 35, "why": "two refreshes of the test windows' 60 Hz screen (this build's 2 rounds: 22.1, 21.2)" },
+        "gui_thread_ms": { "max": 131, "why": "1.5 times the slowest round's median, 86.9 ms (this build's 2 rounds: 86.9, 82.1): a frame a key, 5.1 to 5.4 ms each" },
+        "cpu_ms": { "max": 152, "why": "1.5 times the slowest round's median, 101 ms (this build's 2 rounds: 101, 94)" },
+        "server_cpu_ms": { "max": 43, "why": "1.5 times the slowest round's median, 28.6 ms (this build's 2 rounds: 27.7, 28.6): about 1.8 ms a key, as key-echo's" },
+        "frames": { "max": 24, "why": "1.5 times the slowest round's median, 16 (this build's 2 rounds: 16, 16)" },
+        "messages": { "max": 50, "why": "1.5 times the slowest round's median, 33 (this build's 2 rounds: 33, 33)" }
+      } },
+    { "name": "key-held-local", "kind": "action", "domain": "local", "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "echo_ms": { "max": 20, "why": "what a key's echo should take, as key-echo-local's: its output's own frame, its output not held for more on Windows' timer tick (PERF.md, findings 35 and 67): 8.5 and 8.6 ms (this build's 2 rounds; 22.6 and 22.7 before)" },
+        "echo_max_ms": { "max": 35, "why": "two refreshes of the test windows' 60 Hz screen, as key-echo-local's p95 was (this build's 2 rounds: 21.3, 20)" },
+        "ms": { "max": 20, "why": "the last repeat's echo, as any key's (this build's 2 rounds: 8.5, 8.5)" },
+        "p95_ms": { "max": 35, "why": "two refreshes of the test windows' 60 Hz screen (this build's 2 rounds: 17.9, 9.3)" },
+        "gui_thread_ms": { "max": 119, "why": "1.5 times the slowest round's median, 79.2 ms (this build's 2 rounds: 78.8, 79.2): a frame a key, about 5 ms each" },
+        "cpu_ms": { "max": 132, "why": "1.5 times the slowest round's median, 87.5 ms (this build's 2 rounds: 86.1, 87.5)" },
+        "frames": { "max": 24, "why": "1.5 times the slowest round's median, 16 (this build's 2 rounds: 16, 16)" },
+        "messages": { "max": 50, "why": "1.5 times the slowest round's median, 33 (this build's 2 rounds: 33, 33)" }
+      } },
+    { "name": "tab-by-key", "kind": "action", "gui": "tab", "what": "A tab switch by a key (ActivateTabRelative), between two tabs, to the frame with the other open",
+      "budgets": {
+        "ms": { "max": 15, "why": "1.5 times the slowest round's median, 6.9 ms (this build's 2 rounds: 6.6, 6.9)" },
+        "p95_ms": { "max": 20, "why": "1.5 times the slowest round's p95, 8.6 ms (this build's 2 rounds: 8.6, 7.9)" },
+        "gui_ms": { "max": 15, "why": "1.5 times the slowest round's median, 7.1 ms (this build's 2 rounds: 6.9, 7.1)" },
+        "gui_p95_ms": { "max": 20, "why": "1.5 times the slowest round's p95, 8.8 ms (this build's 2 rounds: 8.8, 8.2)" },
+        "gui_thread_ms": { "max": 20, "why": "1.5 times the slowest round's median, 10.3 ms (this build's 2 rounds: 10.2, 10.3)" },
+        "cpu_ms": { "max": 20, "why": "1.5 times the slowest round's median, 12 ms (this build's 2 rounds: 11.9, 12)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0.5 ms (this build's 2 rounds: 0.4, 0.5)" },
+        "frames": { "max": 3, "why": "1.5 times the slowest round's median, 2 (this build's 2 rounds: 2, 2)" }
+      } },
+    { "name": "tab-by-click", "kind": "action", "gui": "tab", "what": "A tab switch by a click on the other tab's pad on the closed rail, the pointer gone straight after (a posted WM_MOUSELEAVE behind the click, so the panel doesn't open on its rest), to the frame with it open",
+      "budgets": {
+        "ms": { "max": 15, "why": "1.5 times the slowest round's median, 8.4 ms (this build's 2 rounds: 8.4, 7.8)" },
+        "p95_ms": { "max": 20, "why": "1.5 times the slowest round's p95, 13 ms (this build's 2 rounds: 13, 10)" },
+        "gui_ms": { "max": 15, "why": "1.5 times the slowest round's median, 8.5 ms (this build's 2 rounds: 8.5, 7.7)" },
+        "gui_p95_ms": { "max": 20, "why": "1.5 times the slowest round's p95, 11.7 ms (this build's 2 rounds: 11.7, 9.9)" },
+        "gui_thread_ms": { "max": 25, "why": "1.5 times the slowest round's median, 15.3 ms (this build's 2 rounds: 15.3, 14.9)" },
+        "cpu_ms": { "max": 30, "why": "1.5 times the slowest round's median, 17.2 ms (this build's 2 rounds: 17.2, 16.5)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0.5 ms (this build's 2 rounds: 0.5, 0.4)" },
+        "frames": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3)" }
+      } },
+    { "name": "new-tab", "kind": "action", "gui": "new-tab", "what": "A new tab by a key (SpawnCommandInNewTab, a pwsh), to the first frame with it in the window",
+      "budgets": {
+        "ms": { "max": 60, "why": "1.5 times the slowest round's median, 37.8 ms (this build's 2 rounds: 37.8, 35.6)" },
+        "p95_ms": { "max": 120, "why": "1.5 times the slowest round's p95, 75.2 ms (this build's 2 rounds: 67.1, 75.2)" },
+        "gui_ms": { "max": 60, "why": "1.5 times the slowest round's median, 37.8 ms (this build's 2 rounds: 37.8, 36.2)" },
+        "gui_p95_ms": { "max": 120, "why": "1.5 times the slowest round's p95, 75.2 ms (this build's 2 rounds: 66.8, 75.2)" },
+        "gui_thread_ms": { "max": 90, "why": "1.5 times the slowest round's median, 58.8 ms (this build's 2 rounds: 58.8, 51)" },
+        "cpu_ms": { "max": 100, "why": "1.5 times the slowest round's median, 66.4 ms (this build's 2 rounds: 66.4, 58.7)" },
+        "server_cpu_ms": { "max": 90, "why": "1.5 times the slowest round's median, 59.3 ms (this build's 2 rounds: 59.3, 54.9)" },
+        "frames": { "max": 11, "why": "1.5 times the slowest round's median, 7 (this build's 2 rounds: 7, 7)" }
+      } },
+    { "name": "new-tab-local", "kind": "action", "domain": "local", "gui": "new-tab", "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "ms": { "max": 95, "why": "1.5 times the slowest round's median, 60.8 ms (this build's 2 rounds: 60.8, 58.8)" },
+        "p95_ms": { "max": 150, "why": "1.5 times the slowest round's p95, 93.9 ms (this build's 2 rounds: 91.8, 93.9)" },
+        "gui_ms": { "max": 95, "why": "1.5 times the slowest round's median, 60 ms (this build's 2 rounds: 60, 59)" },
+        "gui_p95_ms": { "max": 150, "why": "1.5 times the slowest round's p95, 94.2 ms (this build's 2 rounds: 91.7, 94.2)" },
+        "gui_thread_ms": { "max": 120, "why": "1.5 times the slowest round's median, 76.5 ms (this build's 2 rounds: 76.5, 74.6)" },
+        "cpu_ms": { "max": 150, "why": "1.5 times the slowest round's median, 97.3 ms (this build's 2 rounds: 97.3, 93.6)" },
+        "frames": { "max": 9, "why": "1.5 times the slowest round's median, 6 (this build's 2 rounds: 6, 6)" }
+      } },
+    { "name": "close-tab", "kind": "action", "gui": "close-tab", "what": "A tab closed by a key (CloseCurrentTab), to the first frame without it",
+      "budgets": {
+        "ms": { "max": 20, "why": "1.5 times the slowest round's median, 10.3 ms (this build's 2 rounds: 10.3, 10)" },
+        "p95_ms": { "max": 30, "why": "1.5 times the slowest round's p95, 19.5 ms (this build's 2 rounds: 19.5, 16.4)" },
+        "gui_ms": { "max": 20, "why": "1.5 times the slowest round's median, 10.4 ms (this build's 2 rounds: 10.4, 10.1)" },
+        "gui_p95_ms": { "max": 30, "why": "1.5 times the slowest round's p95, 18.8 ms (this build's 2 rounds: 18.8, 16.2)" },
+        "gui_thread_ms": { "max": 20, "why": "1.5 times the slowest round's median, 11.9 ms (this build's 2 rounds: 11.9, 11.8)" },
+        "cpu_ms": { "max": 25, "why": "1.5 times the slowest round's median, 14.1 ms (this build's 2 rounds: 14.1, 13.7)" },
+        "server_cpu_ms": { "max": 30, "why": "1.5 times the slowest round's median, 18.5 ms (this build's 2 rounds: 18.5, 16.9)" },
+        "frames": { "max": 3, "why": "1.5 times the slowest round's median, 2 (this build's 2 rounds: 2, 2)" }
+      } },
+    { "name": "split", "kind": "action", "gui": "split", "what": "A split by a key (SplitHorizontal, a pwsh), to the first frame with the new pane",
+      "budgets": {
+        "ms": { "max": 70, "why": "1.5 times the slowest round's median, 44.5 ms (this build's 2 rounds: 44.5, 43.4)" },
+        "p95_ms": { "max": 190, "why": "1.5 times the slowest round's p95, 120.7 ms (this build's 2 rounds: 78.5, 120.7)" },
+        "gui_ms": { "max": 70, "why": "1.5 times the slowest round's median, 45.1 ms (this build's 2 rounds: 45.1, 43.7)" },
+        "gui_p95_ms": { "max": 190, "why": "1.5 times the slowest round's p95, 121.3 ms (this build's 2 rounds: 78.5, 121.3)" },
+        "gui_thread_ms": { "max": 90, "why": "1.5 times the slowest round's median, 59 ms (this build's 2 rounds: 59, 56.5)" },
+        "cpu_ms": { "max": 110, "why": "1.5 times the slowest round's median, 67.3 ms (this build's 2 rounds: 67.3, 65.6)" },
+        "server_cpu_ms": { "max": 100, "why": "1.5 times the slowest round's median, 63.8 ms (this build's 2 rounds: 63.8, 59.9)" },
+        "frames": { "max": 11, "why": "1.5 times the slowest round's median, 7 (this build's 2 rounds: 7, 7)" }
+      } },
+    { "name": "close-pane", "kind": "action", "what": "A pane closed by a key (CloseCurrentPane), split off for it first, to the first frame without it: the pane going and the one left growing into its room",
+      "budgets": {
+        "ms": { "max": 45, "why": "1.5 times the slowest round's median, 27.9 ms (this build's 2 rounds: 27.9, 26.8)" },
+        "p95_ms": { "max": 50, "why": "1.5 times the slowest round's p95, 31 ms (this build's 2 rounds: 31, 30)" },
+        "gui_thread_ms": { "max": 35, "why": "1.5 times the slowest round's median, 20.5 ms (this build's 2 rounds: 20.5, 17.7)" },
+        "cpu_ms": { "max": 40, "why": "1.5 times the slowest round's median, 24.9 ms (this build's 2 rounds: 24.9, 20.7)" },
+        "server_cpu_ms": { "max": 35, "why": "1.5 times the slowest round's median, 20.6 ms (this build's 2 rounds: 20.6, 19.6)" },
+        "frames": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3)" }
+      } },
+    { "name": "zoom", "kind": "action", "what": "A pane zoomed or back by a key (TogglePaneZoomState), in a tab split in two, to the first frame that shows it",
+      "budgets": {
+        "ms": { "max": 25, "why": "1.5 times the slowest round's median, 13.4 ms (this build's 2 rounds: 13.4, 12.1)" },
+        "p95_ms": { "max": 30, "why": "1.5 times the slowest round's p95, 19 ms (this build's 2 rounds: 19, 17.2)" },
+        "gui_thread_ms": { "max": 35, "why": "1.5 times the slowest round's median, 20.3 ms (this build's 2 rounds: 20.3, 20.1)" },
+        "cpu_ms": { "max": 40, "why": "1.5 times the slowest round's median, 24.6 ms (this build's 2 rounds: 24.6, 23.1)" },
+        "server_cpu_ms": { "max": 5, "why": "1.5 times the slowest round's median, 3.1 ms (this build's 2 rounds: 3, 3.1)" },
+        "frames": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3)" }
+      } },
+    { "name": "rail-opening", "kind": "action", "gui": "rail", "what": "The pointer posted onto the first pad, to the first frame with the rail open (its open_delay_ms, 150, in it; the GUI's own time starts as that ends)",
+      "budgets": {
+        "ms": { "max": 260, "why": "1.5 times the slowest round's median, 169.2 ms (this build's 2 rounds: 169.2, 168.7)" },
+        "p95_ms": { "max": 260, "why": "1.5 times the slowest round's p95, 172.8 ms (this build's 2 rounds: 170.9, 172.8)" },
+        "gui_ms": { "max": 30, "why": "1.5 times the slowest round's median, 19.2 ms (this build's 2 rounds: 19.2, 19.2)" },
+        "gui_p95_ms": { "max": 35, "why": "1.5 times the slowest round's p95, 22.3 ms (this build's 2 rounds: 21.2, 22.3)" },
+        "gui_thread_ms": { "max": 30, "why": "1.5 times the slowest round's median, 18 ms (this build's 2 rounds: 18, 17.8)" },
+        "cpu_ms": { "max": 35, "why": "1.5 times the slowest round's median, 21.6 ms (this build's 2 rounds: 21.6, 21.2)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0.1 ms (this build's 2 rounds: 0.1, 0.1)" },
+        "frames": { "max": 6, "why": "1.5 times the slowest round's median, 4 (this build's 2 rounds: 4, 4)" }
+      } },
+    { "name": "inbox-opening", "kind": "action", "gui": "inbox", "what": "A click on the InMail button, one message waiting, to the first frame with its list",
+      "budgets": {
+        "ms": { "max": 10, "why": "1.5 times the slowest round's median, 6.5 ms (this build's 2 rounds: 6.4, 6.5)" },
+        "p95_ms": { "max": 25, "why": "1.5 times the slowest round's p95, 14 ms (this build's 2 rounds: 11.1, 14)" },
+        "gui_ms": { "max": 10, "why": "1.5 times the slowest round's median, 6.3 ms (this build's 2 rounds: 6.3, 6.2)" },
+        "gui_p95_ms": { "max": 25, "why": "1.5 times the slowest round's p95, 13.7 ms (this build's 2 rounds: 11.2, 13.7)" },
+        "gui_thread_ms": { "max": 20, "why": "1.5 times the slowest round's median, 11 ms (this build's 2 rounds: 10.9, 11)" },
+        "cpu_ms": { "max": 20, "why": "1.5 times the slowest round's median, 11.9 ms (this build's 2 rounds: 11.8, 11.9)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0 ms (this build's 2 rounds: 0, 0)" },
+        "frames": { "max": 3, "why": "1.5 times the slowest round's median, 2 (this build's 2 rounds: 2, 2)" }
+      } },
+    { "name": "prompts-opening", "kind": "action", "what": "A click on the arrow before the strip's last prompt, Claude Code's history.jsonl as long as Lachlan's (2 MB, 6,600 lines of 1,200 sessions), to the first frame listing the session's 40 prompts",
+      "budgets": {
+        "ms": { "max": 43, "why": "1.5 times the slowest round's median, 28.3 ms (this build's 3 rounds: 26.5, 27.6, 28.3): the click's frame with the list's one row, then the next refresh's with the prompts; the build before, 26.3 and 28.7, its read of the whole file within that refresh" },
+        "p95_ms": { "max": 50, "why": "1.5 times the slowest round's 95th percentile, 33.0 ms (this build's 3 rounds: 32.5, 33.0, 32.5)" },
+        "gui_thread_ms": { "max": 35, "why": "the list laid out and its words shaped for each of its frames (PERF.md, What the cards cost, what's left), three in a test window since the menus fade (feat/new-tab-menus, 2026-11-05): 1.5 times the slowest round's median, 23.2 ms (its 5 rounds: 20.0, 23.0, 17.4, 21.7, 23.2; main's, two frames, 9.2 to 13.5). The third frame is the state file's after the fade ends (lbterm/STATE.md), which Lachlan's window doesn't paint" },
+        "cpu_ms": { "max": 40, "why": "1.5 times the slowest round's median, 26.3 ms (feat/new-tab-menus's 5 rounds, 2026-11-05: 23.7, 25.1, 19.3, 26.3, 26.1; main's 11.3 to 15.3, a frame fewer): the GUI thread's and 2 to 4 ms more" },
+        "frames": { "max": 3, "why": "the click's frame, the prompts' and, in a test window only, the state file's after the list's fade (lbterm/STATE.md): 3 in every round of feat/new-tab-menus (2026-11-05), 2 before the menus faded" }
+      } },
+    { "name": "projects-opening", "kind": "action", "what": "The pointer posted onto the projects pad, to the first frame with the card open (its open delay in it)",
+      "budgets": {
+        "ms": { "max": 470, "why": "1.5 times the slowest round's median, 310.2 ms (this build's 2 rounds: 310.2, 308.6)" },
+        "p95_ms": { "max": 490, "why": "1.5 times the slowest round's p95, 321.8 ms (this build's 2 rounds: 321.8, 320.2)" },
+        "gui_thread_ms": { "max": 25, "why": "1.5 times the slowest round's median, 14.2 ms (this build's 2 rounds: 14.2, 14.1)" },
+        "cpu_ms": { "max": 25, "why": "1.5 times the slowest round's median, 15.9 ms (this build's 2 rounds: 15.9, 15.7)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0 ms (this build's 2 rounds: 0, 0)" },
+        "frames": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3)" }
+      } },
+    { "name": "conductor-view-opening", "kind": "action", "gui": "conductor-view", "what": "A click on the Conductor's pad, against a seat played here (an ask, two questions, two sessions, a conversation of four items), to the first frame with the view",
+      "budgets": {
+        "ms": { "max": 20, "why": "1.5 times the slowest round's median, 11.8 ms (this build's 2 rounds: 11.3, 11.8)" },
+        "p95_ms": { "max": 35, "why": "1.5 times the slowest round's p95, 23.1 ms (this build's 2 rounds: 16.2, 23.1)" },
+        "gui_ms": { "max": 20, "why": "1.5 times the slowest round's median, 11.2 ms (this build's 2 rounds: 11.2, 10.9)" },
+        "gui_p95_ms": { "max": 35, "why": "1.5 times the slowest round's p95, 23.2 ms (this build's 2 rounds: 15.9, 23.2)" },
+        "gui_thread_ms": { "max": 45, "why": "1.5 times the slowest round's median, 29.8 ms (this build's 2 rounds: 29, 29.8)" },
+        "cpu_ms": { "max": 55, "why": "1.5 times the slowest round's median, 34.9 ms (this build's 2 rounds: 33.5, 34.9)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0.1 ms (this build's 2 rounds: 0.1, 0.1)" },
+        "frames": { "max": 6, "why": "1.5 times the slowest round's median, 4 (this build's 2 rounds: 4, 4)" }
+      } },
+    { "name": "tab-menu-opening", "kind": "action", "what": "A right click on the first tab's pad, the pointer resting on it with the rail open, twelve tabs on the rail (eleven Claude stand-ins with labels), to the first frame with the tab menu (lbterm/TAB-MOUSE.md)",
+      "budgets": {
+        "shown_frame": { "max": 1, "why": "the menu in the frame after the click, every run (lbterm/NEW-TAB.md, section 6): a count of frames, which a loaded PC doesn't move; 1 in all 75 runs of feat/new-tab-menus's 5 rounds (2026-11-05), as main's build before it" },
+        "ms": { "max": 5, "why": "1.5 times the slowest round's median, 1.98 ms (feat/new-tab-menus's 5 rounds, 2026-11-05, the PC locked: 1.75, 1.98, 1.29, 1.34, 1.87; main's before it 1.82 to 2.18)" },
+        "p95_ms": { "max": 10, "why": "1.5 times the slowest round's p95, 6.39 ms (its 5 rounds: 3.11, 3.40, 3.70, 6.39, 3.92)" },
+        "gui_thread_ms": { "max": 10, "why": "1.5 times the slowest round's median but one, 5.56 ms (its 5 rounds: 49.9, 5.56, 4.01, 2.95, 4.29): the first round's 49.9 a run, and the slow runs of later rounds, were the test window's own timing to the screen spinning on a locked PC (present.rs, lbterm/FLOWS.md, \"Opening, measured whole\", step 6; PITFALLS 164), not the menu, and main's build 2.08 to 3.56; without the spin a run is 3.22 ms (the fix-up's 50 runs of 2026-11-05); since the fix (Episode::next_look, 2026-11-07) every run of 90 was 2.54 to 5.54 ms, main's 3.06 to 8.10, unlocked" },
+        "cpu_ms": { "max": 20, "why": "1.5 times the slowest round's median but the first's, 13.6 ms (its 5 rounds: 51.0, 13.6, 5.11, 4.05, 5.43; main's 2.69 to 5.47)" },
+        "server_cpu_ms": { "max": 3, "why": "nothing of the server's: 0 in every round" },
+        "frames": { "max": 3, "why": "the frame that draws it and, in a test window only, the state file's own frame after its fade ends (lbterm/STATE.md, 'The frame an animation ends on'): 2 in every round, where main's menu, with no fade, had 1" }
+      } },
+    { "name": "tab-menu-hide-opening", "kind": "action", "what": "tab-menu-opening with the Conductor's pad and its button.json's hidden list empty (lbterm/NEW-TAB.md, section 8): on a build with Hide from Conductor the first tab's menu has the Hide row, its offer found as the menu opens (render/conductor_hide.rs, lbterm_hide_offer), each run's menu checked for it; a build without opens the menu it always did. Its budgets are tab-menu-opening's: the row adds a look at the list and the tab's sessions",
+      "budgets": {
+        "shown_frame": { "max": 1, "why": "the menu in the frame after the click, every run (lbterm/NEW-TAB.md, section 6): a count of frames, which a loaded PC doesn't move; 1 in all 75 runs of feat/new-tab-menus's 5 rounds (2026-11-05), as main's build before it" },
+        "ms": { "max": 5, "why": "1.5 times the slowest round's median, 1.98 ms (feat/new-tab-menus's 5 rounds, 2026-11-05, the PC locked: 1.75, 1.98, 1.29, 1.34, 1.87; main's before it 1.82 to 2.18)" },
+        "p95_ms": { "max": 10, "why": "1.5 times the slowest round's p95, 6.39 ms (its 5 rounds: 3.11, 3.40, 3.70, 6.39, 3.92)" },
+        "gui_thread_ms": { "max": 10, "why": "1.5 times the slowest round's median but one, 5.56 ms (its 5 rounds: 49.9, 5.56, 4.01, 2.95, 4.29): the first round's 49.9 a run, and the slow runs of later rounds, were the test window's own timing to the screen spinning on a locked PC (present.rs, lbterm/FLOWS.md, \"Opening, measured whole\", step 6; PITFALLS 164), not the menu, and main's build 2.08 to 3.56; without the spin a run is 3.22 ms (the fix-up's 50 runs of 2026-11-05); since the fix (Episode::next_look, 2026-11-07) every run of 90 was 2.54 to 5.54 ms, main's 3.06 to 8.10, unlocked" },
+        "cpu_ms": { "max": 20, "why": "1.5 times the slowest round's median but the first's, 13.6 ms (its 5 rounds: 51.0, 13.6, 5.11, 4.05, 5.43; main's 2.69 to 5.47)" },
+        "server_cpu_ms": { "max": 3, "why": "nothing of the server's: 0 in every round" },
+        "frames": { "max": 3, "why": "the frame that draws it and, in a test window only, the state file's own frame after its fade ends (lbterm/STATE.md, 'The frame an animation ends on'): 2 in every round, where main's menu, with no fade, had 1" }
+      } },
+    { "name": "picker", "kind": "action", "gui": "picker", "what": "A click on the new-tab pad at the rail's foot, the pointer resting on it, two projects of the test's own to list, to the first frame with the picker (lbterm/NEW-TAB.md)",
+      "budgets": {
+        "shown_frame": { "max": 1, "why": "the picker in the frame after the click, every run (NEW-TAB.md, 'Left click'): a count of frames, which a loaded PC doesn't move; 1 in all 30 runs of this build's 2 rounds" },
+        "ms": { "max": 5, "why": "1.5 times the slowest round's median, 2.34 ms (this build's 2 rounds: 2.29, 2.34)" },
+        "p95_ms": { "max": 10, "why": "1.5 times the slowest round's p95, 4.47 ms (this build's 2 rounds: 4.47, 3.06)" },
+        "gui_ms": { "max": 5, "why": "1.5 times the slowest round's median, 2.15 ms (this build's 2 rounds: 2.09, 2.15)" },
+        "gui_p95_ms": { "max": 5, "why": "1.5 times the slowest round's p95, 3.21 ms (this build's 2 rounds: 3.21, 2.61)" },
+        "gui_thread_ms": { "max": 10, "why": "1.5 times the slowest round's median, 3.9 ms (this build's 2 rounds: 3.9, 3.73)" },
+        "cpu_ms": { "max": 10, "why": "1.5 times the slowest round's median, 5.04 ms (this build's 2 rounds: 5.04, 4.84)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0.1 ms (this build's 2 rounds: 0, 0.1)" },
+        "frames": { "max": 3, "why": "1.5 times the slowest round's median, 2 (this build's 2 rounds: 2, 2)" }
+      } },
+    { "name": "picker-first", "kind": "action", "gui": "picker", "runs": 1, "warmup": 0, "what": "The picker's first open in the window's GUI, cold, from a click on the pad as picker's: one run, no warm-up, so budgets -Against -Rounds gives one cold open a round (a retake on a busy PC is warm, and says cold 0)",
+      "budgets": {
+        "shown_frame": { "max": 1, "why": "the picker in the frame after the click, cold too (NEW-TAB.md, 'Left click')" },
+        "ms": { "max": 40, "why": "1.5 times the slowest round's, 26.8 ms (this build's 3 rounds, 2026-11-04 04:31 to 04:35: 26.8, 24.5, 26.8), with this scenario's two projects; the review's probes with Lachlan's 49, on the branch before main's fonts-core came in, took 42 to 95 (NEW-TAB.md, 'What the picker costs')" },
+        "p95_ms": { "max": 40, "why": "one run a round: its p95 is its time" },
+        "gui_ms": { "max": 25, "why": "1.5 times the slowest round's, 16.3 ms (this build's 3 rounds: 16.3, 14.3, 15.3)" },
+        "gui_p95_ms": { "max": 25, "why": "one run a round" },
+        "gui_thread_ms": { "max": 30, "why": "1.5 times the slowest round's, 19.3 ms (this build's 3 rounds: 19.3, 17.3, 17.2): the cold open is the GUI thread's, a warm one 3.4 to 3.6" },
+        "cpu_ms": { "max": 35, "why": "1.5 times the slowest round's, 21.2 ms (this build's 3 rounds: 21.2, 19.3, 19.2)" },
+        "frames": { "max": 3, "why": "as the warm picker's: the frame that draws it and its fade's" }
+      } },
+    { "name": "pick", "kind": "action", "gui": "pick", "what": "Enter in the new-tab picker opened from the pad, its first project highlighted, to the first frame with the Starting row at the end of the tabs (or the tab, had it come first); the tab, a pwsh in that project's folder, closed after",
+      "budgets": {
+        "shown_frame": { "max": 1, "why": "the Starting row in the frame after the key, every run (NEW-TAB.md, 'The Starting row'): a count of frames, which a loaded PC doesn't move; 1 in all 30 runs of this build's 2 rounds" },
+        "ms": { "max": 10, "why": "1.5 times the slowest round's median, 5.73 ms (this build's 2 rounds: 4.58, 5.73)" },
+        "p95_ms": { "max": 15, "why": "1.5 times the slowest round's p95, 8.52 ms (this build's 2 rounds: 8.52, 7.85)" },
+        "gui_ms": { "max": 10, "why": "1.5 times the slowest round's median, 5.53 ms (this build's 2 rounds: 4.69, 5.53)" },
+        "gui_p95_ms": { "max": 15, "why": "1.5 times the slowest round's p95, 7.68 ms (this build's 2 rounds: 7.59, 7.68)" },
+        "gui_thread_ms": { "max": 45, "why": "1.5 times the slowest round's median, 29.1 ms (this build's 2 rounds: 28.2, 29.1): the pick, the tab it opens and the picker's fade, to the window quiet" },
+        "cpu_ms": { "max": 55, "why": "1.5 times the slowest round's median, 33.5 ms (this build's 2 rounds: 32.5, 33.5)" },
+        "server_cpu_ms": { "max": 55, "why": "1.5 times the slowest round's median, 34 ms (this build's 2 rounds: 33.2, 34): the server starting the tab's pwsh" },
+        "frames": { "max": 14, "why": "1.5 times the slowest round's median, 9 (this build's 2 rounds: 8, 9)" }
+      } },
+    { "name": "hearts", "kind": "action", "runs": 6, "what": "A key to a program printing love on a line of its own, the same line each run, the run before's still on the screen, to the first frame with the easter egg's hearts in the air; its cost to the window quiet again, the burst's two seconds in it",
+      "budgets": {
+        "ms": { "max": 35, "why": "the key's echo and the frame it brings: 1.5 times the slowest round's median, 23.1 ms (this build's 2 rounds: 22.3, 23.1)" },
+        "p95_ms": { "max": 60, "why": "1.5 times the slowest round's p95, 39.2 ms (this build's 2 rounds: 39.2, 26.7)" },
+        "gui_thread_ms": { "max": 30, "why": "the key's frame and the burst's first, DWM playing the hearts: 1.5 times the slowest round's median, 19.6 ms (this build's 2 rounds: 11.3, 19.6); stage 1's build, 243.7 and 235.1 ms: the whole window painted every 16 ms for the burst's two seconds" },
+        "cpu_ms": { "max": 40, "why": "1.5 times the slowest round's median, 25.5 ms (this build's 2 rounds: 16.2, 25.5)" },
+        "server_cpu_ms": { "max": 55, "why": "the key and the line it prints: 1.5 times the slowest round's median, 36.5 ms (this build's 2 rounds: 29.7, 36.5)" },
+        "frames": { "max": 5, "why": "the key's frame, the burst's first and the state file's frame as DWM's animations end: 3 measured in every run; stage 1's build, 67" }
+      } },
+    { "name": "reload", "kind": "action", "gui": "reload", "runs": 8, "what": "A config reload by a key (ReloadConfiguration: Lachlan's whole lbterm.lua run again), over twenty lines and a tab title with symbols the bundled fonts don't have, to the first frame saying Config reloaded",
+      "budgets": {
+        "ms": { "max": 140, "why": "1.5 times the slowest round's median, 92.5 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 87.3, 89.1, 82.3, 92.1, 92.5; the installed build's 268 to 300). Set at 130 from two locked rounds of 85.5 and 85.8, it failed an unlocked round beside other tracks' test windows at 148, when main's build took 448 against its calm 268 to 300 (the review of perf/fonts-core); this branch's unlocked rounds through the warden on 2026-11-01 were 112 and 117" },
+        "p95_ms": { "max": 210, "why": "1.5 times the slowest round's p95, 136.9 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 113.7, 136.9, 113.1, 121.4, 108.2; 142 on 2026-11-01)" },
+        "gui_ms": { "max": 140, "why": "1.5 times the slowest round's median, 92.2 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 87.1, 89.0, 82.1, 91.7, 92.2)" },
+        "gui_p95_ms": { "max": 210, "why": "1.5 times the slowest round's p95, 134.5 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 113.8, 134.5, 112.3, 121.3, 108)" },
+        "gui_thread_ms": { "max": 120, "why": "1.5 times the slowest round's median, 74.1 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 67.9, 66.4, 68.3, 67.6, 74.1; the installed build's 253 to 298)" },
+        "cpu_ms": { "max": 120, "why": "1.5 times the slowest round's median, 74.7 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 68.6, 67.0, 68.9, 68.2, 74.7)" },
+        "server_cpu_ms": { "max": 3, "why": "the floor (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 0 to 0.06 ms)" },
+        "frames": { "max": 2, "why": "the floor: one frame, the one saying it's reloaded (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 1 in each; the installed build's 2)" },
+        "font_loads": { "max": 0, "why": "a reload of the same font settings keeps every font (config::lbterm::font_key): the installed build made them all again, 227 to 312 ms to the frame over these lines against 74 to 109 now" },
+        "font_files": { "max": 0, "why": "the installed build read 11 system font files a reload (GDI's substitutes, and the caption font)" },
+        "fallback_searches": { "max": 0, "why": "what the kept fonts found is kept: the installed build searched again for every symbol on screen, once for each font" },
+        "atlas_rebuilds": { "max": 0, "why": "the glyph atlas is kept with the fonts" },
+        "reshapes": { "max": 0, "why": "the shapes are kept with the fonts and the atlas; only the lines are laid out again, for the config's colours" }
+      } },
+    { "name": "font-zoom", "kind": "action", "runs": 10, "what": "The font a size bigger and back by keys (IncreaseFontSize, DecreaseFontSize), a run each, over twenty lines and a tab title with symbols LBTerm's bundled fonts don't have, to the first frame with the window at its new size",
+      "budgets": {
+        "ms": { "max": 330, "why": "1.5 times the slowest round's median, 217 ms (this build's 4 rounds: 190.8, 184, 209.9, 217; the installed build's 285 to 338)" },
+        "p95_ms": { "max": 370, "why": "1.5 times the slowest round's p95, 246.3 ms (this build's 4 rounds: 217.4, 193.6, 246.3, 238.2)" },
+        "gui_thread_ms": { "max": 310, "why": "1.5 times the slowest round's median, 203.7 ms (this build's 4 rounds: 198, 203.7, 198.8, 200.9; the installed build's 319 to 363)" },
+        "cpu_ms": { "max": 320, "why": "1.5 times the slowest round's median, 210.3 ms (this build's 4 rounds: 210.3, 210.1, 205.8, 207)" },
+        "server_cpu_ms": { "max": 13, "why": "1.5 times the slowest round's median, 8.1 ms (this build's 4 rounds: 6.7, 6.2, 8.1, 7.5)" },
+        "frames": { "max": 8, "why": "1.5 times the slowest round's median, 5 (this build's 4 rounds: 5, 5, 5, 5)" },
+        "fallback_searches": { "max": 0, "why": "what the fonts found at the old size is kept for the new (wezterm-font's lbterm.rs): the installed build searched again for every character on screen, once for each font" },
+        "font_files": { "max": 0, "why": "GDI's substitutes are turned down by name, so no system font file is read: the installed build read 11 a zoom" },
+        "atlas_rebuilds": { "max": 1, "why": "one atlas made at the same size for the new glyphs, never grown or cleared on top" }
+      } },
+    { "name": "new-window", "kind": "action", "runs": 8, "what": "A new window by a key (wezterm.mux.spawn_window on the test's mux domain), from a window with twenty lines and a tab title with symbols, to the new window's first frame; closed again after",
+      "budgets": {
+        "ms": { "max": 780, "why": "1.5 times the slowest round's median, 519 ms (this build's 4 rounds: 382, 418.1, 519, 462.4)" },
+        "p95_ms": { "max": 1040, "why": "1.5 times the slowest round's p95, 691.8 ms (this build's 4 rounds: 421.2, 452.3, 691.8, 561.8)" },
+        "gui_thread_ms": { "max": 510, "why": "1.5 times the slowest round's median, 335.8 ms (this build's 4 rounds: 282, 290.5, 335.8, 317)" },
+        "cpu_ms": { "max": 530, "why": "1.5 times the slowest round's median, 349.2 ms (this build's 4 rounds: 295.1, 298.2, 349.2, 326.5)" },
+        "server_cpu_ms": { "max": 125, "why": "1.5 times the slowest round's median, 82.3 ms (this build's 4 rounds: 67.2, 69.5, 82.3, 75.2)" },
+        "frames": { "max": 11, "why": "1.5 times the slowest round's median, 7 (this build's 4 rounds: 7, 7, 7, 7)" },
+        "fallback_searches": { "max": 0, "why": "the windows of a process share what their fonts found (wezterm-font's lbterm.rs): the first window's symbols are known to the new one's fonts" },
+        "font_files": { "max": 0, "why": "the caption font is kept and GDI's substitutes are turned down by name: the installed build read 11 font files a new window" }
+      } },
+    { "name": "fallback-line", "kind": "action", "runs": 12, "what": "A line of six characters in a script none of the window's fonts has (Han, Hangul, Thai, Devanagari and on, a new script each run), in the pane and its tab's title, to the first frame with the title; costed to the window quiet again, the fallback found and drawn",
+      "budgets": {
+        "ms": { "max": 105, "why": "1.5 times the slowest round's median, 69.7 ms (this build's 2 rounds of the script that prints in UTF-8: 69.7, 59.2; the installed build's 102.5, 109.6)" },
+        "p95_ms": { "max": 145, "why": "1.5 times the slowest round's p95, 96 ms (this build's 2 rounds: 96, 81)" },
+        "gui_thread_ms": { "max": 160, "why": "1.5 times the slowest round's median, 104.9 ms (this build's 2 rounds: 104.9, 91.9; the installed build's 121.4, 135.4)" },
+        "cpu_ms": { "max": 170, "why": "1.5 times the slowest round's median, 110.9 ms (this build's 2 rounds: 110.9, 97.9)" },
+        "server_cpu_ms": { "max": 55, "why": "1.5 times the slowest round's median, 36.3 ms (this build's 2 rounds: 36.3, 29.8)" },
+        "frames": { "max": 6, "why": "1.5 times the slowest round's median, 4 (this build's 2 rounds: 4, 4)" },
+        "fallback_searches": { "max": 1, "why": "one search for the line's characters whatever fonts meet them: the title's font takes what the pane's found (wezterm-font's lbterm.rs), where each font searched on its own" },
+        "reshapes": { "max": 2, "why": "a reshape for each search's answer handed to a font (the pane's and the title's), and no paint pass thrown away part-way, where each find reshaped the window and threw away the pass it came in" },
+        "font_files": { "max": 0, "why": "a fallback face is found by DirectWrite's file path, and no GDI substitute is read" }
+      } },
+    { "name": "atlas-refill", "kind": "action", "domain": "local", "runs": 12, "what": "A screen of CJK ideographs the glyph atlas doesn't hold, the window 55 rows tall so a screen (about 3,200 glyphs) is more than half the atlas and less than all of it, six screens in turn, to the first frame with the writer's title after it; costed to the window quiet again: each glyph rasterized and staged in an upload buffer of its own for the atlas, which fills, is cleared and takes the screen again (PITFALLS 77)",
+      "budgets": {
+        "ms": { "max": 910, "why": "1.5 times the slowest round's median, 606.6 ms (perf/gpu-memory's build, 17 rounds against its build with wgpu's default blocks and heap, 2026-11-04, unlocked, the PC watched: 485.1 to 606.6; the defaults' 476.9 to 564.8)" },
+        "p95_ms": { "max": 1750, "why": "1.5 times the slowest round's p95, 1,163 ms (the same 17 rounds: 551 to 1,163; a run in a round of 12 an atlas cleared while the PC was busy, 1,295.7 on the defaults)" },
+        "gui_thread_ms": { "max": 890, "why": "1.5 times the slowest round's median, 591.6 ms at the nominal clock (the same 17 rounds: 486.6 to 591.6; the defaults' 485.9 to 609.6): about 3,200 glyphs rasterized and staged, the atlas cleared, and the screen's drawn again" },
+        "cpu_ms": { "max": 900, "why": "1.5 times the slowest round's median, 601.3 ms at the nominal clock (the same 17 rounds: 489.1 to 601.3)" },
+        "frames": { "max": 3, "why": "2 in every round of the 17, on both builds" },
+        "atlas_rebuilds": { "min": 1, "why": "the atlas filled and cleared in every run, as the window is sized for: a screen under half the atlas clears it every other run, and one that grew it once leaves later runs adding to a bigger one, and either way a round's median of 0 says so" },
+        "fallback_searches": { "max": 0, "why": "the font for the ideographs found in the warm-up: a run's glyphs are new to the atlas, their script isn't" }
+      } },
+    { "name": "cli-list", "kind": "action", "what": "lbterm cli list --format json against the mux server, twelve tabs, as the Conductor, Relay and the hooks call it: the call from start to exit",
+      "budgets": {
+        "ms": { "max": 120, "why": "1.5 times the slowest round's median, 78.2 ms (this build's 2 rounds: 78.2, 66.3)" },
+        "p95_ms": { "max": 170, "why": "1.5 times the slowest round's p95, 111.1 ms (this build's 2 rounds: 111.1, 99.1)" },
+        "gui_thread_ms": { "max": 2, "why": "1.5 times the slowest round's median, 0 ms (this build's 2 rounds: 0, 0)" },
+        "cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0.7 ms (this build's 2 rounds: 0.7, 0.6)" },
+        "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 1.1 ms (this build's 2 rounds: 1.1, 1)" },
+        "frames": { "max": 2, "why": "1.5 times the slowest round's median, 0 (this build's 2 rounds: 0, 0)" }
+      } },
+    { "name": "start", "kind": "action", "runs": 6, "what": "The GUI started from nothing on a mux domain (the server started by it), from the process's start to its first frame",
+      "budgets": {
+        "ms": { "max": 1500, "why": "1.5 times the slowest round's median, 958.1 ms (this build's 2 rounds: 939, 958.1)" },
+        "p95_ms": { "max": 1700, "why": "1.5 times the slowest round's p95, 1090.2 ms (this build's 2 rounds: 1066.8, 1090.2)" },
+        "ready_ms": { "max": 1600, "why": "start-local's budget, which a start on a mux domain meets since the GUI starts the server at once (finding 25, fixed by perf/key-latency): 1.5 times this build's slowest round's median, 1060 ms (its 2 rounds: 1046, 1060; 2752 to 2761 before)" },
+        "gui_thread_ms": { "max": 1070, "why": "1.5 times the slowest round's median, 712.8 ms (the build with font setup kept and the GPU's adapter begun on a thread of its own, 4 rounds: 567.9, 591.8, 712.8, 564.1; the installed build's 979 to 1341)" },
+        "cpu_ms": { "max": 1700, "why": "1.5 times the slowest round's median, 1076.4 ms (this build's 2 rounds: 1076.4, 1064.5)" },
+        "server_cpu_ms": { "max": 270, "why": "1.5 times the slowest round's median, 178.5 ms (this build's 2 rounds: 178.5, 161.9)" },
+        "frames": { "max": 9, "why": "1.5 times the slowest round's median, 6 (perf/key-latency's 2 rounds: 6, 6; 12 to 13 before, the connection's pane up for 1.9 s while the GUI tried a socket nobody answered)" }
+      } },
+    { "name": "start-local", "kind": "action", "domain": "local", "runs": 6, "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "ms": { "max": 1600, "why": "1.5 times the slowest round's median, 1029.2 ms (this build's 2 rounds: 1029.2, 976.5)" },
+        "p95_ms": { "max": 1800, "why": "1.5 times the slowest round's p95, 1196.3 ms (this build's 2 rounds: 1196.3, 1140.3)" },
+        "ready_ms": { "max": 1600, "why": "1.5 times the slowest round's median, 1029.2 ms (this build's 2 rounds: 1029.2, 976.5)" },
+        "gui_thread_ms": { "max": 780, "why": "1.5 times the slowest round's median, 516.3 ms (the build with font setup kept and the GPU's adapter begun on a thread of its own, 4 rounds: 432.4, 436.4, 516.3, 507.5; the installed build's 768 to 1146)" },
+        "cpu_ms": { "max": 1400, "why": "1.5 times the slowest round's median, 921.7 ms (this build's 2 rounds: 921.7, 885.2)" },
+        "frames": { "max": 3, "why": "1.5 times the slowest round's median, 2 (this build's 2 rounds: 2, 2)" }
+      } },
+    { "name": "repaint", "kind": "action", "what": "A frame with nothing new in it: the window told to paint (InvalidateRect, no input, no focus) over two panes of text it has drawn, to that frame: every line found in the caches",
+      "budgets": {
+        "ms": { "max": 10, "why": "the floor for a time, over 1.5 times the slowest round's median, 4.57 ms (this build's 3 rounds: 4.57, 4.57, 4.53; the build before its metrics' changes 4.95, 4.69, 4.35)" },
+        "p95_ms": { "max": 16, "why": "the floor for a p95, 1.5 times the slowest round's p95 being 14.1 ms (this build's 3 rounds: 5.25, 9.39, 6.25)" },
+        "gui_thread_ms": { "max": 8, "why": "1.5 times the slowest round's median, 5.04 ms (this build's 3 rounds: 5.04, 4.95, 4.94; the build before its metrics' changes 5.10, 4.97, 5.01)" },
+        "cpu_ms": { "max": 9, "why": "1.5 times the slowest round's median, 5.91 ms (this build's 3 rounds: 5.91, 5.80, 5.46)" },
+        "server_cpu_ms": { "max": 3, "why": "the floor: a frame of lines it has asks the server for nothing but the changes it hasn't (0 to 0.14 ms)" },
+        "frames": { "max": 2, "why": "the floor: one frame (this build's 3 rounds: 1, 1, 1)" },
+        "lines_laid_out": { "max": 0, "why": "nothing in the panes changed, so every line is found in the line quad cache (this build's 3 rounds: 0, 0, 0)" }
+      } },
+    { "name": "resize", "kind": "action", "what": "The window 80 px wider or narrower (SetWindowPos without activating), to the first frame at the new size",
+      "budgets": {
+        "ms": { "max": 55, "why": "1.5 times the slowest round's median, 35.8 ms (this build's 2 rounds: 32.2, 35.8)" },
+        "p95_ms": { "max": 85, "why": "1.5 times the slowest round's p95, 54.3 ms (this build's 2 rounds: 40.8, 54.3)" },
+        "gui_thread_ms": { "max": 55, "why": "1.5 times the slowest round's median, 34.8 ms (this build's 2 rounds: 33.8, 34.8)" },
+        "cpu_ms": { "max": 60, "why": "1.5 times the slowest round's median, 37 ms (this build's 2 rounds: 35.6, 37)" },
+        "server_cpu_ms": { "max": 4, "why": "1.5 times the slowest round's median, 2.4 ms (this build's 2 rounds: 2.3, 2.4)" },
+        "frames": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3)" }
+      } },
+    { "name": "throughput", "kind": "action", "runs": 6, "what": "A writer printing 16 MB of text as fast as it can (pwsh writing 1 MB at a time to its console), from the key that starts it to the first frame with its title saying it's done",
+      "budgets": {
+        "ms": { "max": 2000, "why": "what the same writer takes locally (throughput-local's budget) (finding 24)" },
+        "p95_ms": { "max": 2100, "why": "what the same writer takes locally (throughput-local's budget) (finding 24)" },
+        "gui_thread_ms": { "max": 1000, "why": "what the GUI thread spends on the same output locally (throughput-local's budget), where it parses it too: on a mux domain the server parses it, so the GUI thread should spend less, not more (findings 3 and 24)" },
+        "cpu_ms": { "max": 7600, "why": "1.5 times the slowest round's median, 5005.9 ms (this build's 2 rounds: 5005.9, 4981.1)" },
+        "server_cpu_ms": { "max": 5100, "why": "1.5 times the slowest round's median, 3341.6 ms (this build's 2 rounds: 3304.4, 3341.6)" },
+        "frames": { "max": 152, "why": "a frame for each refresh it shows output at: 1.5 times the slowest round's median, 101 (this branch's build merged with main's perf/mux-server, 2 rounds: 98, 101; before the merge 85.5 and 95). The build before painted 4 in 6 s, its GUI thread busy the whole time fetching the scrollback for the scroll strip's prompt marks (PERF.md, findings 24 and 65)" },
+        "mb_per_s": { "min": 7.5, "why": "what the same writer showed locally before perf/key-latency: the mux domain shouldn't make output slower than the GUI's own tab (finding 24). The local tab now shows 11.5 MB/s or more (throughput-local), which this should reach too" }
+      } },
+    { "name": "throughput-local", "kind": "action", "domain": "local", "runs": 6, "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "ms": { "max": 440, "why": "1.5 times the slowest round's median, 288.9 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 240.6, 275.2, 234.7, 288.9, 258.5; the installed build's 1,362 to 1,433): the model writes a run of plain text in one go and the parser hands it over whole (lbterm/PERF.md, What printing costs). perf/key-latency's 2 rounds were 1,299.2 and 1,268.4" },
+        "p95_ms": { "max": 470, "why": "1.5 times the slowest round's p95, 310.3 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 273.8, 300, 259.4, 310.3, 263.1)" },
+        "gui_thread_ms": { "max": 210, "why": "1.5 times the slowest round's median, 135 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 114.3, 133.1, 99.9, 135, 112.5; the installed build's 433 to 452)" },
+        "cpu_ms": { "max": 560, "why": "1.5 times the slowest round's median, 372.7 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 312.4, 363.1, 300.2, 372.7, 307.4; the installed build's 1,882 to 1,948)" },
+        "frames": { "max": 27, "why": "1.5 times the slowest round's median, 18 frames for the 16 MB (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 15, 16.5, 14.5, 18, 15; the installed build's 69 to 75): a frame comes each refresh the output shows at, and the output is over in a quarter of a second" },
+        "mb_per_s": { "min": 36, "why": "the slowest round's over 1.5, 54.3 MB/s (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 65.2, 57.0, 66.9, 54.3, 60.7; the installed build's 10.95 to 11.53, perf/key-latency's 12.1 and 12.4)" }
+      } },
+    { "name": "spinner-tall", "kind": "action", "gui": "key", "what": "A spinner's line written again in place, as Claude Code's is while it works, in a window like Lachlan's: 1080 by 1920, the Conductor's pad accepting most with its outlines round two rows, a screenful of coloured lines printed first. A key reaching the program writes the line again, so the cursor moves: to the frame with it moved, and what that row's frames cost", "bug": "each key's echo costs the mux server about 13 ms of CPU where it should cost 1 to 2: the echo is output, so the next paint's ask for the pane's title finds its process list over 300 ms old and walks every process on the PC on a thread of its own (mux/src/localpane.rs, CachedProcInfo::fetch; PERF.md, finding 49), as key-echo's does",
+      "budgets": {
+        "ms": { "max": 28, "why": "the slowest round's median, 22.7 ms (perf/paint's 2 rounds on 2026-11-01: 22.5, 22.7), and about a third of a 60 Hz refresh: the echo's frame held a refresh behind the key's own (PERF.md, finding 35), as key-echo's is; main's build then 25.5 and 26.1" },
+        "p95_ms": { "max": 50, "why": "three refreshes of the test windows' 60 Hz screen: 35.1 and 38.6 measured, 46.9 on a PC under load (2026-10-31)" },
+        "gui_ms": { "max": 28, "why": "as ms: the GUI's own time from the key to the frame, 22.6 and 22.7 measured" },
+        "gui_thread_ms": { "max": 14, "why": "what a spinner's row should cost the GUI thread in his window: two frames of one row changing with nothing built again, 10.5 and 10.6 ms measured (perf/paint's 2 rounds, the templates kept, a layer written only where it changed: lbterm/COMPOSITOR.md, 'What a frame costs'), where main's build, which built the card and outline templates and wrote every layer every frame, spent 16.5 and 18.9" },
+        "cpu_ms": { "max": 17, "why": "the GUI process for those two frames: 12.5 and 13.5 ms measured, main's build 18.5 and 20.2" },
+        "server_cpu_ms": { "max": 2, "why": "what an echo should cost the server: its pane's one changed line read and pushed, about 1 to 2 ms (13.0 to 13.4 measured on both builds: finding 49, the bug above)" },
+        "frames": { "max": 3, "why": "the key's own and its row's: 2 measured" },
+        "messages": { "max": 10, "why": "the key's own three messages and a WM_PAINT a frame: 5 and 6 measured" }
+      } },
+    { "name": "throughput-unicode", "kind": "action", "runs": 4, "what": "A writer printing 16 MB of wide characters and emoji as fast as it can (lbterm/bench's Unicode pattern: CJK and Hangul, emoji, accented and combining Latin, Greek, Cyrillic, box drawing, 80 columns a line), from the key that starts it to the first frame with its title saying it's done", "bug": "on a mux domain wide characters and emoji show at 2 to 3 MB/s, the server's parser taking them at about 18: the GUI pulling a busy pane's lines from its server, its runs from 5.9 to 16.2 s in one round (PERF.md, finding 24)",
+      "budgets": {
+        "ms": { "max": 12500, "why": "1.5 times the slowest round's median, 8330.6 ms (this stage's 2 rounds: 7024.4, 8330.6, beside another session's build and four of its test windows; the installed build's 5199.3, 5344.2)" },
+        "p95_ms": { "max": 24300, "why": "1.5 times the slowest round's p95, 16182.4 ms (this stage's 2 rounds: 8751.7, 16182.4)" },
+        "gui_thread_ms": { "max": 7500, "why": "1.5 times the slowest round's median, 4959.9 ms (this stage's 2 rounds: 4393.4, 4959.9; the installed build's 2846.5, 2969.2)" },
+        "cpu_ms": { "max": 12000, "why": "1.5 times the slowest round's median, 7978.3 ms (this stage's 2 rounds: 7058.5, 7978.3)" },
+        "server_cpu_ms": { "max": 9200, "why": "1.5 times the slowest round's median, 6092.0 ms (this stage's 2 rounds: 4957.2, 6092.0; the installed build's 3969.5, 4039.3)" },
+        "frames": { "max": 320, "why": "since main's perf/lbterm-layers and perf/key-latency a frame comes for each refresh it shows output at, where a mux pane's frames had fetched the scrollback for the prompt marks (findings 65 and 37): 1.5 times the slowest round's median, 211.5 (the merged build's 2 rounds, 2026-11-01: 68, 211.5; the installed build's 107, 152.5); before the merge 4 and 5" },
+        "mb_per_s": { "min": 1.4, "why": "the slowest round's over 1.5, 2.04 MB/s (this stage's 2 rounds: 2.31, 2.04; the installed build's 3.09, 3.0)" }
+      } },
+    { "name": "throughput-unicode-local", "kind": "action", "domain": "local", "runs": 4, "what": "The same, the tab the GUI's own", "bug": "wide characters and emoji show locally at 5.9 to 6.8 MB/s (2026-11-03, this branch and main's build alike; 4.2 to 5.0 on 2026-10-31), where the model prints them at about 19 MB/s and the console host takes them at about 18 on a mux domain (lbterm/BENCH.md): the GUI holds the pane's lock for its whole paint, the shell scroll strip's prompt search, the triggers and the rail's titles walking its lines, and the parser waits on it about a third of its time (PERF.md, What printing costs)",
+      "budgets": {
+        "ms": { "max": 3900, "why": "1.5 times the slowest round's median, 2569 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 2397, 2569, 2485, 2364, 2554; the installed build's 2525 to 2710, no difference told apart). Set at 7300 from a round of 4841.7 ms beside another session's build, where unloaded rounds gave 3231 to 3278, so a doubling would have passed (the review of perf/fonts-core)" },
+        "p95_ms": { "max": 4200, "why": "1.5 times the slowest round's p95, 2740 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 2609, 2730, 2661, 2612, 2740)" },
+        "gui_thread_ms": { "max": 1800, "why": "1.5 times the slowest round's median, 1157 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 982, 1046, 1012, 992, 1157)" },
+        "cpu_ms": { "max": 5800, "why": "1.5 times the slowest round's median, 3848 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 3466, 3739, 3609, 3477, 3848; the installed build's 3626 to 4040)" },
+        "frames": { "max": 210, "why": "1.5 times the slowest round's median, 140 (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 132, 137.5, 136.5, 134.5, 140)" },
+        "mb_per_s": { "min": 4.1, "why": "the slowest round's over 1.5, 6.25 MB/s (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 6.70, 6.25, 6.47, 6.79, 6.30; the installed build's 5.93 to 6.36)" }
+      } },
+    { "name": "throughput-rgb", "kind": "action", "runs": 4, "what": "A writer printing 16 MB of Claude Code's look as fast as it can: 24-bit colours (dim and bright text, a diff's rows on a row-wide background, the boxes' borders) and the file paths its tools print, which Lachlan's hyperlink rules make links of, from the key that starts it to the first frame with its title saying it's done", "bug": "on a mux domain Claude Code's look shows at 1.7 to 1.8 MB/s where the GUI's own tab shows it at 6.3 to 6.8: the GUI pulling a busy pane's lines from its server (PERF.md, finding 24)",
+      "budgets": {
+        "ms": { "max": 19900, "why": "1.5 times the slowest round's median, 13207.2 ms (this stage's 2 rounds: 11997.1, 13207.2; the installed build's 25567.2, 27005.5); the mux domain's own cost, finding 24, the most of it" },
+        "p95_ms": { "max": 31800, "why": "1.5 times the slowest round's p95, 21185.5 ms (this stage's 2 rounds: 21185.5, 14607.7: one run in the first 21 s)" },
+        "gui_thread_ms": { "max": 5500, "why": "1.5 times the slowest round's median, 3605.9 ms (this stage's 2 rounds: 3268.0, 3605.9; the installed build's 16622.6, 15680.7)" },
+        "cpu_ms": { "max": 14200, "why": "1.5 times the slowest round's median, 9456.6 ms (this stage's 2 rounds: 8671.6, 9456.6; the installed build's 36032.2, 34176.1)" },
+        "server_cpu_ms": { "max": 11500, "why": "1.5 times the slowest round's median, 7645.3 ms (this stage's 2 rounds: 6982.2, 7645.3; the installed build's 30176.7, 29417.6)" },
+        "frames": { "max": 300, "why": "since main's perf/lbterm-layers and perf/key-latency a frame comes for each refresh it shows output at, where a mux pane's frames had fetched the scrollback for the prompt marks (findings 65 and 37): 1.5 times the slowest round's median, 198.5 (the merged build's 2 rounds, 2026-11-01: 99.5, 198.5; the installed build's 239.5, 288.5); before the merge 4 and 4" },
+        "mb_per_s": { "min": 1.1, "why": "the slowest round's over 1.5, 1.67 MB/s (this stage's 2 rounds: 1.84, 1.67; the installed build's 0.86, 0.82)" }
+      } },
+    { "name": "throughput-rgb-local", "kind": "action", "domain": "local", "runs": 4, "what": "The same, the tab the GUI's own",
+      "budgets": {
+        "ms": { "max": 4200, "why": "1.5 times the slowest round's median, 2781 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 2781, 2653, 2672, 2741, 2605; the installed build's 6,398 to 6,859: a 24-bit pen's block shared, not copied a character, lbterm/PERF.md, What printing costs)" },
+        "p95_ms": { "max": 4400, "why": "1.5 times the slowest round's p95, 2933 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 2923, 2894, 2836, 2933, 2710)" },
+        "gui_thread_ms": { "max": 1500, "why": "1.5 times the slowest round's median, 973.8 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 973.8, 848.3, 834.9, 939.2, 842.3; the installed build's 1,111 to 1,188)" },
+        "cpu_ms": { "max": 5800, "why": "1.5 times the slowest round's median, 3814 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 3805, 3621, 3664, 3814, 3548; the installed build's 7,570 to 8,305)" },
+        "frames": { "max": 200, "why": "a frame for each refresh it shows output at: 1.5 times the slowest round's median, 130.5 (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 129.5, 127.5, 122.5, 126.5, 130.5; the installed build's 148.5 to 155.5)" },
+        "mb_per_s": { "min": 5.2, "why": "the slowest round's over 1.5, 7.92 MB/s (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 7.92, 8.30, 8.24, 8.04, 8.45; the installed build's 3.21 to 3.44)" }
+      } },
+    { "name": "scrollback", "kind": "action", "runs": 3, "what": "100,032 lines of 80 columns printed into Lachlan's scrollback of 50,000 lines, to the first frame with the writer's title saying it's done: the memory the GUI and the server hold once it's full (the warm-up fills it), private_mb the GUI's and server_private_mb the server's",
+      "budgets": {
+        "ms": { "max": 7400, "why": "1.5 times the slowest round's median, 4936.3 ms (this stage's 2 rounds: 4245.9, 4936.3; the installed build's 4352.4, 5884.5): the mux domain's own, finding 24" },
+        "p95_ms": { "max": 7700, "why": "1.5 times the slowest round's p95, 5088.8 ms (this stage's 2 rounds: 4257.1, 5088.8)" },
+        "gui_thread_ms": { "max": 3800, "why": "1.5 times the slowest round's median, 2472.5 ms (this stage's 2 rounds: 1984.8, 2472.5)" },
+        "cpu_ms": { "max": 6500, "why": "1.5 times the slowest round's median, 4284.0 ms (this stage's 2 rounds: 3691.2, 4284.0)" },
+        "server_cpu_ms": { "max": 2700, "why": "1.5 times the slowest round's median, 1794.5 ms (this stage's 2 rounds: 1466.8, 1794.5; the installed build's 2135.5, 2870.7)" },
+        "frames": { "max": 14, "why": "since main's perf/lbterm-layers and perf/key-latency a frame comes for each refresh it shows output at, where a mux pane's frames had fetched the scrollback for the prompt marks (findings 65 and 37): 1.5 times the slowest round's median, 9 (the merged build's 2 rounds, 2026-11-01: 8, 9; the installed build's 40, 44); before the merge 4 and 4" },
+        "private_mb": { "max": 590, "why": "this stage's 552.4 and 544.3 MB with headroom (the installed build's 561.7 and 556.9): on a mux domain the GUI draws a few frames of it, so its caches hold little" },
+        "server_private_mb": { "max": 260, "why": "this stage's 224.0 and 223.0 MB with headroom (the installed build's 225.9 and 207.3): the server's scrollback of 50,000 lines" }
+      } },
+    { "name": "scrollback-local", "kind": "action", "domain": "local", "runs": 3, "what": "The same, the tab the GUI's own: its scrollback in the GUI process",
+      "budgets": {
+        "ms": { "max": 230, "why": "1.5 times the slowest round's median, 149 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 134.2, 125.8, 149, 123.5, 139.3; the installed build's 660 to 725)" },
+        "p95_ms": { "max": 260, "why": "1.5 times the slowest round's p95, 168.9 ms (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 142.2, 142.8, 153.3, 168.9, 145.4)" },
+        "gui_thread_ms": { "max": 100, "why": "1.5 times the slowest round's median, 64.3 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 46.1, 51.8, 64.3, 49.2, 50.4; the installed build's 171 to 223)" },
+        "cpu_ms": { "max": 260, "why": "1.5 times the slowest round's median, 167.3 ms at the nominal clock (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 139.5, 145, 167.3, 129.4, 142.3; the installed build's 841 to 964)" },
+        "frames": { "max": 14, "why": "1.5 times the slowest round's median, 9 (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched: 9, 9, 9, 8, 9; the installed build's 37 to 42)" },
+        "private_mb": { "max": 550, "why": "between this build's 530.6 to 533.2 MB and the installed build's 568.1 to 574.2 (2026-11-03's 5 rounds against the installed build, unlocked, the PC watched): the line caches' quads at upstream's size (BoxedQuad, lbterm/PERF.md, What printing costs); the installed build's 2.6 times upstream's would pass it" }
+      } }
+  ]
+}

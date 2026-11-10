@@ -125,6 +125,17 @@ mod test {
     use wezterm_font::shaper::PresentationWidth;
     use wezterm_font::{FontConfiguration, LoadedFont};
 
+    /// LBTerm: these tests take turns with the font stack, as the GUI thread does: each makes
+    /// fonts, shapes and swaps the global configuration, and side by side on the test harness's
+    /// threads they crashed the binary (bench_shaping reading 0xffffffffffffffff in the font
+    /// code, about one run in six once the check ran wezterm-gui's tests, 2026-11-10;
+    /// PITFALLS 149)
+    fn fonts_turn() -> std::sync::MutexGuard<'static, ()> {
+        static FONTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A test that failed holding it leaves it poisoned: the next takes it all the same
+        FONTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn cluster_and_shape(
         render_metrics: &RenderMetrics,
         glyph_cache: &mut GlyphCache,
@@ -188,11 +199,11 @@ mod test {
 
     #[test]
     fn ligatures_fira() {
+        let _turn = fonts_turn();
         config::use_test_configuration();
-        let _ = env_logger::Builder::new()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Trace)
-            .try_init();
+        // LBTerm: no logger of its own. Upstream's installed one at trace for the whole binary,
+        // so every test after it logged everything (wgpu on each surface op), which slowed the
+        // compositor's timing tests past their margins under the check's load (2026-11-10)
 
         let config = config::configuration();
 
@@ -257,6 +268,7 @@ mod test {
 
     #[test]
     fn bench_shaping() {
+        let _turn = fonts_turn();
         config::use_test_configuration();
 
         // let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128, &render_metrics).unwrap();
@@ -307,11 +319,11 @@ mod test {
 
     #[test]
     fn ligatures_jetbrains() {
+        let _turn = fonts_turn();
         config::use_test_configuration();
-        let _ = env_logger::Builder::new()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Trace)
-            .try_init();
+        // LBTerm: no logger of its own. Upstream's installed one at trace for the whole binary,
+        // so every test after it logged everything (wgpu on each surface op), which slowed the
+        // compositor's timing tests past their margins under the check's load (2026-11-10)
         let config = config::configuration();
 
         let fonts = Rc::new(

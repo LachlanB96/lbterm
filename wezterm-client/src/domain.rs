@@ -26,6 +26,14 @@ pub struct ClientInner {
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
+    /// LBTerm: the window titles the server has told us, which aren't sent back (titles.rs)
+    server_titles: crate::titles::ServerTitles,
+    /// LBTerm: what the windows show, said to the server (lbterm_shown.rs)
+    pub lbterm_shown: crate::lbterm_shown::Shown,
+    /// LBTerm: the server has answered GetParkedTabs on this connection, so its tabs can be
+    /// parked (lbterm/MUX.md, "Parked tabs"); false on a new connection until it has, and for good
+    /// on a server of an older build
+    lbterm_parks: std::sync::atomic::AtomicBool,
 }
 
 impl ClientInner {
@@ -107,6 +115,15 @@ impl ClientInner {
             }
         }
         None
+    }
+
+    /// LBTerm: drop a remote window's mapping once the server has no such window (spawn)
+    fn forget_remote_window(&self, remote_window_id: WindowId) {
+        self.remote_to_local_window
+            .lock()
+            .unwrap()
+            .remove(&remote_window_id);
+        self.server_titles.forget(remote_window_id);
     }
 
     fn local_to_remote_window(&self, local_window_id: WindowId) -> Option<WindowId> {
@@ -246,7 +263,57 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             focused_remote_pane_id: Mutex::new(None),
+            server_titles: Default::default(),
+            lbterm_shown: Default::default(),
+            lbterm_parks: Default::default(),
         }
+    }
+
+    /// LBTerm: the server's answer to GetParkedTabs, `tabs` its parked ones: this connection's
+    /// tabs can be parked, and each local tab of the server's takes its flag from the answer.
+    /// On the GUI thread, outside any notification, the map let go before a flag is set (a
+    /// park notifies, and the domain's subscriber reads the map)
+    fn lbterm_parked_tabs(&self, tabs: &[TabId]) {
+        self.lbterm_parks
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let pairs: Vec<(TabId, TabId)> = self
+            .remote_to_local_tab
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&remote, &local)| (remote, local))
+            .collect();
+        let mux = Mux::get();
+        for (remote, local) in pairs {
+            if let Some(tab) = mux.get_tab(local) {
+                tab.lbterm_set_parked(tabs.contains(&remote));
+            }
+        }
+    }
+
+    /// LBTerm: which of the server's tabs are parked, asked once its panes are mapped (after
+    /// each listing: an attach, a reconnect, a resync), the answer setting the local tabs'
+    /// flags. Its answer is waited for whatever comes: a dropped receiver detaches the domain
+    /// (PITFALLS 171). An older server's answer leaves the connection unable to park
+    fn lbterm_ask_parked(self: Arc<Self>) {
+        promise::spawn::spawn(async move {
+            match self.client.get_parked_tabs(codec::GetParkedTabs {}).await {
+                // On the GUI thread (a local task, as the listing's), outside any notification
+                Ok(answer) => self.lbterm_parked_tabs(&answer.tabs),
+                Err(err) => {
+                    let err = format!("{err:#}");
+                    if codec::lacks_parked_tabs(&err) {
+                        log::info!(
+                            "parked: domain {}'s server can't park tabs (an older build)",
+                            self.local_domain_id
+                        );
+                    } else {
+                        log::warn!("parked: domain {}: {err}", self.local_domain_id);
+                    }
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -255,6 +322,8 @@ pub struct ClientDomain {
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
     local_domain_id: DomainId,
+    /// LBTerm: resyncs one at a time, shared by those asking meanwhile (coalesce.rs)
+    resyncs: crate::coalesce::Coalesced,
 }
 
 async fn update_remote_workspace(
@@ -280,6 +349,20 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
     match notif {
         MuxNotification::ActiveWorkspaceChanged(_client_id) => {
             // TODO: advice remote host of interesting workspaces
+            // LBTerm: another workspace's windows are the ones drawn
+            lbterm_mark_shown(client_domain, local_domain_id);
+        }
+        // LBTerm: what a window shows may have changed: a tab switched, added, closed or moved
+        // (WindowInvalidated), a zoom, a split or a pane closed (TabResized), a new tab or a pane
+        // moved to one (TabAddedToWindow), a window made or gone. Nothing is worked out here,
+        // under the subscribers' lock and maybe a window's write guard (lbterm_shown.rs)
+        MuxNotification::WindowInvalidated(_)
+        | MuxNotification::TabResized(_)
+        | MuxNotification::TabAddedToWindow { .. }
+        | MuxNotification::WindowCreated(_)
+        | MuxNotification::WindowRemoved(_)
+        | MuxNotification::PaneRemoved(_) => {
+            lbterm_mark_shown(client_domain, local_domain_id);
         }
         MuxNotification::WorkspaceRenamed {
             old_workspace,
@@ -302,6 +385,9 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
             }
         }
         MuxNotification::WindowWorkspaceChanged(window_id) => {
+            // LBTerm: a window moved into or out of the active workspace shows its tab, or no
+            // longer does (lbterm_shown.rs); the mark only queues a task, as below
+            lbterm_mark_shown(client_domain, local_domain_id);
             // Mux::get_window() may trigger a borrow error if called
             // immediately; defer the bulk of this work.
             // <https://github.com/wezterm/wezterm/issues/2638>
@@ -354,12 +440,14 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
                 }
             }
         }
-        MuxNotification::WindowTitleChanged {
-            window_id,
-            title: _,
-        } => {
+        MuxNotification::WindowTitleChanged { window_id, title } => {
             if let Some(remote_window_id) = client_domain.local_to_remote_window_id(window_id) {
                 if let Some(inner) = client_domain.inner() {
+                    // LBTerm: a title the server gave this window, set here as it came, goes
+                    // nowhere: the server has it (titles.rs)
+                    if inner.server_titles.is_theirs(remote_window_id, &title) {
+                        return true;
+                    }
                     promise::spawn::spawn_into_main_thread(async move {
                         // De-bounce the title propagation.
                         // There is a bit of a race condition with these async
@@ -373,8 +461,13 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
                         if let Some(mux) = Mux::try_get() {
                             let title = mux
                                 .get_window(window_id)
-                                .map(|win| win.get_title().to_string());
-                            if let Some(title) = title {
+                                // LBTerm: through the title the server gave, kept until a take
+                                // sets it (mux's lbterm_window_titles)
+                                .map(|win| mux::lbterm_window_titles::title(&win));
+                            // LBTerm: unless the server has given it since
+                            if let Some(title) = title.filter(|title| {
+                                !inner.server_titles.is_theirs(remote_window_id, title)
+                            }) {
                                 inner
                                     .client
                                     .set_window_title(codec::WindowTitleChanged {
@@ -395,6 +488,79 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
     true
 }
 
+/// LBTerm: a change of what a window shows may have come: the task that says what they show
+/// queued on the GUI thread, once until it runs (lbterm_shown.rs)
+fn lbterm_mark_shown(client_domain: &ClientDomain, local_domain_id: DomainId) {
+    if let Some(inner) = client_domain.inner() {
+        if inner.lbterm_shown.mark() {
+            promise::spawn::spawn_into_main_thread(async move {
+                lbterm_say_shown(local_domain_id);
+            })
+            .detach();
+        }
+    }
+}
+
+/// LBTerm: `lbterm_mark_shown` for the domain `local_domain_id`, once it's connected
+fn lbterm_mark_shown_of(local_domain_id: DomainId) {
+    if let Some(domain) = Mux::get().get_domain(local_domain_id) {
+        if let Some(domain) = domain.downcast_ref::<ClientDomain>() {
+            lbterm_mark_shown(domain, local_domain_id);
+        }
+    }
+}
+
+/// LBTerm: what this domain's windows show, sent to its server when it's news to it
+/// (SetShownPanes, lbterm_shown.rs). On the GUI thread, outside any notification
+fn lbterm_say_shown(local_domain_id: DomainId) {
+    let Ok(inner) = ClientDomain::get_client_inner_for_domain(local_domain_id) else {
+        return;
+    };
+    let Some(say) = inner
+        .lbterm_shown
+        .to_say(lbterm_shown_panes(&Mux::get(), local_domain_id))
+    else {
+        return;
+    };
+    log::debug!(
+        target: "lbterm::shown",
+        "domain {local_domain_id}: the windows show {:?}",
+        say.pdu.panes.iter().map(|p| p.pane_id).collect::<Vec<_>>()
+    );
+    // Its answer is waited for whatever comes: a dropped receiver detaches the domain
+    // (PITFALLS 171)
+    promise::spawn::spawn(async move {
+        let answer = inner
+            .client
+            .set_shown_panes(say.pdu)
+            .await
+            .map(|_| ())
+            .map_err(|err| format!("{err:#}"));
+        inner.lbterm_shown.answered(say.connection, answer);
+    })
+    .detach();
+}
+
+/// LBTerm: the server's ids of this domain's panes that a window shows: each of the active
+/// workspace's windows' active tab, a zoomed tab's zoomed pane alone (`iter_panes`)
+fn lbterm_shown_panes(mux: &Mux, local_domain_id: DomainId) -> Vec<PaneId> {
+    let mut panes = vec![];
+    for window_id in mux.iter_windows_in_workspace(&mux.active_workspace()) {
+        let Some(tab) = mux.get_active_tab_for_window(window_id) else {
+            continue;
+        };
+        for pos in tab.iter_panes() {
+            if pos.pane.domain_id() != local_domain_id {
+                continue;
+            }
+            if let Some(pane) = pos.pane.downcast_ref::<ClientPane>() {
+                panes.push(pane.remote_pane_id());
+            }
+        }
+    }
+    panes
+}
+
 impl ClientDomain {
     pub fn new(config: ClientDomainConfig) -> Self {
         let local_domain_id = alloc_domain_id();
@@ -405,6 +571,7 @@ impl ClientDomain {
             label,
             inner: Mutex::new(None),
             local_domain_id,
+            resyncs: Default::default(),
         }
     }
 
@@ -465,27 +632,145 @@ impl ClientDomain {
     /// the set of tabs since we were connected, so we need to re-sync.
     pub async fn reattach(domain_id: DomainId, ui: ConnectionUI) -> anyhow::Result<()> {
         let inner = Self::get_client_inner_for_domain(domain_id)?;
+        // LBTerm: nothing is said on the new connection yet of what the windows show, and its
+        // server may be another build (lbterm_shown.rs)
+        inner.lbterm_shown.connected();
+        // LBTerm: and its server may be another build, which may not park (lbterm/MUX.md,
+        // "Parked tabs"): unable until the listing's GetParkedTabs is answered
+        inner
+            .lbterm_parks
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // LBTerm: the server knows a new connection by nothing until it says
+        // who it is, as attach does through the version check (SetClientId).
+        // Without it `lbterm cli list-clients` leaves the window out, and
+        // Terminal's terminal.ahk, APCommand and ai.js find the focused pane
+        // through that list
+        inner.client.verify_version_compat(&ui).await?;
 
         let panes = inner.client.list_panes().await?;
-        Self::process_pane_list(inner, panes, None)?;
+        Self::process_pane_list(Arc::clone(&inner), panes, None)?;
+        // LBTerm: and what the windows show, said once the panes are mapped
+        lbterm_mark_shown_of(domain_id);
+        // LBTerm: what the old connection's word set ends with it: a pane it said it held has
+        // its push asked of this one, any build's, which holds and owes nothing for it yet
+        // (ClientPane::lbterm_reconnected; lbterm/MUX.md, "Tabs out of view: output held at the
+        // server")
+        for pane in Mux::get().iter_panes() {
+            if pane.domain_id() != domain_id {
+                continue;
+            }
+            if let Some(pane) = pane.downcast_ref::<ClientPane>() {
+                pane.lbterm_reconnected();
+            }
+        }
+
+        // LBTerm: and which pane has the keyboard, which the server only
+        // hears when the focus moves
+        let focused = *inner.focused_remote_pane_id.lock().unwrap();
+        if let Some(pane_id) = focused {
+            inner
+                .client
+                .set_focused_pane_id(codec::SetFocusedPane { pane_id })
+                .await
+                .ok();
+        }
 
         ui.close();
         Ok(())
     }
 
+    /// Lists the server's panes and brings the local tabs in line. LBTerm: one at a time, a
+    /// caller that comes while one runs waiting for the next, which lists after it asked
+    /// (crate::coalesce): a new tab used to bring two to four at once
     pub async fn resync(&self) -> anyhow::Result<()> {
-        if let Some(inner) = self.inner() {
-            let panes = inner.client.list_panes().await?;
-            Self::process_pane_list(inner, panes, None)?;
-        }
-        Ok(())
+        self.resyncs
+            .run(move || async move {
+                if let Some(inner) = self.inner() {
+                    let panes = inner.client.list_panes().await?;
+                    Self::process_pane_list(inner, panes, None)?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     pub fn process_remote_window_title_change(&self, remote_window_id: WindowId, title: String) {
         if let Some(inner) = self.inner() {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
+                // LBTerm: heard first, so the notification set_title makes isn't sent back
+                inner.server_titles.heard(remote_window_id, &title);
                 if let Some(mut window) = Mux::get().get_window_mut(local_window_id) {
                     window.set_title(&title);
+                }
+                // LBTerm: no longer kept, unless a newer one came meanwhile (lbterm_titles.rs)
+                mux::lbterm_window_titles::set(local_window_id, &title);
+            }
+        }
+    }
+
+    /// LBTerm: the server's newest `title` for its window `remote_window_id` kept where any thread
+    /// reads it, noted as theirs so it isn't sent back (titles.rs), and not set on the window: the
+    /// next take sets it (lbterm_titles.rs). False for a window this domain doesn't know yet,
+    /// which goes the GUI way and resyncs
+    pub(crate) fn lbterm_window_title_kept(&self, remote_window_id: WindowId, title: &str) -> bool {
+        let Some(inner) = self.inner() else {
+            return false;
+        };
+        let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) else {
+            return false;
+        };
+        inner.server_titles.heard(remote_window_id, title);
+        mux::lbterm_window_titles::keep(local_window_id, title);
+        true
+    }
+
+    /// LBTerm: whether this domain's tabs can be parked: its server has answered GetParkedTabs on
+    /// the connection it has now (lbterm/MUX.md, "Parked tabs")
+    pub fn lbterm_can_park(&self) -> bool {
+        self.inner().map_or(false, |inner| {
+            inner
+                .lbterm_parks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    /// LBTerm: park or unpark local tab `local_tab_id` of this domain: asked of its server,
+    /// whose word back (TabParked) sets the local tab, so nothing heard goes back (PITFALLS
+    /// 159). Nothing on a connection whose server can't park
+    pub fn lbterm_park(&self, local_tab_id: TabId, parked: bool) {
+        let Some(inner) = self.inner() else {
+            return;
+        };
+        if !inner
+            .lbterm_parks
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::info!("parked: domain {}'s server can't park tabs", self.local_domain_id);
+            return;
+        }
+        let Some(tab_id) = inner.local_to_remote_tab(local_tab_id) else {
+            log::warn!("parked: local tab {local_tab_id} has no tab at the server");
+            return;
+        };
+        promise::spawn::spawn(async move {
+            if let Err(err) = inner
+                .client
+                .set_tab_parked(codec::TabParked { tab_id, parked })
+                .await
+            {
+                log::error!("parked: tab {tab_id} at the server: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// LBTerm: the server's word that its tab `remote_tab_id` was parked or unparked
+    pub fn lbterm_remote_tab_parked(&self, remote_tab_id: TabId, parked: bool) {
+        if let Some(inner) = self.inner() {
+            if let Some(local_tab_id) = inner.remote_to_local_tab_id(remote_tab_id) {
+                if let Some(tab) = Mux::get().get_tab(local_tab_id) {
+                    tab.lbterm_set_parked(parked);
                 }
             }
         }
@@ -545,13 +830,20 @@ impl ClientDomain {
 
             if let Some((remote_window_id, remote_tab_id)) = tabroot.window_and_tab_ids() {
                 let tab;
+                // LBTerm: the size of a tab the GUI had already, which its window gave it, and
+                // whether a pane of it has a Resize the server hasn't answered (lbterm_sizes.rs)
+                let mut local_size = None;
 
                 remote_windows_to_forget.remove(&remote_window_id);
                 remote_tabs_to_forget.remove(&remote_tab_id);
 
                 if let Some(tab_id) = inner.remote_to_local_tab_id(remote_tab_id) {
                     match mux.get_tab(tab_id) {
-                        Some(t) => tab = t,
+                        Some(t) => {
+                            let out = crate::pane::lbterm_sizes::tab_unanswered(&t);
+                            local_size = Some((t.get_size(), out));
+                            tab = t
+                        }
                         None => {
                             // We likely decided that we hit EOF on the tab and
                             // removed it from the mux.  Let's add it back, but
@@ -577,7 +869,9 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
-                tab.sync_with_pane_tree(root_size, tabroot, |entry| {
+                // LBTerm: the server's sizes, taken without being sent back to it
+                // (pane/lbterm_sizes.rs)
+                let sync = || tab.sync_with_pane_tree(root_size, tabroot, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
                     if let Some(pane_id) = inner.remote_to_local_pane_id(entry.pane_id) {
@@ -617,6 +911,27 @@ impl ClientDomain {
                         pane
                     }
                 });
+                crate::pane::lbterm_sizes::from_server(sync);
+                // LBTerm: then the size the window gave the tab, put back without being sent,
+                // when the listing is older than a Resize of the window's the server hasn't
+                // answered yet: the server gets there by itself and says so. With none out, the
+                // server's size is the tab's, as upstream took it (lbterm_sizes.rs)
+                if let Some((size, out)) = local_size {
+                    if size != root_size {
+                        let keep = crate::pane::lbterm_sizes::keeps_its_own(&size, &root_size, out);
+                        log::debug!(
+                            target: "lbterm::resize",
+                            "resync: tab {} {} {:?} over {:?}",
+                            tab.tab_id(),
+                            if keep { "keeps its own, a Resize out:" } else { "takes the server's" },
+                            if keep { size } else { root_size },
+                            if keep { root_size } else { size }
+                        );
+                        if keep {
+                            crate::pane::lbterm_sizes::from_server(|| tab.resize(size));
+                        }
+                    }
+                }
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
                     let mut window = mux
@@ -671,6 +986,7 @@ impl ClientDomain {
 
         for (remote_window_id, window_title) in panes.window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
+                inner.server_titles.heard(remote_window_id, &window_title);
                 let mut window = mux
                     .get_window_mut(local_window_id)
                     .expect("no such window!?");
@@ -703,6 +1019,10 @@ impl ClientDomain {
                 panes.remove(&p);
             }
         }
+
+        // LBTerm: and which of its tabs are parked, now each is mapped: a tab parked before this
+        // listing mapped it had its word dropped (lbterm/MUX.md, "Parked tabs")
+        inner.lbterm_ask_parked();
 
         Ok(())
     }
@@ -821,23 +1141,72 @@ impl Domain for ClientDomain {
         command_dir: Option<String>,
         window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
+        self.lbterm_spawn_activating(size, command, command_dir, window, true)
+            .await
+    }
+
+    /// LBTerm: a spawn that leaves the window where it was (`activate` false) asks the server
+    /// with SpawnNoActivate, as `lbterm cli spawn --no-activate` does, so the server's window
+    /// stays on its tab as well as this one (Lua's `spawn_tab { activate = false }`, the new-tab
+    /// picker's Shift+Enter). A server that doesn't know it says so, and nothing opens.
+    async fn lbterm_spawn_activating(
+        &self,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        window: WindowId,
+        activate: bool,
+    ) -> anyhow::Result<Arc<Tab>> {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
         let workspace = Mux::get().active_workspace();
 
-        let result = inner
-            .client
-            .spawn_v2(SpawnV2 {
-                domain: SpawnTabDomain::DefaultDomain,
-                window_id: inner.local_to_remote_window(window),
-                size,
-                command,
-                command_dir,
-                workspace,
-            })
-            .await?;
+        let remote_window = inner.local_to_remote_window(window);
+        let spawn_v2 = |window_id| SpawnV2 {
+            domain: SpawnTabDomain::DefaultDomain,
+            window_id,
+            size,
+            command: command.clone(),
+            command_dir: command_dir.clone(),
+            workspace: workspace.clone(),
+        };
+        let client = &inner.client;
+        let send = |spawn: SpawnV2| async move {
+            if activate {
+                client.spawn_v2(spawn).await
+            } else {
+                client
+                    .spawn_no_activate(codec::SpawnNoActivate { spawn })
+                    .await
+            }
+        };
+        let result = match send(spawn_v2(remote_window)).await {
+            Ok(result) => result,
+            // LBTerm: the server drops a window with its last tab, while the GUI can keep the
+            // window on for a new tab (wezterm-gui's termwindow/last_tab.rs, mux's lbterm_keep.rs).
+            // When the server has no such window any more, a new one there stands for this one.
+            Err(err) => match remote_window {
+                Some(gone)
+                    if !inner
+                        .client
+                        .list_panes()
+                        .await?
+                        .tabs
+                        .iter()
+                        .any(|t| t.window_and_tab_ids().map(|(w, _)| w) == Some(gone)) =>
+                {
+                    log::info!(
+                        "spawn: the server has no window {gone} any more; \
+                         a new one there for local window {window}"
+                    );
+                    inner.forget_remote_window(gone);
+                    send(spawn_v2(None)).await?
+                }
+                _ => return Err(err),
+            },
+        };
 
         inner.record_remote_to_local_window_mapping(result.window_id, window);
 
@@ -985,7 +1354,10 @@ impl Domain for ClientDomain {
                     "Server has {} tabs.  Attaching to local UI...\n",
                     panes.tabs.len()
                 ));
-                ClientDomain::finish_attach(domain_id, client, panes, window_id)
+                ClientDomain::finish_attach(domain_id, client, panes, window_id)?;
+                // LBTerm: what the windows show, said once the panes are mapped (lbterm_shown.rs)
+                lbterm_mark_shown_of(domain_id);
+                Ok(())
             }
         })
         .await

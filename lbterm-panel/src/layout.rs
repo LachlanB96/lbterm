@@ -79,6 +79,10 @@ const LABEL_GAP: f32 = 3.0;
 const LABEL_INSET: f32 = 2.0;
 /// The turning arc's square, on a pad's top right corner
 const SPINNER: f32 = 12.0;
+/// The disc of a tab hidden from the Conductor's mark, on a pad's bottom right corner, and the
+/// eye-off glyph on it (lbterm/NEW-TAB.md, section 8)
+const HIDDEN_DISC: f32 = 12.0;
+pub const HIDDEN_GLYPH: f32 = 10.0;
 /// The open tab's bar down the rail's left edge, beside its pill: this wide,
 /// this far in from the ring, and this much shorter than the pill at each end
 const EDGE_BAR_W: f32 = 3.0;
@@ -95,8 +99,31 @@ const SPOT_CORE: f32 = 10.0;
 /// Between the Conductor's slot and the first tab's, more than between two tabs: room for the
 /// hairline rule that keeps them apart
 const HEAD_GAP: f32 = 7.0;
+/// Tab links' lines down the rail's left edge (lbterm_extras::links): at most this many side by
+/// side, between the open tab's bar and the pills, a link finding none free sharing the last
+pub const LINK_LANES: usize = 3;
+/// From the pills to the first lane, and between lanes
+const LINK_LANE_GAP: f32 = 3.0;
+const LINK_WIDTH: f32 = 2.0;
+/// The mark at each end of a link, and how far left of the pad its middle is: clear of the orange
+/// ring round a pad that asks something too (its first try at 5 ran into it)
+const LINK_END: f32 = 6.0;
+const LINK_END_IN: f32 = 7.0;
 /// The mark on the Conductor's pad for its remote control, on the pad's top right corner
 const HEAD_MARK: f32 = 10.0;
+/// The badge on the Conductor's pad counting the tab connections suggested on its rail, on the
+/// pad's top left corner, its count in the pads' numbers' font: this share of that font's line
+/// tall (14 px for Lachlan's 9 pt at 96 DPI), its words this far in from each end, and this far
+/// clear of the remote control's mark
+const HEAD_BADGE_LINE: f32 = 0.875;
+const HEAD_BADGE_INSET: f32 = 2.0;
+const HEAD_BADGE_GAP: f32 = 1.0;
+/// The new-tab pad at the rail's foot (lbterm/DESIGN.md, "The + pad"): a pill this big, the label
+/// pill's corners, centred on the pads; the + in it, two strokes this long and this wide
+const FOOT_W: f32 = 42.0;
+const FOOT_H: f32 = 30.0;
+const PLUS: f32 = 12.0;
+const PLUS_STROKE: f32 = 1.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
@@ -118,8 +145,13 @@ pub struct Layout {
     pub rows: usize,
     /// The labels under the pads, their lines together; 0 without labels
     pub label: f32,
+    /// One of a label's lines: rows give their labels' lines up one at a time, before any tab
+    /// leaves the rail ([`Layout::label_lines`]). 0 keeps the label whole
+    pub label_line: f32,
     /// A slot above the tabs' for the Conductor's pad (lbterm_extras::conductor)
     pub head: bool,
+    /// The new-tab pad, fixed at the rail's foot (`lbterm_tab_panel.new_tab`)
+    pub foot: bool,
 }
 
 impl Layout {
@@ -220,17 +252,60 @@ impl Layout {
         x >= self.left && x < right && y >= self.body_top && y < self.bottom
     }
 
-    /// Under a pad, the label and the gap above it; nothing without labels.
-    fn label_block(&self) -> f32 {
-        if self.label > 0.0 {
-            self.px(LABEL_GAP) + self.label
+    /// How many lines a label takes as the config asks: none without labels, one when its lines
+    /// aren't known apart
+    fn lines_wanted(&self) -> usize {
+        if self.label <= 0.0 {
+            0
+        } else if self.label_line > 0.0 {
+            (self.label / self.label_line).round().max(1.0) as usize
         } else {
-            0.0
+            1
         }
     }
 
+    /// A label of `lines` lines under a pad, the gap above it included; nothing without labels
+    /// or lines
+    fn label_block_of(&self, lines: usize) -> f32 {
+        if self.label <= 0.0 || lines == 0 {
+            return 0.0;
+        }
+        let h = if self.label_line > 0.0 { lines as f32 * self.label_line } else { self.label };
+        self.px(LABEL_GAP) + h
+    }
+
+    /// How many lines each label shows (lbterm/DESIGN.md, "The + pad"): all of them while every
+    /// row fits at its least with them, else one fewer at a time, down to none, before any tab
+    /// leaves the rail. The open panel names every tab whatever this says. With `label_line` 0 the
+    /// label is kept whole.
+    pub fn label_lines(&self) -> usize {
+        let want = self.lines_wanted();
+        let slots = self.rows + self.head as usize;
+        if slots == 0 || self.label_line <= 0.0 {
+            return want;
+        }
+        let room = self.list_room();
+        (0..=want)
+            .rev()
+            .find(|&n| slots as f32 * (self.px(ROW_MIN) + self.label_block_of(n)) <= room)
+            .unwrap_or(0)
+    }
+
+    /// Under a pad, the label as many lines as it shows and the gap above it; nothing without
+    /// labels.
+    fn label_block(&self) -> f32 {
+        self.label_block_of(self.label_lines())
+    }
+
+    /// The room down the rail for the Conductor's slot and the tabs' rows: inside the ring, less
+    /// the gap under the Conductor's slot and the new-tab pad's at the foot
+    fn list_room(&self) -> f32 {
+        self.panel(false).h - 2.0 * (self.stroke() + self.px(LIST_PAD)) - self.head_gap() - self.foot_block()
+    }
+
     /// Each row's height: as tall as they come when there's room, shrinking
-    /// to fit more tabs. The Conductor's slot is a row too.
+    /// to fit more tabs. The Conductor's slot is a row too, and the new-tab pad's room at the
+    /// foot is kept, so it never falls off.
     pub fn row_height(&self) -> f32 {
         let label = self.label_block();
         let (min, max) = (self.px(ROW_MIN) + label, self.px(ROW_MAX) + label);
@@ -238,8 +313,16 @@ impl Layout {
         if slots == 0 {
             return max;
         }
-        let room = self.panel(false).h - 2.0 * (self.stroke() + self.px(LIST_PAD)) - self.head_gap();
-        (room / slots as f32).floor().clamp(min, max)
+        (self.list_room() / slots as f32).floor().clamp(min, max)
+    }
+
+    /// The new-tab pad's room at the foot: its pill and the gap with the rule above it
+    fn foot_block(&self) -> f32 {
+        if self.foot {
+            self.px(FOOT_H) + self.px(HEAD_GAP)
+        } else {
+            0.0
+        }
     }
 
     /// The extra room between the Conductor's slot and the tabs, without one none
@@ -294,15 +377,90 @@ impl Layout {
         Area::new(panel.x, self.top_row() - above, panel.w, self.row_height())
     }
 
-    /// Whether row `i` is on screen at all.
+    /// Whether row `i` is on screen at all: above the new-tab pad's rule when it's there.
     pub fn row_visible(&self, i: usize) -> bool {
         let (y, h) = self.row_band(i);
-        let panel = self.panel(false);
-        i < self.rows && y + h <= panel.bottom() - self.stroke()
+        let end = if self.foot {
+            self.foot_rule().y
+        } else {
+            self.panel(false).bottom() - self.stroke()
+        };
+        i < self.rows && y + h <= end
     }
 
-    /// The middle of the rail, where the pads line up.
-    fn column(&self) -> f32 {
+    /// How many tabs the rail has no room for: past rows at their least with no label lines,
+    /// the new-tab pad's rule says "+N" so no tab is cut without a word
+    pub fn hidden(&self) -> usize {
+        (0..self.rows).rev().take_while(|&i| !self.row_visible(i)).count()
+    }
+
+    /// The new-tab pad (lbterm/DESIGN.md, "The + pad"): a pill at the rail's foot, centred on the
+    /// pads, its bottom a list's pad above the ring's inside. It never moves.
+    pub fn foot_pill(&self) -> Area {
+        let (w, h) = (self.px(FOOT_W), self.px(FOOT_H));
+        let bottom = self.panel(false).bottom() - self.stroke() - self.px(LIST_PAD);
+        Area::new(self.column() - (w / 2.0).round(), (bottom - h).round(), w, h)
+    }
+
+    /// The new-tab pad's corners: the label pill's
+    pub fn foot_radius(&self) -> f32 {
+        self.px(LABEL_PILL_RADIUS)
+    }
+
+    /// The + in the new-tab pad: a stroke across and one down, crossing at its middle
+    pub fn plus(&self) -> [Area; 2] {
+        let pill = self.foot_pill();
+        let (len, w) = (self.px(PLUS), PLUS_STROKE * self.scale);
+        let (cx, cy) = (pill.x + pill.w / 2.0, pill.y + pill.h / 2.0);
+        [
+            Area::new(cx - len / 2.0, cy - w / 2.0, len, w),
+            Area::new(cx - w / 2.0, cy - len / 2.0, w, len),
+        ]
+    }
+
+    /// The hairline over the new-tab pad, the Conductor's rule's grey: across the middle of the
+    /// rail, 80% of the pad's width, halfway between the last row's pill and the pad's
+    pub fn foot_rule(&self) -> Area {
+        let pill = self.foot_pill();
+        let above = pill.y - self.px(HEAD_GAP);
+        let half = (pill.w / 2.0 * 0.8).round();
+        let h = self.stroke();
+        Area::new(self.column() - half, ((above + pill.y - h) / 2.0).round(), 2.0 * half, h)
+    }
+
+    /// The new-tab pad's row on the open panel, from its pill on, as a tab's
+    pub fn foot_highlight(&self) -> Area {
+        self.highlight_from(self.foot_pill())
+    }
+
+    /// Where the new-tab pad's words go on the open panel
+    pub fn foot_text(&self) -> Area {
+        self.text_beside(self.foot_pill())
+    }
+
+    /// Where a press on the new-tab pad lands: the pad's slot across the rail (the open panel's
+    /// width while it's open) from the rule down. With the window maximized (`corner`: the
+    /// window's last pixel row) it runs on to the window's left edge and its last row, so a flick
+    /// into the screen's corner lands on it; otherwise it stops at the window's edge inside its
+    /// border, where Windows' resize border begins.
+    pub fn foot_zone(&self, open: bool, corner: Option<f32>) -> Area {
+        let top = self.foot_rule().y;
+        let right = self.panel(open).right() + self.gap();
+        let (left, bottom) = match corner {
+            Some(last) => (self.left.min(0.0), last.max(self.bottom)),
+            None => (self.left, self.bottom),
+        };
+        Area::new(left, top, right - left, (bottom - top).max(0.0))
+    }
+
+    /// Whether a point is on the new-tab pad's zone
+    pub fn foot_at(&self, x: f32, y: f32, open: bool, corner: Option<f32>) -> bool {
+        self.foot && self.foot_zone(open, corner).contains(x, y)
+    }
+
+    /// The middle of the rail, where the pads line up: the window strip's InMail button is
+    /// centred over it too.
+    pub fn column(&self) -> f32 {
         (self.panel(false).x + self.rail / 2.0).round()
     }
 
@@ -359,6 +517,23 @@ impl Layout {
         Area::new(cx - half, cy - half, 2.0 * half, 2.0 * half)
     }
 
+    /// The badge on the Conductor's pad counting the tab connections suggested on its rail
+    /// (lbterm/LINKS.md, "Connections"; his E8), for words `w` wide in a font whose lines are
+    /// `line` tall, the pads' numbers' (his "use a bigger one", 2026-11-01): a pill on the pad's
+    /// top left corner, as the remote control's mark sits on its top right, a disc for one digit,
+    /// growing to the right for more, its left end staying inside the pad's pill and its right
+    /// short of the mark, its words nearer its ends where they'd reach it. Until 2026-11-02 it was
+    /// 11 px across at 96 DPI with the count in the labels' 7 pt font, whose 1 came out half-toned
+    pub fn head_badge(&self, w: f32, line: f32) -> Area {
+        let pad = self.head_pad();
+        let h = (line * HEAD_BADGE_LINE).round().max(1.0);
+        let (cx, cy) = (pad.x + self.px(2.0), pad.y);
+        let left = (cx - h / 2.0).max(self.head_pill().x + self.px(1.0)).round();
+        let room = (self.head_mark().x - self.px(HEAD_BADGE_GAP) - left).floor();
+        let width = (w + 2.0 * self.px(HEAD_BADGE_INSET)).round().min(room).max(h).max(w.ceil());
+        Area::new(left, (cy - h / 2.0).round(), width, h)
+    }
+
     /// The hairline between the Conductor's slot and the tabs: across the middle of the rail,
     /// halfway between their pills
     pub fn head_rule(&self) -> Area {
@@ -410,11 +585,26 @@ impl Layout {
     }
 
     fn label_under(&self, pad: Area) -> Area {
-        if self.label <= 0.0 {
+        let block = self.label_block();
+        if block <= 0.0 {
             return Area::new(pad.x, pad.bottom(), 0.0, 0.0);
         }
         let half = self.pill_half() - self.px(LABEL_INSET);
-        Area::new(self.column() - half, pad.bottom() + self.px(LABEL_GAP), 2.0 * half, self.label)
+        Area::new(self.column() - half, pad.bottom() + self.px(LABEL_GAP), 2.0 * half, block - self.px(LABEL_GAP))
+    }
+
+    /// What covers row `i`'s label while the panel is open (Lachlan's 12a, lbterm/NEW-TAB.md,
+    /// "Landing 4"), in the pill's colour on the open parts' surface: the label's room, a pixel
+    /// wider either side for the glyphs' soft edges (still inside the pill: the room is
+    /// `LABEL_INSET` in from it) and a pixel below. Its top is the room's, the gap under the pad
+    /// left alone, where the hidden mark's disc ends. None while the rows show no label line.
+    pub fn label_cover(&self, i: usize) -> Option<Area> {
+        let room = self.label(i);
+        if room.h <= 0.0 || room.w <= 0.0 {
+            return None;
+        }
+        let edge = self.px(1.0);
+        Some(Area::new(room.x - edge, room.y, room.w + 2.0 * edge, room.h + edge))
     }
 
     /// Row `i`'s highlight on the open panel, from the pill on, ending short
@@ -490,6 +680,17 @@ impl Layout {
         Area::new(text.x, self.pill(i).bottom() - h - self.px(3.0), text.w, h)
     }
 
+    /// Subagent `k` of `n`'s bar in row `i` (the hub's guesses): side by side, a gap between
+    /// each, along the line over the program's bar when the row has one (`over`), else on its line.
+    pub fn agent_bar(&self, i: usize, k: usize, n: usize, over: bool) -> Area {
+        let main = self.progress_bar(i);
+        let gap = self.px(4.0);
+        let n = n.max(1) as f32;
+        let w = ((main.w - gap * (n - 1.0)) / n).floor().max(0.0);
+        let y = if over { main.y - main.h - self.px(2.0) } else { main.y };
+        Area::new(main.x + k as f32 * (w + gap), y, w, main.h)
+    }
+
     /// The turning arc on row `i`'s pad while its program waits on tasks of
     /// its own: a square centred on the pad's top right corner, the arc and
     /// the disc of the panel's colour behind it inside, so it reads apart
@@ -501,12 +702,56 @@ impl Layout {
         Area::new(cx - half, cy - half, 2.0 * half, 2.0 * half)
     }
 
+    /// The mark of a tab hidden from the Conductor: a disc on row `i`'s pad's bottom right
+    /// corner, centred as the turning arc's square is on the top right (the top right is the
+    /// arc's and the unread dot's, and the links' marks are left of the pad), for the eye-off
+    /// glyph to sit in the middle of
+    pub fn hidden_mark(&self, i: usize) -> Area {
+        let pad = self.pad(i);
+        let half = self.px(HIDDEN_DISC) / 2.0;
+        let (cx, cy) = (pad.right() - self.px(3.0), pad.bottom() - self.px(3.0));
+        Area::new(cx - half, cy - half, 2.0 * half, 2.0 * half)
+    }
+
     /// The mark in the top right corner of row `i`'s pad for a result not
     /// yet seen.
     pub fn unread_dot(&self, i: usize) -> Area {
         let pad = self.pad(i);
         let d = self.px(6.0);
         Area::new(pad.right() - d - self.px(2.0), pad.y + self.px(2.0), d, d)
+    }
+
+    /// The middle of tab links' lane `lane` down the rail's left edge: the first a gap left of
+    /// the pills, each next a gap further out (the last, beside the open tab's bar, is shared)
+    pub fn link_lane(&self, lane: usize) -> f32 {
+        let lanes = lane.min(LINK_LANES - 1) as f32 + 1.0;
+        (self.column() - self.pill_half() - lanes * self.px(LINK_LANE_GAP)).round()
+    }
+
+    /// How wide a link's line is
+    pub fn link_width(&self) -> f32 {
+        self.px(LINK_WIDTH)
+    }
+
+    /// Where a link ends on row `i`: its mark's middle, left of the pad and level with its middle,
+    /// and right of the first lane (without labels the pills are narrow and the lanes come close)
+    pub fn link_end(&self, i: usize) -> (f32, f32) {
+        let pad = self.pad(i);
+        let x = (pad.x - self.px(LINK_END_IN)).max(self.link_lane(0) + self.px(LINK_LANE_GAP));
+        (x, (pad.y + pad.h / 2.0).round())
+    }
+
+    /// How wide the mark at each end of a link is
+    pub fn link_end_size(&self) -> f32 {
+        self.px(LINK_END)
+    }
+
+    /// Whether a point is on the rail's link lanes, from the outer lane to the end marks: where
+    /// a click on a suggested link's dashes lands
+    pub fn on_link_lanes(&self, x: f32) -> bool {
+        let half = self.link_width() + self.px(1.0);
+        let end = self.link_end_size() / 2.0;
+        x >= self.link_lane(LINK_LANES - 1) - half && x <= self.link_end(0).0 + end
     }
 
     /// The row under a point, if any.
@@ -541,6 +786,14 @@ impl Layout {
     fn around_start(&self, radius: f32) -> Area {
         let (x, y) = self.sweep_point(0.0);
         Area::new((x - radius).floor(), (y - radius).floor(), 2.0 * radius + 1.0, 2.0 * radius + 1.0)
+    }
+
+    /// The room the edge crosses as the panel opens, over the panes it presses over: from the
+    /// closed ring's right edge to the open one's, as tall as the ring. The wave washes over it
+    /// just ahead of the edge (crate::wave).
+    pub fn wave_band(&self) -> Area {
+        let (closed, open) = (self.panel(false), self.panel(true));
+        Area::new(closed.right(), open.y, open.right() - closed.right(), open.h)
     }
 }
 
@@ -605,7 +858,233 @@ mod test {
             scale: 1.0,
             rows: 4,
             label: 0.0,
+            label_line: 0.0,
             head: false,
+            foot: false,
+        }
+    }
+
+    /// Lachlan's rail: two-line labels of a 12 px line, the Conductor's slot, the new-tab pad, the
+    /// panel `h` tall inside its gutters, at `scale`
+    fn his(rows: usize, h: f32, scale: f32) -> Layout {
+        let gap = (4.0 * scale).round();
+        Layout {
+            left: 0.0,
+            body_top: 38.0,
+            bottom: 38.0 + 2.0 * gap + h,
+            right: 1080.0,
+            rail: (68.0 * scale).round(),
+            width: (290.0 * scale).round(),
+            scale,
+            rows,
+            label: 24.0 * scale,
+            label_line: 12.0 * scale,
+            head: true,
+            foot: true,
+        }
+    }
+
+    #[test]
+    fn the_hidden_mark_sits_on_the_pads_bottom_right_clear_of_the_arc_and_the_links() {
+        for scale in [1.0, 1.5, 2.0] {
+            let l = his(6, 900.0, scale);
+            for i in (0..6).filter(|&i| l.row_visible(i)) {
+                let (pad, mark) = (l.pad(i), l.hidden_mark(i));
+                // A 12 px disc, centred 3 px in from the pad's bottom right corner
+                assert_eq!((mark.w, mark.h), (l.px(12.0), l.px(12.0)), "at {scale}");
+                assert_eq!(mark.x + mark.w / 2.0, pad.right() - l.px(3.0));
+                assert_eq!(mark.y + mark.h / 2.0, pad.bottom() - l.px(3.0));
+                // The glyph fits inside it
+                assert!(l.px(HIDDEN_GLYPH) < mark.w);
+                // Below the arc's square and the unread dot, at the top right
+                let (arc, dot) = (l.spinner(i), l.unread_dot(i));
+                assert!(mark.y >= arc.bottom() - l.px(1.0) && mark.y >= dot.bottom(), "row {i} at {scale}: {mark:?} into {arc:?}");
+                // Right of where the links' marks end, left of the pad
+                let (end, _) = l.link_end(i);
+                assert!(mark.x > end + l.link_end_size() / 2.0, "row {i} at {scale}");
+                // Inside the row's slot, so it moves with the row
+                let slot = l.slot(i);
+                assert!(mark.y >= slot.y && mark.bottom() <= slot.bottom(), "row {i} at {scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_labels_cover_takes_its_room_inside_the_pill_and_clear_of_the_pad_and_its_marks() {
+        for scale in [1.0, 1.5, 2.0] {
+            // Two lines of label, then crowded down to one and to none
+            for rows in [6, 30, 60] {
+                let l = his(rows, 900.0, scale);
+                for i in (0..rows).filter(|&i| l.row_visible(i)) {
+                    let (room, pill, pad) = (l.label(i), l.pill(i), l.pad(i));
+                    let Some(cover) = l.label_cover(i) else {
+                        assert_eq!(l.label_lines(), 0, "row {i} of {rows} at {scale}: a label shows and nothing covers it");
+                        continue;
+                    };
+                    // All the room the label is drawn in
+                    assert!(cover.x <= room.x && cover.right() >= room.right(), "row {i} of {rows} at {scale}");
+                    assert!(cover.y <= room.y && cover.bottom() >= room.bottom(), "row {i} of {rows} at {scale}");
+                    // Inside the pill, so a lifted row's hover colour isn't cut square
+                    assert!(cover.x >= pill.x && cover.right() <= pill.right(), "row {i} of {rows} at {scale}: {cover:?} past {pill:?}");
+                    assert!(cover.bottom() <= pill.bottom(), "row {i} of {rows} at {scale}");
+                    // Below the pad and the hidden mark's disc, which stay on the open panel
+                    assert!(cover.y >= pad.bottom(), "row {i} of {rows} at {scale}");
+                    assert!(cover.y >= l.hidden_mark(i).bottom() - 0.01, "row {i} of {rows} at {scale}");
+                }
+            }
+        }
+        // No labels: nothing to cover
+        let l = layout();
+        assert_eq!(l.label_cover(0), None);
+    }
+
+    #[test]
+    fn the_new_tab_pad_sits_at_the_rails_foot_and_never_moves() {
+        for scale in [1.0, 1.5] {
+            for rows in [1, 8, 30] {
+                let l = his(rows, 900.0, scale);
+                let (pill, panel) = (l.foot_pill(), l.panel(false));
+                assert_eq!((pill.w, pill.h), (l.px(42.0), l.px(30.0)), "at {scale}");
+                assert_eq!(pill.bottom(), panel.bottom() - l.stroke() - l.px(8.0), "a list's pad above the ring's inside");
+                assert!((pill.x + pill.w / 2.0 - l.column()).abs() <= 0.5, "centred on the pads");
+                assert!(pill.right() < l.seam(false) && pill.x > panel.x + l.stroke(), "inside the closed rail, left of the seam");
+                assert_eq!(l.foot_radius(), l.px(10.0), "the label pill's corners");
+                // The rule over it: in the head rule's place, 80% of the pad
+                let rule = l.foot_rule();
+                assert!(rule.bottom() <= pill.y && rule.y >= pill.y - l.px(7.0), "{rule:?} over {pill:?}");
+                assert_eq!(rule.w, (pill.w / 2.0 * 0.8).round() * 2.0);
+                assert_eq!(rule.h, l.stroke());
+                // Every visible row is above the rule
+                for i in (0..rows).filter(|&i| l.row_visible(i)) {
+                    assert!(l.pill(i).bottom() <= rule.y, "row {i} at {scale} runs into the rule");
+                }
+                // The + inside it: two strokes 12 px across, crossing at its middle
+                let [across, down] = l.plus();
+                assert_eq!((across.w, down.h), (l.px(12.0), l.px(12.0)));
+                assert!(across.x > pill.x && across.right() < pill.right() && down.y > pill.y && down.bottom() < pill.bottom());
+                // Open, its row runs beside it as a tab's does
+                assert_eq!(l.foot_highlight().x, pill.x);
+                assert!(l.foot_text().x > pill.right() && l.foot_text().right() < l.seam(true));
+                // The same place however many tabs there are
+                assert_eq!(pill, his(rows + 5, 900.0, scale).foot_pill());
+            }
+        }
+    }
+
+    #[test]
+    fn the_row_height_keeps_room_for_the_conductor_and_the_new_tab_pad() {
+        let mut l = his(12, 900.0, 1.0);
+        let room = l.panel(false).h - 2.0 * (1.0 + 8.0) - 7.0 - (30.0 + 7.0);
+        assert_eq!(l.row_height(), (room / 13.0).floor().clamp(28.0 + 3.0 + 24.0, 46.0 + 3.0 + 24.0));
+        l.foot = false;
+        let room = l.panel(false).h - 2.0 * (1.0 + 8.0) - 7.0;
+        assert_eq!(l.row_height(), (room / 13.0).floor().clamp(55.0, 73.0), "without the pad, as before");
+        l.head = false;
+        let room = l.panel(false).h - 2.0 * (1.0 + 8.0);
+        assert_eq!(l.row_height(), (room / 12.0).floor().clamp(55.0, 73.0));
+    }
+
+    #[test]
+    fn labels_give_up_lines_before_any_tab_leaves_the_rail() {
+        // 20 tabs in 900 px: no label lines, every tab drawn
+        let l = his(20, 900.0, 1.0);
+        assert_eq!(l.label_lines(), 0);
+        assert_eq!(l.label(0).h, 0.0, "no label line shows");
+        assert!((0..20).all(|i| l.row_visible(i)), "all 20 drawn");
+        assert_eq!(l.hidden(), 0);
+        // 16 in 978 px: one line each, every tab drawn; two would push the last off
+        let l = his(16, 978.0, 1.0);
+        assert_eq!(l.label_lines(), 1);
+        assert_eq!(l.label(0).h, 12.0);
+        assert!((0..16).all(|i| l.row_visible(i)), "all 16 drawn");
+        let mut whole = l;
+        whole.label_line = 0.0;
+        assert!(!whole.row_visible(15), "kept whole, the last tab fell off");
+        // Few tabs: both lines
+        let l = his(8, 978.0, 1.0);
+        assert_eq!(l.label_lines(), 2);
+        assert_eq!(l.label(0).h, 24.0);
+        // Without labels, none to give up
+        let mut bare = his(8, 978.0, 1.0);
+        bare.label = 0.0;
+        assert_eq!(bare.label_lines(), 0);
+    }
+
+    #[test]
+    fn plus_n_only_past_rows_at_their_least() {
+        for rows in 1..=80 {
+            let l = his(rows, 900.0, 1.0);
+            if l.hidden() > 0 {
+                assert_eq!(l.row_height(), 28.0, "{rows} tabs: a tab hidden before rows reached their least");
+                assert_eq!(l.label_lines(), 0, "{rows} tabs: hidden while labels kept a line");
+                assert_eq!(l.hidden(), (0..rows).filter(|&i| !l.row_visible(i)).count());
+            }
+        }
+        assert_eq!(his(29, 900.0, 1.0).hidden(), 0);
+        assert!(his(60, 900.0, 1.0).hidden() > 0, "60 tabs don't fit 900 px");
+    }
+
+    #[test]
+    fn the_new_tab_pads_zone_runs_into_the_screens_corner_when_maximized() {
+        let l = his(8, 900.0, 1.0);
+        let pill = l.foot_pill();
+        let mid = (pill.x + pill.w / 2.0, pill.y + pill.h / 2.0);
+        for corner in [None, Some(l.bottom + 4.0)] {
+            assert!(l.foot_at(mid.0, mid.1, false, corner), "the pill itself");
+            assert!(l.foot_at(l.panel(false).right() + 2.0, mid.1, false, corner), "the gutter past the rail");
+            assert!(!l.foot_at(l.panel(false).right() + 10.0, mid.1, false, corner), "not the panes");
+            assert!(l.foot_at(l.panel(true).right() + 2.0, mid.1, true, corner), "the open panel's width");
+            assert!(!l.foot_at(mid.0, l.pill(0).y + 2.0, false, corner), "not a tab's row");
+            assert!(l.foot_at(0.0, mid.1, false, corner), "the window's left edge");
+        }
+        // Not maximized: it stops at the window's edge inside its border
+        assert!(!l.foot_at(mid.0, l.bottom + 1.0, false, None));
+        // Maximized: down to the window's last pixel row, the screen's corner
+        let last = l.bottom + 3.0;
+        assert!(l.foot_at(0.0, last, false, Some(l.bottom + 4.0)));
+        assert!(l.foot_at(mid.0, last, false, Some(l.bottom + 4.0)));
+        // No pad, no zone
+        let mut none = l;
+        none.foot = false;
+        assert!(!none.foot_at(mid.0, mid.1, false, None));
+    }
+
+    #[test]
+    fn the_wave_washes_over_the_room_the_edge_crosses() {
+        let l = layout();
+        let band = l.wave_band();
+        assert_eq!(band.x, l.panel(false).right());
+        assert_eq!(band.right(), l.panel(true).right());
+        assert_eq!(band.w, l.travel());
+        assert_eq!((band.y, band.h), (l.panel(true).y, l.panel(true).h));
+        // Over the panes' room, not the closed rail's
+        assert!(band.x >= l.strip());
+    }
+
+    #[test]
+    fn link_lanes_run_between_the_open_tabs_bar_and_the_pills() {
+        for label in [0.0, 20.0] {
+            let mut l = layout();
+            l.label = label;
+            let pill = l.pill(1);
+            let bar = l.edge_bar(1);
+            let half = l.link_width() / 2.0;
+            // The first two clear of both; the last, shared, may run beside the bar
+            for lane in 0..LINK_LANES - 1 {
+                let x = l.link_lane(lane);
+                assert!(x + half <= pill.x && x - half >= bar.right(), "lane {lane} at {x} with labels {label}");
+            }
+            assert!(l.link_lane(LINK_LANES - 1) + half <= l.link_lane(LINK_LANES - 2) - half);
+            assert_eq!(l.link_lane(LINK_LANES), l.link_lane(LINK_LANES - 1), "past the last lane it's shared");
+            // Each end's mark sits left of the pad, level with its middle, and in its row's slot
+            let (x, y) = l.link_end(1);
+            let pad = l.pad(1);
+            assert!(x + l.link_end_size() / 2.0 <= pad.x);
+            assert!(x > l.link_lane(0));
+            assert_eq!(y, (pad.y + pad.h / 2.0).round());
+            let slot = l.slot(1);
+            assert!(y > slot.y && y < slot.bottom());
+            assert!(l.on_link_lanes(l.link_lane(2)) && l.on_link_lanes(x) && !l.on_link_lanes(pad.x + 2.0));
         }
     }
 
@@ -858,6 +1337,27 @@ mod test {
     }
 
     #[test]
+    fn subagents_bars_share_the_line_over_the_programs_bar() {
+        let l = layout();
+        let main = l.progress_bar(0);
+        for n in 1..=4 {
+            let bars: Vec<Area> = (0..n).map(|k| l.agent_bar(0, k, n, true)).collect();
+            assert_eq!(bars[0].x, main.x);
+            assert!(bars[n - 1].right() <= main.right(), "{n}: within the words' width");
+            for pair in bars.windows(2) {
+                assert!(pair[1].x >= pair[0].right() + l.px(4.0) - 0.01, "{n}: a gap between each");
+            }
+            for b in &bars {
+                assert_eq!((b.y, b.h), (main.y - main.h - l.px(2.0), main.h), "the line over it");
+                assert!(b.y > l.pill(0).y);
+            }
+        }
+        // With no bar of the program's, on its line
+        assert_eq!(l.agent_bar(0, 0, 2, false).y, main.y);
+        assert_eq!(l.agent_bar(0, 0, 1, false).w, main.w.floor());
+    }
+
+    #[test]
     fn the_lights_surfaces_centre_on_its_start() {
         let l = layout();
         let (x, y) = l.sweep_point(0.0);
@@ -899,6 +1399,42 @@ mod test {
         assert!(l.head_text().x > head.right() && l.head_text().right() < l.head_highlight().right());
         l.head = false;
         assert!(!l.head_at(20.0, y, false), "no slot without the Conductor");
+    }
+
+    #[test]
+    fn the_conductors_count_of_suggested_connections_sits_on_its_pads_other_corner() {
+        for (scale, label) in [(1.0, 24.0), (1.0, 0.0), (1.5, 24.0), (2.0, 24.0)] {
+            let mut l = layout();
+            l.scale = scale;
+            l.label = label;
+            l.head = true;
+            let (pill, pad, mark) = (l.head_pill(), l.head_pad(), l.head_mark());
+            // The pads' numbers' font: Lachlan's 9 pt, a digit 7 px wide in a line 16 tall at 96 DPI
+            let (digit, line) = (7.0 * scale, 16.0 * scale);
+            // One digit: a disc on the pad's top left corner, clear of the remote mark on its right,
+            // and tall enough for the font's digits with room round them: 14 px at 96 DPI, where
+            // the labels' 7 pt count had 11
+            let one = l.head_badge(digit, line);
+            assert_eq!(one.w, one.h, "a disc at {scale}");
+            assert_eq!(one.h, (14.0 * scale).round(), "at {scale}");
+            assert!(one.h >= line * 0.85 && one.w >= digit + 2.0 * l.px(HEAD_BADGE_INSET), "{one:?} at {scale}");
+            assert!(one.x < pad.x && one.right() > pad.x && one.y < pad.y && one.bottom() > pad.y, "{one:?} on {pad:?}");
+            assert!(one.right() <= mark.x - l.px(HEAD_BADGE_GAP), "clear of the remote mark: {one:?} {mark:?}");
+            assert!(one.x > pill.x, "inside the pill: {one:?} {pill:?}");
+            // Two digits: wider to the right, its left where it was, still short of the mark, with
+            // a pixel at least either side of them
+            let two = l.head_badge(2.0 * digit, line);
+            assert!(two.w > one.w && two.x == one.x && two.y == one.y && two.h == one.h, "{two:?} {one:?}");
+            assert!(two.right() <= mark.x - l.px(HEAD_BADGE_GAP), "12 clear of the remote mark at {scale}: {two:?} {mark:?}");
+            assert!(two.w >= 2.0 * digit + 2.0, "12's room at {scale}: {two:?}");
+            // Three never fit beside the mark: the badge takes them whole, over it
+            let three = l.head_badge(3.0 * digit, line);
+            assert!(three.w >= 3.0 * digit && three.x == one.x);
+            // Whole pixels, so its edges are crisp
+            for v in [one.x, one.y, one.w, one.h, two.x, two.y, two.w, two.h] {
+                assert_eq!(v, v.round());
+            }
+        }
     }
 
     #[test]

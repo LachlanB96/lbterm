@@ -41,6 +41,14 @@ impl UserData for MuxTab {
             let tab = this.resolve(&mux)?;
             Ok(tab.get_title())
         });
+        // LBTerm: whether the tab is parked (Lachlan's 8a; lbterm/NEW-TAB.md, "Landing 4"), as
+        // this process holds it: a mux domain's tab as its server last said. Parked or unparked
+        // with the LbtermPark action
+        methods.add_method("lbterm_parked", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let tab = this.resolve(&mux)?;
+            Ok(tab.lbterm_parked())
+        });
         methods.add_method("set_title", |_, this, title: String| {
             let mux = get_mux()?;
             let tab = this.resolve(&mux)?;

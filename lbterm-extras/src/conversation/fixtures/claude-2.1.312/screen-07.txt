@@ -1,0 +1,52 @@
+[38:2::80:80:80m[48:2::55:55:55m❯ Run the shell command: echo scroll probe[39m[K
+[49m  line 17
+  line 18
+  line 19
+  line 20
+  line 21
+  line 22
+  line 23
+  line 24
+  line 25
+  line 26
+  line 27
+  line 28
+  line 29
+  line 30
+  line 31
+  line 32
+  line 33
+  line 34
+  line 35
+  line 36
+  line 37
+  line 38
+  line 39
+  line 40
+  line 41
+  line 42
+  line 43
+  line 44
+  line 45
+  line 46
+  line 47
+  line 48
+  line 49
+  line 50
+  line 51
+  line 52
+  line 53
+  line 54
+  line 55
+  line 56
+  line 57
+  line 58                           [38:2::255:255:255m[48:2::55:55:55m Jump to bottom (ctrl+End) ↓ 
+
+[38:2::136:136:136m[49m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m▸ probe summary line
+[39m  [38:2::153:153:153mhaiku | probe | main
+[39m  [38:2::153:153:153mtoggles line
+[39m  [38:2::175:135:255m⏵⏵ accept edits on[38:2::153:153:153m (shift+tab to cycle) · ← 2 agents
+[39m

@@ -93,6 +93,8 @@ BeforeAll {
       Add-File $priv 'lbterm/one.ps1' 'one'
       Add-File $priv 'CLAUDE.md' 'notes for Claude: C:\Users\zanzibarquill'
       Add-File $priv '.claude/memory/MEMORY.md' 'memory'
+      Add-File $priv 'api.json' '{ "summary": "what the megaproject uses of it" }'
+      Add-File $priv 'lbterm/api.json' '{ "only": "the root one is the contract" }'
       foreach ($f in Get-ChildItem -Recurse -File $publishDir) {
         Add-File $priv ([IO.Path]::GetRelativePath((Split-Path (Split-Path $publishDir)), $f.FullName) -replace '\\', '/') (Get-Content -Raw $f.FullName).TrimEnd("`n")
       }
@@ -253,6 +255,8 @@ Describe 'Get-PublicTree' {
     $names | Should -Contain 'README.md'
     $names | Should -Not -Contain 'CLAUDE.md'
     $names | Where-Object { $_ -like '.claude/*' } | Should -BeNullOrEmpty
+    $names | Should -Not -Contain 'api.json'
+    $names | Should -Contain 'lbterm/api.json'
     $entries | Where-Object { $_ -match '^160000 commit [0-9a-f]+\tdeps/sub$' } | Should -HaveCount 1
     # The checkout's own index is untouched
     git -C $s.Private diff --cached --name-only | Should -BeNullOrEmpty
@@ -361,5 +365,134 @@ Describe 'Publish-Lbterm' -Skip:(-not $hasBash) {
     git -C $s.Public config user.email '1+octo@users.noreply.github.com'
     Add-File $s.Public 'stray.md' 'stray'
     { Publish-Lbterm -Repo $s.Private -Public $s.Public } | Should -Throw '*changes of its own*'
+  }
+}
+
+# The clone's own core.hooksPath replaces the machine's, so its hooks run the machine's first through
+# machine-hook.sh when the clone has namemask.mode. Here a clone set up as the public one is, with
+# the real hooks, and a stand-in for the machine's global git config (GIT_CONFIG_GLOBAL) naming a
+# folder of stand-in machine hooks, which write each call to a log and refuse when a test says so.
+Describe 'machine-hook.sh' -Skip:(-not $hasBash) {
+  BeforeAll {
+    $machine = Join-Path $TestDrive 'machine-hooks'
+    $refuse = Join-Path $TestDrive 'refuse'
+    $empty = Join-Path $TestDrive 'empty-hooks'
+    New-Item -ItemType Directory $machine, $refuse, $empty | Out-Null
+    $log = Join-Path $TestDrive 'machine.log'
+    foreach ($h in 'pre-commit', 'commit-msg', 'pre-push') {
+      $script = @"
+#!/bin/sh
+in=
+[ "$h" = pre-push ] && in=`$(cat)
+echo "$h `$* | `$in" >>'$($log -replace '\\', '/')'
+[ -f '$(($refuse -replace '\\', '/'))/$h' ] && exit 1
+exit 0
+"@
+      [IO.File]::WriteAllText((Join-Path $machine $h), $script.Replace("`r`n", "`n") + "`n")
+    }
+    $savedGlobal = $env:GIT_CONFIG_GLOBAL
+
+    # The global git config a test runs under: one naming $HooksPath, or none at all
+    function Set-Global([string]$HooksPath) {
+      $g = Join-Path $TestDrive "global-$([guid]::NewGuid().ToString('N').Substring(0, 8)).gitconfig"
+      $text = if ($HooksPath) { "[core]`n`thooksPath = $($HooksPath -replace '\\', '/')`n" } else { "[core]`n`tautocrlf = false`n" }
+      [IO.File]::WriteAllText($g, $text)
+      $env:GIT_CONFIG_GLOBAL = $g
+    }
+
+    # A clone with the hooks on, as the real one has them, namemask.mode set when -Masked
+    function New-Clone([switch]$Masked) {
+      $c = New-Repo 'clone'
+      New-Item -ItemType Directory (Join-Path $c 'lbterm') | Out-Null
+      Copy-Item -Recurse $publishDir (Join-Path $c 'lbterm')
+      git -C $c config core.hooksPath lbterm/publish/hooks
+      if ($Masked) { git -C $c config namemask.mode block }
+      $c
+    }
+
+    function Invoke-Git([string]$Repo, [string[]]$Arguments) {
+      $out = git -C $Repo @Arguments 2>&1 | Out-String
+      [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
+    }
+
+    function Get-Calls { if (Test-Path $log) { @(Get-Content $log) } else { @() } }
+  }
+
+  AfterAll { $env:GIT_CONFIG_GLOBAL = $savedGlobal }
+
+  BeforeEach {
+    Set-Global $machine
+    Remove-Item -Force -ErrorAction SilentlyContinue $log
+    Get-ChildItem $refuse | Remove-Item -Force
+  }
+
+  It 'runs only the leak check in a clone without namemask.mode' {
+    $c = New-Clone
+    Add-File $c 'a.txt' 'a'
+    (Invoke-Git $c @('commit', '-q', '-m', 'One')).Code | Should -Be 0
+    Get-Calls | Should -BeNullOrEmpty
+  }
+
+  It "runs the machine's pre-commit and commit-msg first, and either refusing blocks the commit" {
+    $c = New-Clone -Masked
+    Add-File $c 'a.txt' 'a'
+    (Invoke-Git $c @('commit', '-q', '-m', 'One')).Code | Should -Be 0
+    $calls = @(Get-Calls)
+    $calls.Count | Should -Be 2
+    $calls[0] | Should -Match '^pre-commit +\|'
+    $calls[1] | Should -Match '^commit-msg .*COMMIT_EDITMSG'
+    $head = git -C $c rev-parse HEAD
+    foreach ($h in 'pre-commit', 'commit-msg') {
+      New-Item -ItemType File (Join-Path $refuse $h) | Out-Null
+      Add-File $c "$h.txt" $h
+      (Invoke-Git $c @('commit', '-q', '-m', "Refused by $h")).Code | Should -Not -Be 0
+      git -C $c rev-parse HEAD | Should -Be $head
+      Remove-Item (Join-Path $refuse $h)
+    }
+  }
+
+  It "still runs the leak check after the machine's hook passes" {
+    $c = New-Clone -Masked
+    Add-File $c 'a.txt' 'for Zanzibar Quill'
+    $r = Invoke-Git $c @('commit', '-q', '-m', 'One')
+    $r.Code | Should -Not -Be 0
+    Assert-Quiet $r
+    @(Get-Calls)[0] | Should -Match '^pre-commit'
+    git -C $c rev-parse --verify -q HEAD | Should -BeNullOrEmpty
+  }
+
+  It "hands the machine's pre-push the remote and the refs being pushed, and its refusal blocks the push" {
+    $c = New-Clone -Masked
+    Add-File $c 'a.txt' 'a'
+    git -C $c commit -q -m 'Upstream'
+    git -C $c update-ref refs/remotes/upstream/base HEAD
+    Add-File $c 'b.txt' 'b'
+    git -C $c commit -q -m 'Two'
+    $origin = Join-Path $TestDrive "origin-$([guid]::NewGuid().ToString('N').Substring(0, 8)).git"
+    git init -q --bare -b main $origin
+    git -C $c remote add origin $origin
+    Remove-Item -Force -ErrorAction SilentlyContinue $log
+    (Invoke-Git $c @('push', '-q', 'origin', 'main')).Code | Should -Be 0
+    $sha = git -C $c rev-parse HEAD
+    @(Get-Calls) | Should -HaveCount 1
+    @(Get-Calls)[0] | Should -Match "^pre-push origin \S+ \| refs/heads/main $sha refs/heads/main 0{40}$"
+
+    New-Item -ItemType File (Join-Path $refuse 'pre-push') | Out-Null
+    Add-File $c 'c.txt' 'c'
+    git -C $c commit -q -m 'Three'
+    (Invoke-Git $c @('push', '-q', 'origin', 'main')).Code | Should -Not -Be 0
+    git -C $origin rev-parse main | Should -Be $sha
+  }
+
+  It "blocks while the machine's hooks can't be found, or the global config names the clone's own" {
+    $c = New-Clone -Masked
+    Add-File $c 'a.txt' 'a'
+    foreach ($case in @(@('', 'no core.hooksPath'), @($empty, 'missing'), @('lbterm/publish/hooks', 'own hooks folder'))) {
+      Set-Global $case[0]
+      $r = Invoke-Git $c @('commit', '-q', '-m', 'One')
+      $r.Code | Should -Not -Be 0
+      $r.Out | Should -Match $case[1]
+    }
+    git -C $c rev-parse --verify -q HEAD | Should -BeNullOrEmpty
   }
 }

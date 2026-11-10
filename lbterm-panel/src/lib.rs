@@ -9,20 +9,23 @@
 //! Nothing is polled and no file is read.
 //!
 //! What's here is the logic, without the GUI: [`row`] turns a tab into what
-//! its row shows, [`Hover`] decides when the panel opens and closes and how lit it is, and
-//! [`Layout`] says where every part of it goes. Tested with
-//! `cargo test -p lbterm-panel`.
+//! its row shows, [`Hover`] decides when the panel opens and closes and how lit it is,
+//! [`Layout`] says where every part of it goes, and [`wave`] what washes ahead of its edge as it
+//! opens. Tested with `cargo test -p lbterm-panel`.
 
 pub mod claude;
 pub mod hover;
 pub mod idle;
 pub mod layout;
+pub mod look;
+pub mod names;
 pub mod palette;
 pub mod shape;
 pub mod text;
+pub mod wave;
 pub mod words;
 
-pub use claude::{row, Blocked, Program, ProgramState, Row, RowState, Status, Tab};
+pub use claude::{row, Blocked, Changes, LinkState, Program, ProgramState, Quiet, QuietLevel, Row, RowState, Status, Tab, TabLink, waits_on_you};
 pub use hover::{Hover, Light, Phase};
 pub use idle::Bar;
 pub use layout::{Area, Layout};

@@ -106,6 +106,15 @@ impl UserData for GuiWin {
             this.window.notify(TermWindowNotif::SetLeftStatus(status));
             Ok(())
         });
+        // LBTerm: a tab is on its way to this window, said in the strip and by the Starting row
+        // at the end of the rail's tabs until it comes (or 20 s pass); nil takes it back, the row
+        // folding and the strip saying nothing opened (render/new_tab.rs, lbterm_expect_tab)
+        methods.add_method("lbterm_expect_tab", |_, this, text: Option<String>| {
+            this.window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.lbterm_expect_tab(text)
+            })));
+            Ok(())
+        });
         methods.add_async_method("get_dimensions", |_, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window.notify(TermWindowNotif::GetDimensions(tx));

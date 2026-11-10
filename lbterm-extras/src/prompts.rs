@@ -44,20 +44,131 @@ pub fn sent(history: &str, sid: &str) -> Vec<Sent> {
         .lines()
         // Most lines are other sessions': cheap to pass over before parsing
         .filter(|line| line.contains(sid))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|record| record.get("sessionId").and_then(|s| s.as_str()) == Some(sid))
-        .filter_map(|record| {
-            let text = record.get("display")?.as_str()?.trim().to_string();
-            let at_ms = match record.get("timestamp")? {
-                serde_json::Value::Number(n) => n.as_i64()?,
-                serde_json::Value::String(s) => s.parse().ok()?,
-                _ => return None,
-            };
-            (!text.is_empty() && !text.starts_with('/')).then_some(Sent { text, at_ms })
-        })
+        .filter_map(record)
+        .filter(|(whose, _)| whose == sid)
+        .map(|(_, sent)| sent)
         .collect();
     out.sort_by_key(|s| s.at_ms);
     out
+}
+
+/// A line of history.jsonl: whose prompt, and the prompt, if it's one the list shows
+fn record(line: &str) -> Option<(String, Sent)> {
+    let record = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let sid = record.get("sessionId")?.as_str()?.to_string();
+    let text = record.get("display")?.as_str()?.trim().to_string();
+    let at_ms = match record.get("timestamp")? {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.parse().ok()?,
+        _ => return None,
+    };
+    (!text.is_empty() && !text.starts_with('/')).then_some((sid, Sent { text, at_ms }))
+}
+
+/// How many bytes before where a read stopped are kept, to tell the next read whether the file
+/// is still the one read (appended to) or was written anew
+const KEEP: usize = 256;
+
+/// Claude Code's history.jsonl as read so far: where each session's prompts are in it. The file
+/// is every session's (2 MB and 6,600 lines on Lachlan's PC on 2026-10-31, and it only grows), so
+/// it's read whole once and after that only what was added since ([`History::read_on`]), not
+/// whole again for each click on the strip's prompt or its list. What's kept is where each
+/// session's records are, not the prompts (pasted text and all): a session's are read from the
+/// file when they're asked for ([`History::sent`]), so what the GUI holds for its whole life
+/// stays small however long the file grows
+#[derive(Debug, Default)]
+pub struct History {
+    /// The bytes read: up to the end of the last whole line
+    read: u64,
+    /// The last of them, up to [`KEEP`]
+    tail: Vec<u8>,
+    /// Where each session's records are in the file, in its order: each line's start and length
+    sessions: std::collections::HashMap<String, Vec<(u64, u32)>>,
+}
+
+impl History {
+    /// The prompts session `sid` sent, oldest first, as [`sent`] gives them: its records read
+    /// from `path`, the file [`Self::read_on`] last read
+    pub fn sent(&self, path: &std::path::Path, sid: &str) -> std::io::Result<Vec<Sent>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some(lines) = self.sessions.get(sid) else {
+            return Ok(vec![]);
+        };
+        let mut file = std::fs::File::open(path)?;
+        let mut out = vec![];
+        let mut line = vec![];
+        for &(at, len) in lines {
+            line.resize(len as usize, 0);
+            file.seek(SeekFrom::Start(at))?;
+            file.read_exact(&mut line)?;
+            if let Some((whose, sent)) = record(&String::from_utf8_lossy(&line)) {
+                if whose == sid {
+                    out.push(sent);
+                }
+            }
+        }
+        out.sort_by_key(|s| s.at_ms);
+        Ok(out)
+    }
+
+    /// How many sessions it knows of, and how many records it knows where they are
+    pub fn size(&self) -> (usize, usize) {
+        (self.sessions.len(), self.sessions.values().map(Vec::len).sum())
+    }
+
+    /// How many bytes of the file have been read
+    pub fn read(&self) -> u64 {
+        self.read
+    }
+
+    /// Takes in `bytes`, the file from where the last read stopped: its whole lines, the part
+    /// after the last waiting for the rest of it. How many bytes it took
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        let Some(last) = bytes.iter().rposition(|&b| b == b'\n') else {
+            return 0;
+        };
+        let whole = &bytes[..=last];
+        let mut at = self.read;
+        for line in whole.split(|&b| b == b'\n') {
+            let start = at;
+            at += line.len() as u64 + 1;
+            if line.is_empty() || line.len() > u32::MAX as usize {
+                continue;
+            }
+            if let Some((sid, _)) = record(&String::from_utf8_lossy(line)) {
+                self.sessions.entry(sid).or_default().push((start, line.len() as u32));
+            }
+        }
+        self.read += whole.len() as u64;
+        let mut tail = std::mem::take(&mut self.tail);
+        tail.extend_from_slice(whole);
+        let from = tail.len().saturating_sub(KEEP);
+        self.tail = tail.split_off(from);
+        whole.len()
+    }
+
+    /// Reads `path` on from where the last read stopped; from its start again when it's shorter
+    /// than that, or the bytes before that aren't the ones read (written anew, not appended to)
+    pub fn read_on(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let kept = self.tail.len() as u64;
+        let same = len >= self.read && {
+            let mut before = vec![0u8; kept as usize];
+            file.seek(SeekFrom::Start(self.read - kept))?;
+            file.read_exact(&mut before)?;
+            before == self.tail
+        };
+        if !same {
+            *self = History::default();
+        }
+        file.seek(SeekFrom::Start(self.read))?;
+        let mut bytes = vec![];
+        file.read_to_end(&mut bytes)?;
+        self.feed(&bytes);
+        Ok(())
+    }
 }
 
 /// `text` on one line, its whitespace run together
@@ -78,6 +189,17 @@ pub struct Row {
     pub text: String,
     /// The cell under its first mark is on Claude Code's grey message band
     pub band: bool,
+    /// The words after its mark are dim against the band: Claude Code's sticky header, which
+    /// 2.1.312 draws on the band too (grey on grey, where a message you sent is white)
+    pub dim: bool,
+}
+
+/// Whether words in `fg` on `bg` (sRGB) are dim: close to the band in brightness, as Claude
+/// Code's sticky header's grey on grey is (80 on 55), where a message's are white on it. `None`
+/// is the terminal's own foreground, never dim; `faint` is SGR 2.
+pub fn dim_words(fg: Option<(u8, u8, u8)>, bg: (u8, u8, u8), faint: bool) -> bool {
+    let light = |(r, g, b): (u8, u8, u8)| (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+    faint || fg.is_some_and(|fg| (light(fg) - light(bg)).abs() < 0.3)
 }
 
 /// Where a prompt was found.
@@ -103,21 +225,21 @@ fn matches(shown: &str, key: &str) -> bool {
 
 /// Where the prompt whose [`key`] is `key` is on `rows`, the pane's screen top to bottom: the
 /// lowest row on the band that starts with the mark and then it, else a row near the top
-/// without the band that does, which is Claude Code's header. The input box at the bottom starts
+/// that does with its words dim, or off the band as before 2.1.312, which is Claude Code's header. The input box at the bottom starts
 /// with the mark too, but isn't on the band and isn't near the top.
 pub fn find(rows: &[Row], key: &str) -> Option<Found> {
     let on_band = rows
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, row)| row.band && after_mark(&row.text).map_or(false, |s| matches(&s, key)));
+        .find(|(_, row)| row.band && !row.dim && after_mark(&row.text).map_or(false, |s| matches(&s, key)));
     if let Some((i, _)) = on_band {
         return Some(Found::Row(i));
     }
     let top = HEADER_ROWS.min(rows.len().saturating_sub(BOTTOM_ROWS));
     rows[..top]
         .iter()
-        .position(|row| !row.band && after_mark(&row.text).map_or(false, |s| matches(&s, key)))
+        .position(|row| (!row.band || row.dim) && after_mark(&row.text).map_or(false, |s| matches(&s, key)))
         .map(Found::Header)
 }
 
@@ -311,6 +433,93 @@ mod test {
     }
 
     #[test]
+    fn the_history_read_on_gives_what_a_whole_read_gives() {
+        let lines = [
+            record("Lets work on the summary panel", 1000, SID),
+            record("1 yes\n\nand give me a new prompt", 1500, OTHER),
+            record("/model", 1700, SID),
+            // Written out of order: still oldest first
+            record("show me the layouts in browser please", 900, SID),
+            "not json".to_string(),
+        ];
+        let whole = lines.join("\n") + "\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let mut h = History::default();
+        // Written a piece at a time, a line cut in two among them
+        let cut = whole.len() / 2 + 7;
+        std::fs::write(&path, &whole[..cut]).unwrap();
+        h.read_on(&path).unwrap();
+        assert!(h.read() <= cut as u64);
+        std::fs::write(&path, &whole).unwrap();
+        h.read_on(&path).unwrap();
+        assert_eq!(h.read(), whole.len() as u64);
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&whole, SID));
+        assert_eq!(h.sent(&path, OTHER).unwrap(), sent(&whole, OTHER));
+        assert_eq!(h.sent(&path, SID).unwrap()[0].text, "show me the layouts in browser please");
+        // Read again with nothing added: the same prompts
+        h.read_on(&path).unwrap();
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&whole, SID));
+        // A line added: read on
+        let more = whole.clone() + &record("and one more thing", 3000, SID) + "\n";
+        std::fs::write(&path, &more).unwrap();
+        h.read_on(&path).unwrap();
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&more, SID));
+        assert_eq!(h.sent(&path, SID).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_history_keeps_where_prompts_are_not_the_prompts() {
+        // A long paste among them: what's kept is a place for each record, whatever its size
+        let paste = "x".repeat(100_000);
+        let lines = [
+            record("first", 1000, SID),
+            record(&paste, 1100, OTHER),
+            record("/clear", 1200, SID),
+            record("second", 1300, SID),
+        ];
+        let whole = lines.join("\n") + "\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        std::fs::write(&path, &whole).unwrap();
+        let mut h = History::default();
+        h.read_on(&path).unwrap();
+        // Two sessions, three records (the slash command isn't one), read back from the file
+        assert_eq!(h.size(), (2, 3));
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&whole, SID));
+        assert_eq!(h.sent(&path, OTHER).unwrap()[0].text, paste);
+        assert!(h.sent(&path, "11111111-2222-3333-4444-555555555555").unwrap().is_empty());
+        // Read on: the new record's place is past the old ones'
+        let more = whole.clone() + &record("third", 1400, SID) + "\n";
+        std::fs::write(&path, &more).unwrap();
+        h.read_on(&path).unwrap();
+        assert_eq!(h.size(), (2, 4));
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&more, SID));
+    }
+
+    #[test]
+    fn a_history_written_anew_is_read_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let first = [record("old prompt one", 1000, SID), record("old prompt two", 1100, SID)].join("\n") + "\n";
+        std::fs::write(&path, &first).unwrap();
+        let mut h = History::default();
+        h.read_on(&path).unwrap();
+        assert_eq!(h.sent(&path, SID).unwrap().len(), 2);
+        // Trimmed to its last line and appended to, longer than before: not the bytes read
+        let anew = record("old prompt two", 1100, SID) + "\n" + &record("a newer prompt, long enough to be longer", 1200, SID) + "\n";
+        assert!(anew.len() > first.len());
+        std::fs::write(&path, &anew).unwrap();
+        h.read_on(&path).unwrap();
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&anew, SID));
+        // Shorter than what was read
+        let short = record("just this", 1300, SID) + "\n";
+        std::fs::write(&path, &short).unwrap();
+        h.read_on(&path).unwrap();
+        assert_eq!(h.sent(&path, SID).unwrap(), sent(&short, SID));
+    }
+
+    #[test]
     fn a_prompts_key_is_its_first_line() {
         assert_eq!(key("1 yes\n\nand give me a new prompt"), "1 yes");
         assert_eq!(key("\n  first   words\nsecond"), "first words");
@@ -323,6 +532,7 @@ mod test {
         Row {
             text: text.to_string(),
             band,
+            dim: false,
         }
     }
 
@@ -382,6 +592,18 @@ mod test {
         let mut both = screen(prompt);
         both[0] = row(&format!("\u{276f} {prompt}"), false);
         assert_eq!(find(&both, &key(prompt)), Some(Found::Row(3)));
+    }
+
+    #[test]
+    fn the_header_on_the_band_is_told_from_a_message_by_its_dim_words() {
+        // Claude Code 2.1.312 draws its sticky header on the band, its words grey on grey
+        let prompt = "Write a 12-line poem about terminals.";
+        let mut rows = screen("something else entirely, sent later");
+        rows[0] = Row { text: format!("\u{276f} {prompt}"), band: true, dim: true };
+        assert_eq!(find(&rows, &key(prompt)), Some(Found::Header(0)));
+        // A message on the band in white is the message itself
+        rows[0].dim = false;
+        assert_eq!(find(&rows, &key(prompt)), Some(Found::Row(0)));
     }
 
     #[test]

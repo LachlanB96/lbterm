@@ -17,6 +17,21 @@ that can't be seen past some point.
 With --expect it prints the start that fits best and how far the frames are from the spring:
 a split's line on the layout spring lands within a few pixels (capture timing, not motion).
 MS is the spring's duration as captured, so already stretched by any slowdown.
+
+A fade has no edge: --fade X Y W H measures, in that rectangle of each frame, how much of the
+first frame still shows (1 at the first, 0 at the last: the mean difference from the first over
+the whole difference, which is right for a cross-fade, each pixel a blend of the two), and writes
+  DIR/fade.csv     per frame, that share
+  DIR/fade.png     the share over time, and with --fade-ms MS the curve it should follow
+  DIR/contact.png  the frames from just before it starts to just after it ends
+--fade-ms MS (as captured, so stretched by any slowdown) and --fade-curve X1 Y1 X2 Y2 (a
+cubic-bezier, tab_switch's by default) print the start that fits best and how far the frames are
+from the curve, in shares of the whole fade. --crop X Y W H tiles only that rectangle of each frame
+in the fade's contact.png, at --zoom times its size (2 by default) rather than the whole frame at a
+third: a narrow strip (the scroll strip, the objectives strip) read at its real size and more.
+--tiles writes only contact.png, --count frames picked evenly from them all with their times (and
+--crop's rectangle of each, if given): for motion that turns back and ends where it started, which
+has no fade to measure.
 """
 import argparse
 import csv
@@ -41,6 +56,12 @@ ap.add_argument("--clamp", type=float)
 # The edge is on screen before it moves (an outline gliding): the motion starts when it moves more
 # than 2 px (its soft pixel flickers across the brightness threshold at rest)
 ap.add_argument("--still", action="store_true")
+ap.add_argument("--fade", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
+ap.add_argument("--fade-ms", type=float)
+ap.add_argument("--fade-curve", type=float, nargs=4, default=[0.23, 1, 0.32, 1], metavar=("X1", "Y1", "X2", "Y2"))
+ap.add_argument("--crop", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
+ap.add_argument("--zoom", type=int, default=2)
+ap.add_argument("--tiles", action="store_true")
 args = ap.parse_args()
 body = args.ring or None
 d = Path(args.dir)
@@ -51,6 +72,107 @@ frames = [
     np.asarray(Image.open(d / f"frame{int(r['frame']):03d}.png").convert("RGB"), dtype=int)
     for r in rows
 ]
+
+
+def bezier(x1, y1, x2, y2):
+    """CSS cubic-bezier: progress at time t, both 0 to 1"""
+
+    def at(t):
+        if t <= 0:
+            return 0.0
+        if t >= 1:
+            return 1.0
+        lo, hi = 0.0, 1.0
+        for _ in range(50):
+            u = (lo + hi) / 2
+            x = 3 * (1 - u) ** 2 * u * x1 + 3 * (1 - u) * u * u * x2 + u**3
+            lo, hi = (u, hi) if x < t else (lo, u)
+        u = (lo + hi) / 2
+        return 3 * (1 - u) ** 2 * u * y1 + 3 * (1 - u) * u * u * y2 + u**3
+
+    return at
+
+
+def tile(pick, label, path):
+    if args.crop:
+        # That rectangle alone, each pixel `zoom` pixels wide and tall, and room above it for
+        # the label (a narrow strip's tile is wider than the strip)
+        cx, cy, cw, ch = args.crop
+        tw, th = max(cw * args.zoom, 150), ch * args.zoom
+    else:
+        tw, th = frames[0].shape[1] // 3, frames[0].shape[0] // 3
+    sheet = Image.new("RGB", (args.cols * tw, math.ceil(len(pick) / args.cols) * (th + 16)), (40, 40, 40))
+    draw = ImageDraw.Draw(sheet)
+    for n, i in enumerate(pick):
+        x, y = (n % args.cols) * tw, (n // args.cols) * (th + 16)
+        image = Image.fromarray(frames[i].astype(np.uint8))
+        if args.crop:
+            part = image.crop((cx, cy, cx + cw, cy + ch))
+            thumb = part.resize((cw * args.zoom, ch * args.zoom), Image.NEAREST)
+        else:
+            thumb = image.resize((tw, th), Image.LANCZOS)
+        sheet.paste(thumb, (x, y + 16))
+        draw.text((x + 4, y + 2), label(i), fill=(230, 230, 230))
+    sheet.save(path)
+
+
+if args.tiles:
+    pick = sorted(set(np.linspace(0, len(frames) - 1, min(args.count, len(frames))).round().astype(int)))
+    tile(pick, lambda i: f"#{i} {times[i]:.0f} ms", d / "contact.png")
+    print(f"contact sheet {d / 'contact.png'}")
+    raise SystemExit(0)
+
+if args.fade:
+    fx, fy, fw, fh = args.fade
+    region = [f[fy : fy + fh, fx : fx + fw, :3].mean(axis=2) for f in frames]
+    whole = np.abs(region[-1] - region[0]).mean()
+    if whole < 0.5:
+        raise SystemExit(f"the first and last frames are alike in {args.fade}: nothing faded there")
+    share = [1 - np.abs(r - region[0]).mean() / whole for r in region]
+    with open(d / "fade.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["frame", "ms", "share"])
+        for i, (t, s) in enumerate(zip(times, share)):
+            w.writerow([i, t, f"{s:.4f}"])
+    first = next((i for i, s in enumerate(share) if s < 0.98), 0)
+    last = next((i for i in range(len(share)) if all(s < 0.02 for s in share[i:])), len(share) - 1)
+    print(f"fade starts at frame {first} ({times[first]:.0f} ms), done at frame {last} ({times[last]:.0f} ms)")
+    lo, hi = max(0, first - 2), min(len(frames) - 1, last + 3)
+    pick = sorted(set(np.linspace(lo, hi, min(args.count, hi - lo + 1)).round().astype(int)))
+    tile(pick, lambda i: f"#{i} {times[i] - times[first]:+.0f} ms  {share[i]:.2f}", d / "contact.png")
+    W, H, pad = 900, 420, 50
+    plot = Image.new("RGB", (W, H), (250, 250, 250))
+    pd = ImageDraw.Draw(plot)
+    t0, t1 = times[lo], times[hi]
+
+    def px(t, v):
+        return (pad + (t - t0) / max(1e-9, t1 - t0) * (W - 2 * pad), H - pad - v * (H - 2 * pad))
+
+    pd.rectangle([pad, pad, W - pad, H - pad], outline=(180, 180, 180))
+    pd.text((pad, 10), "share of the first frame: measured (red)" + (", curve (blue)" if args.fade_ms else ""), fill=(0, 0, 0))
+    if args.fade_ms:
+        curve = bezier(*args.fade_curve)
+        measured = [(times[i], share[i]) for i in range(lo, hi + 1)]
+
+        def rms(start):
+            return math.sqrt(sum((1 - curve((t - start) / args.fade_ms) - s) ** 2 for t, s in measured) / len(measured))
+
+        start = min(np.arange(times[first] - args.fade_ms / 2, times[first] + 1, 0.5), key=rms)
+        worst = max(abs(1 - curve((t - start) / args.fade_ms) - s) for t, s in measured)
+        print(f"fade fit: start {start - times[first]:+.1f} ms from the first frame that moved, rms {rms(start):.3f}, worst {worst:.3f} of the whole fade over {len(measured)} frames")
+        prev = None
+        for k in range(400):
+            t = t0 + (t1 - t0) * k / 399
+            p = px(t, 1 - curve((t - start) / args.fade_ms))
+            if prev:
+                pd.line([prev, p], fill=(40, 90, 220), width=2)
+            prev = p
+    for i in range(lo, hi + 1):
+        x, y = px(times[i], share[i])
+        pd.ellipse([x - 3, y - 3, x + 3, y + 3], fill=(220, 40, 40))
+    plot.save(d / "fade.png")
+    print(f"contact sheet {d / 'contact.png'}, plot {d / 'fade.png'}")
+    raise SystemExit(0)
 
 
 def edge(img):

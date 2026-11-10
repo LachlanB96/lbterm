@@ -46,6 +46,10 @@ impl VecStorage {
         // string.
         let mut cell_idx = 0;
         let mut has_implicit_hyperlinks = false;
+        // LBTerm: the last cell's attributes before and after its link, which the next takes
+        // when it had the same before, so a link's cells share one heap block (wezterm-cell's
+        // shared fat attributes) where each made its own
+        let mut last: Option<(wezterm_cell::CellAttributes, wezterm_cell::CellAttributes)> = None;
         for (byte_idx, _grapheme) in line.grapheme_indices(true) {
             let cell = &mut self.cells[cell_idx];
             let mut matched = false;
@@ -54,7 +58,19 @@ impl VecStorage {
                     let attrs = cell.attrs_mut();
                     // Don't replace existing links
                     if attrs.hyperlink().is_none() {
-                        attrs.set_hyperlink(Some(Arc::clone(&m.link)));
+                        match &last {
+                            Some((before, after))
+                                if before == attrs
+                                    && after.hyperlink().map_or(false, |l| Arc::ptr_eq(l, &m.link)) =>
+                            {
+                                *attrs = after.clone();
+                            }
+                            _ => {
+                                let before = attrs.clone();
+                                attrs.set_hyperlink(Some(Arc::clone(&m.link)));
+                                last = Some((before, attrs.clone()));
+                            }
+                        }
                         matched = true;
                     }
                 }

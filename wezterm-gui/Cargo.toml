@@ -127,6 +127,13 @@ winapi = { workspace=true, features = [
     "namedpipeapi",
     "synchapi",
     "winsock2",
+    # LBTerm: the control pipe (control.rs)
+    "winbase",
+    "winerror",
+    # LBTerm: the process's CPU, memory, handles and threads for metrics (counters.rs)
+    "processthreadsapi",
+    "psapi",
+    "winnt",
 ]}
 windows = { workspace=true, features = [
     "Win32_UI_Shell",
@@ -139,14 +146,25 @@ windows = { workspace=true, features = [
 ]}
 xml-rs.workspace = true
 # LBTerm: DirectComposition (lbterm/COMPOSITOR.md), at the version wgpu-hal
-# already builds, so the crate isn't compiled twice.
+# already builds, so the crate isn't compiled twice. `implement` and
+# `Foundation_Numerics` are for the tests' stand-in device (compositor/recorder.rs,
+# COMPOSITOR.md's "Checking it without a window"): `implement` gives the interfaces'
+# `_Impl` traits, which the visual's need Matrix3x2 for. Nothing at run time uses
+# them, and they're here rather than in dev-dependencies so the build and the
+# check's cargo test agree on the crate's features (lbterm-unify).
 windows58 = { package = "windows", version = "0.58", default-features = false, features = [
+    "Foundation_Numerics",
+    "implement",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectComposition",
+    # LBTerm: frame statistics and the time they're in (present.rs), as wgpu-hal has them
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
@@ -157,3 +175,8 @@ windows58 = { package = "windows", version = "0.58", default-features = false, f
 benchmarking.workspace = true
 env_logger.workspace = true
 k9.workspace = true
+
+# LBTerm: the path #[implement] writes its code against, for the stand-in device
+# (compositor/recorder.rs): the windows-core windows58 is built on
+[target.'cfg(windows)'.dev-dependencies]
+windows-core = { version = "0.58", default-features = false }

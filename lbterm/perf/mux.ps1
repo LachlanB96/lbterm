@@ -14,6 +14,10 @@ touched:
    sent again since (captured: mux-reattached.png), and offer no crash restore.
 4. It's closed as a window is (WM_CLOSE). The tabs must end with it, and the server after them.
 5. A third GUI, quit with QuitApplication (F12 here): the same.
+6. Claude Code starting in a shell tab just before a crash: a GUI and a second plain tab, noted as
+   two shell tabs; then the second reports a Claude session and the GUI is killed at once, inside
+   the note's 2 s (SAVE_AFTER), so the note still has it as a shell tab. The next GUI must offer
+   nothing: the pane with a session no noted tab has stands for the shell tab it started in.
 
   pwsh -File lbterm\perf\mux.ps1
 #>
@@ -22,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test 'mux' -Bin $Bin
 $note = Join-Path $env:APPDATA "lbterm\session-$($T.Class).json"
-$sock = Join-Path $T.Out 'sock'
+$sock = $T.Sock
 $cfg = Join-Path $T.Out 'config\mux.lua'
 $report = Join-Path $T.Out 'report.json'
 $sid = '5f0c2d7e-1b3a-4e6f-9a8b-7c6d5e4f3a21'
@@ -51,9 +55,12 @@ wezterm.on('update-status', function(window, pane)
   end
   local f = io.open(report, 'w')
   if f then f:write(encode(panes)); f:close() end
+  -- update-status comes again on its interval only after a status is set (PITFALLS.md, trap 48)
+  window:set_right_status('')
 end)
 return {
   automatically_reload_config = false,
+  wsl_domains = {},
   front_end = 'WebGpu',
   initial_cols = 90,
   status_update_interval = 500,
@@ -80,6 +87,15 @@ $b64 = { param($s) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s))
 [Console]::Write("`$e]9;4;1;40`$bel")
 'claude-ish: said its piece'
 Start-Sleep 600
+"@)
+
+# Claude Code arriving in a shell tab: its session and nothing more
+$sid2 = '2a7c9e1f-3b5d-4f60-8c1e-9d2b4a6f8e03'
+$sessionOnly = Join-Path $T.Out 'session-only.ps1'
+[IO.File]::WriteAllText($sessionOnly, @"
+`$e = [char]27; `$bel = [char]7
+[Console]::Write("`$e]1337;SetUserVar=claude_session=$(& $b64 $sid2)`$bel")
+'session-only: said its session'
 "@)
 
 function Open-Window {
@@ -136,6 +152,14 @@ Invoke-Test {
   if ($server.Count -ne 1) { throw "$($server.Count) test mux servers running after the first GUI connected" }
   New-Tab -From $panes[0].pane_id -Server -Program (New-PwshProgram -File $claudeish) | Out-Null
   Test-Claudeish (Read-Report 2) 'live'
+  # The crash-restore note has both tabs, the Claude-ish one with its session, 2 s after they
+  # changed: killed sooner, the note still had it as a shell tab, which the session's pane can't
+  # stand for, and the next GUI offered it
+  $noted = Wait-Until {
+    $n = try { Get-Content $note -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+    $n -and @($n.windows.tabs).Count -eq 2 -and @($n.windows.tabs | Where-Object { $_.claude_session -eq $sid }).Count
+  } -TimeoutSec 10 -IntervalMs 100
+  if (-not $noted) { Add-Failure "the crash-restore note didn't list both tabs, the Claude-ish one with its session, within 10 s" }
 
   # 2. As a crash would end it
   Stop-TestWindow $first
@@ -153,8 +177,9 @@ Invoke-Test {
   $remote = @($seen.remote_pane_id | Sort-Object)
   if (($remote -join ',') -ne (($serverIds | Sort-Object) -join ',')) { Add-Failure "remote_pane_id $($remote -join ',') isn't the server's $($serverIds -join ',')" }
   Start-Sleep 3  # past crash restore's 2 s wait for the attach, so a prompt would show by now
-  # Painted and still
-  Wait-Settled -Window $second -What 'the reattached window' | Out-Null
+  # Painted and still, with no prompt: both tabs are still open
+  $settled = Wait-Settled -Window $second -What 'the reattached window'
+  if ($settled.overlay) { Add-Failure "the reattached window put up '$($settled.overlay)' with both noted tabs still open (a crash-restore prompt)" }
   Get-Shot $second -Name 'mux-reattached' | ForEach-Object Dispose
 
   # 4. Closing the window ends its tabs, and the server goes once it has none
@@ -174,4 +199,37 @@ Invoke-Test {
   if (-not (Wait-Gone { Test-WindowAlive $third })) { Add-Failure 'the GUI was still running 8 s after QuitApplication' }
   if (-not (Wait-Gone { Get-TestServers })) { Add-Failure 'the server was still running 8 s after QuitApplication' }
   else { 'after QuitApplication: GUI and server gone' }
+
+  # 6. Claude Code starts in a noted shell tab and the GUI dies before the note says so
+  Remove-Item $note -ErrorAction SilentlyContinue
+  $fourth = Open-Window
+  $panes = Wait-ServerPanes 1
+  # In a folder of its own: a note offers identical tabs once (restore::to_offer), so two shell tabs
+  # in default_cwd would be one, which the first tab's pane stands for whatever the second becomes
+  $shellTab = New-Tab -From $panes[0].pane_id -Server -Cwd $T.Out
+  $two = Wait-Until {
+    $n = try { Get-Content $note -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+    $n -and @($n.windows.tabs).Count -eq 2 -and -not @($n.windows.tabs | Where-Object { $_.claude_session }).Count
+  } -TimeoutSec 10 -IntervalMs 100
+  if (-not $two) { throw 'the crash-restore note never listed the two shell tabs' }
+  Invoke-Cli send-text --pane-id $shellTab --no-paste "& '$sessionOnly'`r" -Server | Out-Null
+  $seen = Wait-Until {
+    $r = try { @(Get-Content $report -Raw -ErrorAction Stop | ConvertFrom-Json) } catch { @() }
+    @($r | Where-Object { $_.user_vars.claude_session -eq $sid2 }).Count
+  } -TimeoutSec 8 -IntervalMs 50
+  if (-not $seen) { throw "the GUI never saw the shell tab's session" }
+  Stop-TestWindow $fourth
+  # The check only means something if the note still had it as a shell tab
+  $left = Get-Content $note -Raw | ConvertFrom-Json
+  if (@($left.windows.tabs).Count -ne 2 -or @($left.windows.tabs | Where-Object { $_.claude_session }).Count) {
+    Add-Failure "the note had $(@($left.windows.tabs).Count) tabs, $(@($left.windows.tabs | Where-Object { $_.claude_session }).Count) with a session, when the GUI died, not two shell tabs: a kill inside SAVE_AFTER was not tested"
+  } else { 'killed inside SAVE_AFTER: the note still had the Claude tab as a shell tab' }
+  $fifth = Open-Window
+  Start-Sleep 3  # past crash restore's 2 s wait for the attach
+  $settled = Wait-Settled -Window $fifth -What 'the GUI after the kill'
+  if ($settled.overlay) { Add-Failure "the next GUI put up '$($settled.overlay)' though both noted tabs were still open: the session that started in the shell tab didn't stand for it" }
+  else { 'reattached: nothing offered' }
+  Send-Close $fifth
+  if (-not (Wait-Gone { Test-WindowAlive $fifth })) { Add-Failure 'the fifth GUI was still running 8 s after its window closed' }
+  if (-not (Wait-Gone { Get-TestServers })) { Add-Failure 'the server was still running 8 s after the fifth GUI closed' }
 } -Passed 'mux: tabs outlive a dead GUI with their state, and end with a closed or quit one'

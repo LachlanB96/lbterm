@@ -1,9 +1,9 @@
-use crate::quad::{HeapQuadAllocator, TripleLayerQuadAllocator};
+use crate::quad::TripleLayerQuadAllocator;
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
+use crate::termwindow::render::line_key::{CursorRow, LineFrame};
 use crate::termwindow::render::{
-    same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
-    RenderScreenLineParams,
+    LineQuadCacheValue, LineToEleShapeCacheKey, RenderScreenLineParams,
 };
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
 use ::window::bitmaps::TextureRect;
@@ -13,7 +13,6 @@ use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
-use ordered_float::NotNan;
 use std::time::Instant;
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -85,6 +84,8 @@ impl crate::TermWindow {
         let pane_id = pos.pane.pane_id();
         let current_viewport = self.get_viewport(pane_id);
         let dims = pos.pane.get_dimensions();
+        // LBTerm: the pane as this frame draws it, for the state file and a key's echo
+        self.lbterm_state_drawn(&pos.pane, &cursor, &dims);
 
         let gl_state = self.render_state.as_ref().unwrap();
 
@@ -291,6 +292,9 @@ impl crate::TermWindow {
 
             pos.pane
                 .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);
+            // LBTerm: the rows the pane draws, so the triggers know which of their lines have gone
+            // (render/triggers.rs)
+            self.lbterm_triggers_view(pane_id, stable_range.clone(), &palette);
 
             struct LineRender<'a, 'b> {
                 term_window: &'a mut crate::TermWindow,
@@ -316,11 +320,19 @@ impl crate::TermWindow {
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
+                // LBTerm: the cells linking to a picture row, drawn over after the lines
+                // (render/thumbnails.rs)
+                thumbnail_runs: Vec<lbterm_extras::thumbnails::Run>,
             }
 
             let left_pixel_x = padding_left
                 + border.left.get() as f32
                 + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
+
+            // LBTerm: a pane of the GUI's own has its rows copied out, its terminal held only for
+            // that, and laid out after, so its parser goes on taking in output meanwhile
+            // (render/pane_lines.rs)
+            let mut copied = self.lbterm_copy_lines(&pos.pane, stable_range.clone());
 
             let mut render = LineRender {
                 term_window: self,
@@ -346,6 +358,7 @@ impl crate::TermWindow {
                 window_is_transparent,
                 layers,
                 error: None,
+                thumbnail_runs: vec![],
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -356,81 +369,78 @@ impl crate::TermWindow {
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
                     let stable_row = stable_top + line_idx as StableRowIndex;
-                    // LBTerm: what triggers colour is drawn from a recoloured copy, and what's
-                    // new is noted for its effect (render/triggers.rs)
+                    // LBTerm: what triggers colour is drawn from a recoloured copy, kept while the
+                    // line is the same, and what's new is noted for its effect (render/triggers.rs)
                     let styled = self.term_window.lbterm_trigger_line(
                         self.pane_id,
                         stable_row,
                         line,
                         self.palette,
                     );
-                    let line: &Line = styled.as_ref().unwrap_or(&**line);
-                    let selrange = self
-                        .selrange
-                        .map_or(0..0, |sel| sel.cols_for_row(stable_row, self.rectangular));
-                    // Constrain to the pane width!
-                    let selrange = selrange.start..selrange.end.min(self.dims.cols);
+                    let line: &Line = styled.as_deref().unwrap_or(&**line);
+                    let (shape_hash, by_state) = self.term_window.lbterm_shape_hash_for_line(line);
+                    // LBTerm: noted before the line's cached quads can return early, and only for
+                    // a line holding a link drawn by state, as a picture's are: its cells were
+                    // looked through for one on every frame (render/thumbnails.rs)
+                    if by_state {
+                        crate::termwindow::render::thumbnails::lbterm_thumbnail_runs(
+                            line_idx,
+                            line,
+                            &mut self.thumbnail_runs,
+                        );
+                    }
 
-                    let (cursor, composing, password_input) = if self.cursor.y == stable_row {
-                        (
-                            Some(CursorProperties {
-                                position: StableCursorPosition {
-                                    y: 0,
-                                    ..*self.cursor
-                                },
-                                dead_key_or_leader: self.term_window.dead_key_status
-                                    != DeadKeyStatus::None
-                                    || self.term_window.leader_is_active(),
-                                cursor_fg: self.cursor_fg,
-                                cursor_bg: self.cursor_bg,
-                                cursor_border_color: self.cursor_border_color,
-                                cursor_is_default_color: self.cursor_is_default_color,
-                            }),
-                            match (self.pos.is_active, &self.term_window.dead_key_status) {
-                                (true, DeadKeyStatus::Composing(composing)) => {
-                                    Some(composing.to_string())
-                                }
-                                _ => None,
-                            },
-                            if self.term_window.config.detect_password_input {
-                                match self.pos.pane.get_metadata() {
-                                    Value::Object(obj) => {
-                                        match obj.get(&Value::String("password_input".to_string()))
-                                        {
-                                            Some(Value::Bool(b)) => *b,
-                                            _ => false,
-                                        }
-                                    }
-                                    _ => false,
-                                }
-                            } else {
-                                false
-                            },
-                        )
-                    } else {
-                        (None, None, false)
-                    };
-
-                    let shape_hash = self.term_window.shape_hash_for_line(line);
-
-                    let quad_key = LineQuadCacheKey {
+                    // LBTerm: the key is what the line shows, the cursor and the selected columns
+                    // as they are on it included, and `row_y` its row, in pixels from the
+                    // window's top: its quads are laid out at 0 and moved there as they're copied
+                    // in, so a line that only moved keeps its quads (render/line_key.rs)
+                    let (quad_key, row_y) = LineFrame {
                         pane_id: self.pane_id,
-                        password_input,
-                        pane_is_active: self.pos.is_active,
                         config_generation: self.term_window.config.generation(),
                         shape_generation: self.term_window.shape_generation,
                         quad_generation: self.term_window.quad_generation,
-                        composing: composing.clone(),
-                        selection: selrange.clone(),
-                        cursor,
-                        shape_hash,
-                        top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + (line_idx + self.pos.top) as f32
-                                * self.term_window.render_metrics.cell_size.height as f32,
-                        left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
-                        phys_line_idx: line_idx,
+                        left_pixel_x: self.left_pixel_x,
+                        top_pixel_y: self.top_pixel_y,
+                        pos_top: self.pos.top,
+                        cell_height: self.term_window.render_metrics.cell_size.height as f32,
+                        cols: self.dims.cols,
                         reverse_video: self.dims.reverse_video,
-                    };
+                        cursor: self.cursor,
+                        selection: self.selrange,
+                        rectangular: self.rectangular,
+                        is_active: self.pos.is_active,
+                        composited: self.term_window.lbterm_composited(),
+                        focused: self.term_window.focused.is_some(),
+                    }
+                    .line(line_idx, stable_row, shape_hash, || CursorRow {
+                        dead_key_or_leader: self.term_window.dead_key_status != DeadKeyStatus::None
+                            || self.term_window.leader_is_active(),
+                        cursor_fg: self.cursor_fg,
+                        cursor_bg: self.cursor_bg,
+                        cursor_border_color: self.cursor_border_color,
+                        cursor_is_default_color: self.cursor_is_default_color,
+                        composing: match (self.pos.is_active, &self.term_window.dead_key_status) {
+                            (true, DeadKeyStatus::Composing(composing)) => {
+                                Some(composing.to_string())
+                            }
+                            _ => None,
+                        },
+                        password_input: if self.term_window.config.detect_password_input {
+                            match self.pos.pane.get_metadata() {
+                                Value::Object(obj) => {
+                                    match obj.get(&Value::String("password_input".to_string())) {
+                                        Some(Value::Bool(b)) => *b,
+                                        _ => false,
+                                    }
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        },
+                    });
+                    let selrange = quad_key.selection.clone();
+                    let password_input = quad_key.password_input;
 
                     if let Some(cached_quad) =
                         self.term_window.line_quad_cache.borrow_mut().get(&quad_key)
@@ -439,25 +449,32 @@ impl crate::TermWindow {
                             .expires
                             .map(|i| Instant::now() >= i)
                             .unwrap_or(false);
-                        let hover_changed = if cached_quad.invalidate_on_hover_change {
-                            !same_hyperlink(
+                        // LBTerm: only when which of its own links is under the pointer changes,
+                        // where any frame with the pointer on no link laid out every line holding
+                        // one again (lbterm_extras::link_looks::hover_changed)
+                        let hover_changed = cached_quad.invalidate_on_hover_change
+                            && lbterm_extras::link_looks::hover_changed(
+                                &cached_quad.lbterm_links,
                                 cached_quad.current_highlight.as_ref(),
                                 self.term_window.current_highlight.as_ref(),
-                            )
-                        } else {
-                            false
-                        };
+                            );
                         if !expired && !hover_changed {
                             cached_quad
                                 .layers
-                                .apply_to(self.layers)
-                                .context("cached_quad.layers.apply_to")?;
+                                .lbterm_apply_moved(self.layers, row_y)
+                                .context("cached_quad.layers.lbterm_apply_moved")?;
                             self.term_window.update_next_frame_time(cached_quad.expires);
                             return Ok(());
                         }
                     }
 
-                    let mut buf = HeapQuadAllocator::default();
+                    // LBTerm: a line laid out again, counted (lbterm_extras::work)
+                    lbterm_extras::work::WORK.line();
+                    // LBTerm: laid out where the window's lines are laid out, its room kept from
+                    // line to line, then kept at its own size (quad.rs, `lbterm_exact`); taken out
+                    // while it's drawn into, so a layout that fails leaves an empty one behind
+                    let mut buf = self.term_window.lbterm_line_quads.take();
+                    buf.lbterm_clear();
                     let next_due = self.term_window.has_animation.borrow_mut().take();
 
                     let shape_key = LineToEleShapeCacheKey {
@@ -480,7 +497,9 @@ impl crate::TermWindow {
                         .term_window
                         .render_screen_line(
                             RenderScreenLineParams {
-                                top_pixel_y: *quad_key.top_pixel_y,
+                                // LBTerm: at row 0, the window's top; moved to `row_y` as
+                                // it's copied in
+                                top_pixel_y: 0.0,
                                 left_pixel_x: self.left_pixel_x,
                                 pixel_width: self.dims.cols as f32
                                     * self.term_window.render_metrics.cell_size.width as f32,
@@ -521,11 +540,13 @@ impl crate::TermWindow {
                     let expires = self.term_window.has_animation.borrow().as_ref().cloned();
                     self.term_window.update_next_frame_time(next_due);
 
-                    buf.apply_to(self.layers)
-                        .context("HeapQuadAllocator::apply_to")?;
+                    buf.lbterm_apply_moved(self.layers, row_y)
+                        .context("HeapQuadAllocator::lbterm_apply_moved")?;
+                    let layers = buf.lbterm_exact();
+                    self.term_window.lbterm_line_quads.replace(buf);
 
                     let quad_value = LineQuadCacheValue {
-                        layers: buf,
+                        layers,
                         expires,
                         invalidate_on_hover_change: render_result.invalidate_on_hover_change,
                         current_highlight: if render_result.invalidate_on_hover_change {
@@ -533,6 +554,7 @@ impl crate::TermWindow {
                         } else {
                             None
                         },
+                        lbterm_links: render_result.lbterm_links,
                     };
 
                     self.term_window
@@ -555,10 +577,24 @@ impl crate::TermWindow {
                 }
             }
 
-            pos.pane.with_lines_mut(stable_range.clone(), &mut render);
-            if let Some(error) = render.error.take() {
+            match copied.as_mut() {
+                Some(copied) => copied.lay_out(&mut render),
+                None => pos.pane.with_lines_mut(stable_range.clone(), &mut render),
+            }
+            let error = render.error.take();
+            let thumbnail_runs = std::mem::take(&mut render.thumbnail_runs);
+            // LBTerm: the rows kept, so the next frame copies only those that change: a pass
+            // that fails (a shape cache to clear, an atlas to grow) is done again at once
+            if let Some(copied) = copied {
+                self.lbterm_keep_lines(pane_id, copied);
+            }
+            if let Some(error) = error {
                 return Err(error).context("error while calling with_lines_mut");
             }
+            // LBTerm: the images the pane's lines link to, drawn into the rows they cover
+            // (render/thumbnails.rs)
+            self.lbterm_paint_thumbnails(layers, pos, &thumbnail_runs, top_pixel_y, left_pixel_x, hsv)
+                .context("lbterm_paint_thumbnails")?;
         }
 
         /*

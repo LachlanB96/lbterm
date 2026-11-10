@@ -57,7 +57,8 @@ impl UserData for MuxWindow {
         methods.add_method("get_title", |_, this, _: ()| {
             let mux = get_mux()?;
             let window = this.resolve(&mux)?;
-            Ok(window.get_title().to_string())
+            // LBTerm: the server's newest, kept until a take sets it (mux's lbterm_window_titles)
+            Ok(mux::lbterm_window_titles::title(&window))
         });
         methods.add_method("set_title", |_, this, title: String| {
             let mux = get_mux()?;

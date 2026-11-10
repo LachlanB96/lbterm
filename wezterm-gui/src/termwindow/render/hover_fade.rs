@@ -38,7 +38,12 @@ pub fn fades(item: &UIItemType) -> bool {
     matches!(
         item,
         UIItemType::TabBar(
-            TabBarItem::WindowButton(_) | TabBarItem::LbtermRestart | TabBarItem::LbtermSummary
+            TabBarItem::WindowButton(_)
+                | TabBarItem::LbtermRestart
+                | TabBarItem::LbtermSummary
+                | TabBarItem::LbtermInbox
+                | TabBarItem::LbtermAgenda
+                | TabBarItem::LbtermContext
         )
     )
 }

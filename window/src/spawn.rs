@@ -50,7 +50,7 @@ fn schedule_with_pri(runnable: Runnable, high_pri: bool, site: SpawnSite) {
 /// a summary is logged when its window ends rather than with whatever is timed next
 fn slow_log_wake(after: std::time::Duration) {
     promise::spawn::spawn_into_main_thread(async move {
-        async_io::Timer::after(after).await;
+        lbterm_extras::counters::timer(async_io::Timer::after(after)).await;
         lbterm_extras::slow::wake_up();
     })
     .detach();
@@ -71,6 +71,8 @@ impl SpawnQueue {
             }),
         );
         lbterm_extras::slow::set_waker(slow_log_wake);
+        // Its timer and task are the measuring's own, not work at rest (lbterm_extras::budget)
+        lbterm_extras::budget::own(file!());
     }
 
     pub fn run(&self) -> bool {
@@ -130,10 +132,39 @@ impl SpawnQueue {
     }
 
     fn run_impl(&self) -> bool {
+        self.run_windows(false)
+    }
+
+    /// LBTerm: the message loop's drain, which stops for a message waiting for the window
+    /// (connection.rs). The sizing loop's pumps in window.rs, where Windows takes the messages,
+    /// still run every task (`run`)
+    pub(crate) fn run_until_message(&self) -> bool {
+        self.run_windows(true)
+    }
+
+    fn run_windows(&self, stop_for_messages: bool) -> bool {
         self.event_handle.reset_event();
+        // LBTerm: the drain stops for a message waiting for the window, a key, the pointer or a
+        // posted message, which the loop takes before it drains again: it ran every task queued,
+        // the low-priority ones and any queued while it ran included, before the loop looked at
+        // a single message. Windows is asked every 0.5 ms of draining, and it's counted
+        // (lbterm_extras::work)
+        let mut drain = lbterm_extras::work::Drain::start(Instant::now());
         while let Some(func) = self.pop_func() {
             func();
+            let now = Instant::now();
+            if drain.ran(now) {
+                let waiting = crate::os::windows::work::message_waiting();
+                drain.checked(now, waiting);
+                if stop_for_messages && waiting && self.has_any_queued() {
+                    drain.cut();
+                    // What's left is run at the loop's next turn, which mustn't sleep on it
+                    self.event_handle.set_event();
+                    break;
+                }
+            }
         }
+        drain.end(Instant::now(), &lbterm_extras::work::WORK);
         self.has_any_queued()
     }
 }

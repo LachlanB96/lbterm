@@ -16,16 +16,17 @@ $T = Start-Test 'clipboard-image' -Bin $Bin
 
 if ($WithImage) {
   # Windows PowerShell for the clipboard's image API, as wezterm.lua's fallback uses it
-  & powershell.exe -NoProfile -NonInteractive -Command @'
+  $setImage = @'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $b = New-Object System.Drawing.Bitmap 8, 8
 [System.Windows.Forms.Clipboard]::SetImage($b)
 '@
+  & powershell.exe -NoProfile -NonInteractive -Command $setImage  # windows-ok: the clipboard's image API, as wezterm.lua's fallback uses it, is 5.1's
 }
 
 # The answer Get-Clipboard gives, and how long it takes, the way wezterm.lua asked before
 $watch = [Diagnostics.Stopwatch]::StartNew()
-$probe = & powershell.exe -NoProfile -NonInteractive -Command 'if (Get-Clipboard -Format Image) { "img" }'
+$probe = & powershell.exe -NoProfile -NonInteractive -Command 'if (Get-Clipboard -Format Image) { "img" }'  # windows-ok: Get-Clipboard -Format Image is 5.1's alone
 $probeMs = $watch.ElapsedMilliseconds
 $expected = [bool]($probe -match 'img')
 
@@ -36,7 +37,7 @@ local wezterm = require 'wezterm'
 local started = os.clock()
 local has = wezterm.gui.clipboard_has_image()
 wezterm.log_warn(string.format('clipboard_has_image=%s in %.3f ms', tostring(has), (os.clock() - started) * 1000))
-return { lbterm_crash_restore = false, automatically_reload_config = false, front_end = 'WebGpu' }
+return { lbterm_crash_restore = false, wsl_domains = {}, automatically_reload_config = false, front_end = 'WebGpu' }
 '@ | Set-Content -Path $lua -Encoding utf8NoBOM
 
 Invoke-Test {

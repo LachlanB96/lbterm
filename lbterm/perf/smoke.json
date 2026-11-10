@@ -1,0 +1,17 @@
+{
+  "about": "The smoke set: the test-window runs every branch's last stage makes with lbterm.ps1 e2e -Smoke, beside the scripts the branch added or changed (Lachlan's 1a of 2026-11-09). Each guards a break that would cost him most in his daily LBTerm, runs in under about a minute, and never failed on the PC's account in the history (.claude/tools/e2e-history.ts). Entries are run names exactly as lbterm.ps1 e2e names them (a script, or a script and its variant's suffix), so naming a script doesn't bring its variants. About 5 minutes when they pass.",
+  "scripts": [
+    { "name": "mux", "why": "his tabs live in the mux server: a tab's state reaches the GUI, survives a killed GUI, comes back on attach" },
+    { "name": "mux-reconnect", "why": "the server hanging up or dying: the window reconnects and keeps its tabs, or gives up and closes" },
+    { "name": "server-start", "why": "starting the server: one server, never two, never a GUI waiting on nothing" },
+    { "name": "socket-keep", "why": "the server keeps its socket, which every project reaching his tabs goes through" },
+    { "name": "restore", "why": "crash restore brings his tabs back" },
+    { "name": "echo-frame", "why": "a key's echo in the first frame after it: typing arriving in bursts is what he notices first" },
+    { "name": "echo-frame-mux", "why": "the same through the mux server, as his tabs are" },
+    { "name": "claude-working", "why": "reading real Claude Code's screen: a stand-in passed while the scroll strip was wrong (2026-10-28)" },
+    { "name": "scroll-strip", "why": "the scroll strip against a Claude transcript" },
+    { "name": "spawn-no-activate", "why": "nothing LBTerm opens takes the foreground: a window that does swallows his typing" },
+    { "name": "last-tab", "why": "the last tab closing, the window and the Conductor's pad" },
+    { "name": "gpu-lost", "why": "a lost GPU device: the window rebuilds and keeps its panes (a driver update destroyed a window with every pane, 2026-08-11)" }
+  ]
+}

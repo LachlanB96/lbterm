@@ -420,6 +420,11 @@ pub fn set_config_file_override(path: &Path) {
 pub fn set_config_overrides(items: &[(String, String)]) -> anyhow::Result<()> {
     *CONFIG_OVERRIDES.lock().unwrap() = items.to_vec();
 
+    // LBTerm: with none, there's nothing to check early, and this made a whole Lua context and a
+    // default config through it, to throw both away, before every GUI, mux server and cli start
+    if items.is_empty() {
+        return Ok(());
+    }
     let _ = default_config_with_overrides_applied()?;
     Ok(())
 }
@@ -584,13 +589,15 @@ impl ConfigInner {
     /// configuration.
     /// On failure, retain the existing configuration but
     /// replace any captured error message.
-    fn reload(&mut self) {
+    /// Takes a config Config::load made (LBTerm: Configuration::reload runs the file first,
+    /// outside the lock, and hands its result here)
+    fn apply_loaded(&mut self, loaded: LoadedConfig) {
         let LoadedConfig {
             config,
             file_name,
             lua,
             warnings,
-        } = Config::load();
+        } = loaded;
 
         self.warnings = warnings;
 
@@ -696,12 +703,16 @@ impl ConfigInner {
 
 pub struct Configuration {
     inner: Mutex<ConfigInner>,
+    /// LBTerm: reloads one at a time, so each's Lua state reaches the main thread in the order
+    /// their configs are swapped in, now that the file runs outside `inner` (reload)
+    reloading: Mutex<()>,
 }
 
 impl Configuration {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(ConfigInner::new()),
+            reloading: Mutex::new(()),
         }
     }
 
@@ -751,10 +762,17 @@ impl Configuration {
         inner.use_test();
     }
 
-    /// Reload the configuration
+    /// Reload the configuration. LBTerm: the file runs before `inner` is locked, which every
+    /// reader of the config takes (configuration(), the GUI thread's included), and the lock is
+    /// held only to swap the result in: upstream ran the file under it, so a save held every
+    /// reader for as long as the config took to run
     pub fn reload(&self) {
+        let _one_at_a_time = self.reloading.lock().unwrap();
+        // LBTerm: the budget's reload is timed from here (lbterm.rs)
+        crate::lbterm::note_reload_start();
+        let loaded = Config::load();
         let mut inner = self.inner.lock().unwrap();
-        inner.reload();
+        inner.apply_loaded(loaded);
     }
 
     /// Returns a copy of any captured error message.

@@ -7,10 +7,18 @@ use bitflags::bitflags;
 mod c1;
 mod csi;
 mod image;
+/// LBTerm: get_changed_stable_rows reads only what can have changed
+mod lbterm_changes;
+/// LBTerm: the scrollback grows as it fills
+mod lbterm_scrollback;
+// LBTerm: a resize's rewrap marks only what it joins, cuts or moves
+mod lbterm_rewrap;
 mod notify;
 mod program_status;
 mod progress;
 mod prompt_modes;
+mod prompt_rows;
+mod titles;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
 use k9::assert_equal as assert_eq;

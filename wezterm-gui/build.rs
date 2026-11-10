@@ -19,15 +19,7 @@ fn main() {
             let dest_name = exe_output_dir.join(name);
             let src_name = conhost_dir.join(name);
 
-            if !dest_name.exists() {
-                std::fs::copy(&src_name, &dest_name)
-                    .context(format!(
-                        "copy {} -> {}",
-                        src_name.display(),
-                        dest_name.display()
-                    ))
-                    .unwrap();
-            }
+            lbterm_copy_asset(&src_name, &dest_name);
         }
 
         let angle_dir = windows_dir.join("angle");
@@ -35,15 +27,7 @@ fn main() {
             let dest_name = exe_output_dir.join(name);
             let src_name = angle_dir.join(name);
 
-            if !dest_name.exists() {
-                std::fs::copy(&src_name, &dest_name)
-                    .context(format!(
-                        "copy {} -> {}",
-                        src_name.display(),
-                        dest_name.display()
-                    ))
-                    .unwrap();
-            }
+            lbterm_copy_asset(&src_name, &dest_name);
         }
 
         {
@@ -51,15 +35,7 @@ fn main() {
             let _ = std::fs::create_dir(&dest_mesa);
             let dest_name = dest_mesa.join("opengl32.dll");
             let src_name = windows_dir.join("mesa").join("opengl32.dll");
-            if !dest_name.exists() {
-                std::fs::copy(&src_name, &dest_name)
-                    .context(format!(
-                        "copy {} -> {}",
-                        src_name.display(),
-                        dest_name.display()
-                    ))
-                    .unwrap();
-            }
+            lbterm_copy_asset(&src_name, &dest_name);
         }
 
         // If a file named `.tag` is present, we'll take its contents for the
@@ -184,4 +160,36 @@ END
             ))
             .unwrap();
     }
+}
+
+/// LBTerm: a bundled file (ConPTY, ANGLE, Mesa) copied next to the exes whenever it differs from
+/// the build's copy, and the build script run again when it changes. Upstream copied it only when
+/// the build had none, so a new ConPTY in assets/windows/conhost never reached a build folder
+/// that already had the old one (2026-10-31). A copy a running program holds (a test window from
+/// its build folder) is renamed aside first, as `lbterm.ps1 install` does, since Windows lets a
+/// file in use be renamed but not replaced.
+#[cfg(windows)]
+fn lbterm_copy_asset(src_name: &std::path::Path, dest_name: &std::path::Path) {
+    use anyhow::Context as _;
+    println!("cargo:rerun-if-changed={}", src_name.display());
+    let src = std::fs::read(src_name)
+        .context(format!("read {}", src_name.display()))
+        .unwrap();
+    if std::fs::read(dest_name).ok().as_deref() == Some(&src[..]) {
+        return;
+    }
+    if dest_name.exists() && std::fs::remove_file(dest_name).is_err() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut aside = dest_name.as_os_str().to_owned();
+        aside.push(format!(".old-{stamp}"));
+        std::fs::rename(dest_name, &aside)
+            .context(format!("move {} aside, which something holds", dest_name.display()))
+            .unwrap();
+    }
+    std::fs::write(dest_name, &src)
+        .context(format!("copy {} -> {}", src_name.display(), dest_name.display()))
+        .unwrap();
 }

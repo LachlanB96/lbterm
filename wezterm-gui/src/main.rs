@@ -36,12 +36,22 @@ use wezterm_toast_notification::*;
 
 mod colorease;
 mod commands;
+mod conversations;
+mod control;
+mod counters;
 mod customglyph;
+mod drafts;
 mod download;
 mod frontend;
 mod glyphcache;
+mod inbox;
 mod inputmap;
+mod let_go;
+mod mic;
 mod overlay;
+mod park;
+mod placement;
+mod present;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;
@@ -53,6 +63,7 @@ mod selection;
 mod shapecache;
 mod spawn;
 mod conductor_hub;
+mod seat_client;
 mod stats;
 mod state_files;
 mod state_probe;
@@ -62,6 +73,10 @@ mod tabbar;
 mod tab_ghost;
 mod tabcolors;
 mod termwindow;
+// LBTerm: where the test binary crashed, said before it dies (test_crash.rs)
+#[cfg(all(test, windows))]
+mod test_crash;
+mod thumbnails;
 mod toasts;
 mod unicode_names;
 mod uniforms;
@@ -421,12 +436,20 @@ async fn async_run_terminal_gui(
     opts: StartCommand,
     should_publish: bool,
 ) -> anyhow::Result<()> {
+    lbterm_extras::start::mark("gui_task");
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
     std::env::set_var("WEZTERM_UNIX_SOCKET", unix_socket_path.clone());
     wezterm_blob_leases::register_storage(Arc::new(
         wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
     ))?;
+    // LBTerm: the panes of its own parked tabs beside its socket, a mux domain's left to its
+    // server, written only once one of its own is parked (mux's lbterm_parked.rs)
+    mux::lbterm_parked::publish(
+        unix_socket_path.clone(),
+        |pane| pane.downcast_ref::<wezterm_client::pane::ClientPane>().is_none(),
+        false,
+    );
     if let Err(err) = spawn_mux_server(unix_socket_path, should_publish) {
         log::warn!("{:#}", err);
     }
@@ -466,6 +489,7 @@ async fn async_run_terminal_gui(
     if !opts.attach {
         trigger_and_log_gui_startup(spawn_command).await;
     }
+    lbterm_extras::start::mark("gui_startup");
 
     let is_connecting = opts.attach;
 
@@ -500,7 +524,12 @@ async fn async_run_terminal_gui(
             trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         }
     }
-    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
+    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await?;
+    lbterm_extras::start::mark("tab");
+    // LBTerm: the domain has attached and the window has its tabs: crash restore may ask now
+    // (restore.rs), not over the connection status a mux domain shows until then
+    crate::restore::start_up_done();
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -763,6 +792,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         default_domain_name.as_deref(),
         opts.workspace.as_deref(),
     )?;
+    lbterm_extras::start::mark("mux");
 
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
@@ -786,7 +816,15 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         return Ok(());
     }
 
+    // LBTerm: the GPU's instance and adapter begun now, on a thread of their own, while the rest
+    // of the start goes on: the first window takes them (termwindow/gpu_warm.rs). Only once the
+    // request wasn't handed to a running LBTerm: a process that hands it over and exits would
+    // make a D3D12 device on every adapter for nothing, and could exit inside the driver
+    // (PITFALLS 58)
+    crate::termwindow::gpu_warm::warm_up(&config);
+    lbterm_extras::start::mark("gpu_begun");
     let gui = crate::frontend::try_new()?;
+    lbterm_extras::start::mark("frontend");
     let activity = Activity::new();
     // LBTerm: read the note of tabs the last LBTerm left, before writing ours (restore.rs)
     if config.lbterm_crash_restore {
@@ -794,6 +832,10 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     }
     // LBTerm: the "Restart to update" pill (restart.rs)
     crate::restart::watch();
+    // LBTerm: letting go of a folder another program asks to rename (let_go.rs)
+    crate::let_go::start();
+    // LBTerm: the control pipe other programs ask this GUI through (control.rs)
+    crate::control::start();
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
@@ -847,6 +889,8 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
 }
 
 fn main() {
+    // LBTerm: the start's marks are timed from here (lbterm_extras::start, metrics' start)
+    lbterm_extras::start::began(std::time::Instant::now());
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
@@ -1221,6 +1265,7 @@ fn run() -> anyhow::Result<()> {
     };
 
     env_bootstrap::bootstrap();
+    lbterm_extras::start::mark("bootstrap");
     // window_funcs is not set up by env_bootstrap as window_funcs is
     // GUI environment specific and env_bootstrap is used to setup the
     // headless mux server.
@@ -1229,6 +1274,10 @@ fn run() -> anyhow::Result<()> {
     config::lua::add_context_setup_func(crate::stats::register);
 
     stats::Stats::init()?;
+    // LBTerm: the counters start, on the GUI thread (counters.rs, lbterm/PERF.md)
+    counters::start();
+    // LBTerm: a write to a pane that didn't get there shows on its scroll strip
+    termwindow::render::scroll_strip::start();
     let _saver = umask::UmaskSaver::new();
 
     config::common_init(
@@ -1236,6 +1285,7 @@ fn run() -> anyhow::Result<()> {
         &opts.config_override,
         opts.skip_config,
     )?;
+    lbterm_extras::start::mark("config");
     let config = config::configuration();
     if let Some(value) = &config.default_ssh_auth_sock {
         std::env::set_var("SSH_AUTH_SOCK", value);

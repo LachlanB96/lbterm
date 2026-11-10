@@ -1,0 +1,7 @@
+[
+  { "name": "c-rest", "config": "bench", "lua": "lbterm_compositor = true,", "steps": ["rest:30", "rest:90"] },
+  { "name": "m-comp", "config": "bench", "mux": true, "lua": "lbterm_compositor = true,", "steps": ["tabs:8", "lines:100000:plain", "closefill"] },
+  { "name": "m-sb100k", "config": "bench", "mux": true, "lua": "lbterm_compositor = true,", "scrollback": 100000, "steps": ["lines:100000:plain", "closefill"] },
+  { "name": "l-local", "config": "lachlan", "scrollback": 50000, "steps": ["rest:30", "tabs:8", "lines:100000:varied", "closefill"] },
+  { "name": "l-mux", "config": "lachlan", "mux": true, "scrollback": 50000, "steps": ["tabs:8", "lines:100000:varied", "closefill"] }
+]

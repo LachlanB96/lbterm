@@ -37,8 +37,20 @@ pub mod activity;
 pub mod client;
 pub mod connui;
 pub mod domain;
+pub mod lbterm_keep;
+pub mod lbterm_output;
+pub mod lbterm_parked;
+pub mod lbterm_procs;
+pub mod lbterm_prompts;
+pub mod lbterm_ptyrec;
+pub mod lbterm_push_read;
 pub mod lbterm_repaint;
+#[cfg(windows)]
+pub mod lbterm_serve;
 pub mod lbterm_typed;
+pub mod lbterm_wait;
+pub mod lbterm_window_titles;
+pub mod lbterm_writes;
 pub mod localpane;
 pub mod pane;
 pub mod renderable;
@@ -97,6 +109,12 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+    /// LBTerm: a tab parked or unparked (`Tab::lbterm_set_parked`; lbterm/NEW-TAB.md,
+    /// "Landing 4", 8a)
+    LbtermTabParked {
+        tab_id: TabId,
+        parked: bool,
+    },
 }
 
 static LAST_SUBSCRIBER_ID: AtomicUsize = AtomicUsize::new(0);
@@ -118,16 +136,37 @@ pub struct Mux {
 }
 
 const BUFSIZE: usize = 1024 * 1024;
+/// LBTerm: what a pane's reader reads ConPTY's output into, the parser's buffer's size
+/// (mux_output_parser_buffer_size's default). Upstream read into BUFSIZE, a megabyte for every
+/// pane, zeroed and so committed, which a read seldom fills
+const LBTERM_READ_BUFSIZE: usize = 128 * 1024;
 
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
-fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: Vec<Action>) {
+fn send_actions_to_mux(
+    pane: &Weak<dyn Pane>,
+    dead: &Arc<AtomicBool>,
+    actions: Vec<Action>,
+    notice: &Arc<lbterm_output::OutputNotice>,
+) {
     let start = Instant::now();
     match pane.upgrade() {
         Some(pane) => {
             pane.perform_actions(actions);
             histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
-            Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id()));
+            // LBTerm: a notification only when none is on its way already, which covers this
+            // batch too (lbterm_output.rs); upstream queued a main-thread task for every batch
+            if notice.queue() {
+                let notice = Arc::clone(notice);
+                let pane_id = pane.pane_id();
+                promise::spawn::spawn_into_main_thread(async move {
+                    notice.delivering();
+                    if let Some(mux) = Mux::try_get() {
+                        mux.notify(MuxNotification::PaneOutput(pane_id));
+                    }
+                })
+                .detach();
+            }
         }
         None => {
             // Something else removed the pane from
@@ -141,14 +180,22 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
 
 /// This is the parsing loop for the given pane.
 /// It reads all data sent to `rx` (from pane PTY) and handles all terminal events for this pane.
-fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
+fn parse_buffered_data(
+    pane: Weak<dyn Pane>,
+    dead: &Arc<AtomicBool>,
+    mut rx: FileDescriptor,
+    coalesce: lbterm_wait::Coalesce,
+) {
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
+    // LBTerm: runs of ASCII as one PrintString each, which the terminal takes whole
+    parser.lbterm_print_runs(true);
     let mut actions = vec![];
     let mut hold = false;
     let mut action_size = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline = None;
+    let notice = Arc::new(lbterm_output::OutputNotice::default());
 
     loop {
         match rx.read(&mut buf) {
@@ -192,7 +239,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                     action.append_to(&mut actions);
 
                     if flush && !actions.is_empty() {
-                        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions), &notice);
                         action_size = 0;
                     }
                 });
@@ -210,13 +257,18 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                             }
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
-                        if poll_delay.is_some() {
-                            let mut pfd = [pollfd {
-                                fd: rx.as_socket_descriptor(),
-                                events: POLLIN,
-                                revents: 0,
-                            }];
-                            if let Ok(1) = poll(&mut pfd, poll_delay) {
+                        if let Some(poll_delay) = poll_delay {
+                            // LBTerm: waited on time, not to Windows' 15.6 ms tick
+                            // (lbterm_wait.rs)
+                            let readable = coalesce.wait(poll_delay, || {
+                                let mut pfd = [pollfd {
+                                    fd: rx.as_socket_descriptor(),
+                                    events: POLLIN,
+                                    revents: 0,
+                                }];
+                                matches!(poll(&mut pfd, Some(Duration::ZERO)), Ok(1))
+                            });
+                            if readable {
                                 // We can read now without blocking, so accumulate
                                 // more data into actions
                                 continue;
@@ -227,7 +279,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                         }
                     }
 
-                    send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions), &notice);
                     deadline = None;
                     action_size = 0;
                 }
@@ -244,7 +296,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     // for very short lived commands so that we don't forget to
     // display what they displayed.
     if !actions.is_empty() {
-        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions), &notice);
     }
 }
 
@@ -287,14 +339,22 @@ fn read_from_pane_pty(
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
 ) {
-    let mut buf = vec![0; BUFSIZE];
+    let mut buf = vec![0; LBTERM_READ_BUFSIZE];
 
     // This is used to signal that an error occurred either in this thread,
     // or in the main mux thread.  If `true`, this thread will terminate.
     let dead = Arc::new(AtomicBool::new(false));
 
-    let (pane_id, exit_behavior) = match pane.upgrade() {
-        Some(pane) => (pane.pane_id(), pane.exit_behavior()),
+    // LBTerm: with LBTERM_PTY_RECORD set, every read recorded (lbterm_ptyrec.rs); else None
+    let (pane_id, exit_behavior, record) = match pane.upgrade() {
+        Some(pane) => (
+            pane.pane_id(),
+            pane.exit_behavior(),
+            lbterm_ptyrec::Recorder::start(pane.pane_id(), || {
+                let d = pane.get_dimensions();
+                (d.viewport_rows, d.cols)
+            }),
+        ),
         None => return,
     };
 
@@ -313,10 +373,21 @@ fn read_from_pane_pty(
         }
     };
 
+    // LBTerm: the parser's coalescing wait (lbterm_wait.rs); a pane without one says so, as
+    // one without its socketpair does
+    let coalesce = match lbterm_wait::Coalesce::new() {
+        Ok(c) => c,
+        Err(err) => {
+            log::error!("read_from_pane_pty: {err:#}");
+            localpane::emit_output_for_pane(pane_id, &format!("⚠️  wezterm: read_from_pane_pty: {err:#}"));
+            return;
+        }
+    };
+
     // Spawn parser thread for this pane
     std::thread::spawn({
         let dead = Arc::clone(&dead);
-        move || parse_buffered_data(pane, &dead, rx)
+        move || parse_buffered_data(pane, &dead, rx, coalesce)
     });
 
     if let Some(banner) = banner {
@@ -336,6 +407,9 @@ fn read_from_pane_pty(
                 break;
             }
             Ok(size) => {
+                if let Some(record) = &record {
+                    record.read(&buf[..size]);
+                }
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
                 // Send received data to this pane parser thread.
@@ -348,6 +422,9 @@ fn read_from_pane_pty(
                 }
             }
         }
+    }
+    if record.is_some() {
+        lbterm_ptyrec::finished(pane_id);
     }
 
     match exit_behavior.unwrap_or_else(|| configuration().exit_behavior) {
@@ -907,8 +984,40 @@ impl Mux {
                     return;
                 }
             };
+            // LBTerm: a window's last tab whose program ended can be left to a keeper, which puts
+            // a new tab in its place before removing it (lbterm_keep.rs). Found before the windows
+            // prune their dead tabs, which would take it and its panes
+            let kept: Vec<TabId> = windows
+                .iter()
+                .flat_map(|(&window_id, win)| {
+                    // Each tab, and whether its program ended: every pane dead or gone from the
+                    // mux, as the window's own pruning judges them
+                    let tabs: Vec<(TabId, bool)> = win
+                        .iter_tabs()
+                        .map(|tab| {
+                            let panes = tab.iter_panes_ignoring_zoom();
+                            let ended = !panes.is_empty()
+                                && panes.iter().all(|p| {
+                                    p.pane.is_dead() || self.get_pane(p.pane.pane_id()).is_none()
+                                });
+                            (tab.tab_id(), ended)
+                        })
+                        .collect();
+                    tabs.iter()
+                        .filter(|&&(id, ended)| {
+                            ended
+                                && lbterm_keep::is_last(
+                                    tabs.iter().filter(|o| o.0 != id).map(|o| !o.1),
+                                )
+                        })
+                        .map(|&(id, _)| (window_id, id))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|&(window_id, id)| lbterm_keep::keeps(window_id, id, &live_tab_ids))
+                .map(|(_, id)| id)
+                .collect();
             for (window_id, win) in windows.iter_mut() {
-                win.prune_dead_tabs(&live_tab_ids);
+                win.prune_dead_tabs(&live_tab_ids, &kept);
                 if win.is_empty() {
                     log::trace!("prune_dead_windows: window is now empty");
                     dead_windows.push(*window_id);
@@ -920,6 +1029,7 @@ impl Mux {
                 .read()
                 .iter()
                 .filter_map(|(&id, tab)| if tab.is_dead() { Some(id) } else { None })
+                .filter(|id| !kept.contains(id))
                 .collect();
         }
 
@@ -1394,8 +1504,9 @@ impl Mux {
             CachePolicy::FetchImmediate,
         );
 
+        // LBTerm: a mux server's domain is told whether to activate it too
         let tab = domain
-            .spawn(size, command.clone(), cwd.clone(), window_id)
+            .lbterm_spawn_activating(size, command.clone(), cwd.clone(), window_id, activate)
             .await
             .with_context(|| {
                 format!(

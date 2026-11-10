@@ -576,6 +576,12 @@ impl Pane for QuickSelectOverlay {
             .for_each_logical_line_in_stable_range_mut(lines, for_line);
     }
 
+    /// LBTerm: the pane under it scans its own lines, as it does without the overlay: a mux
+    /// domain's pane keeps what it scanned only through its own (wezterm-client's scan_rows)
+    fn apply_hyperlinks(&self, lines: Range<StableRowIndex>, rules: &[termwiz::hyperlink::Rule]) {
+        self.delegate.apply_hyperlinks(lines, rules);
+    }
+
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
         self.delegate.get_logical_lines(lines)
     }

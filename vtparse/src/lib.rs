@@ -112,6 +112,15 @@ pub trait VTActor {
     /// character.
     fn print(&mut self, b: char);
 
+    /// LBTerm: a run of printable ASCII (0x20 to 0x7E) met in the ground state, where each is
+    /// printed and nothing else happens: `print` for each character in turn, unless the actor
+    /// takes the run whole
+    fn print_ascii(&mut self, s: &str) {
+        for c in s.chars() {
+            self.print(c);
+        }
+    }
+
     /// The C0 or C1 control function should be executed, which may have any one of a variety of
     /// effects, including changing the cursor position, suspending or resuming communications or
     /// changing the shift states in effect.
@@ -750,8 +759,30 @@ impl VTParser {
     /// This may result in some number of calls to the methods on the
     /// provided `actor`.
     pub fn parse(&mut self, bytes: &[u8], actor: &mut dyn VTActor) {
-        for b in bytes {
-            self.parse_byte(*b, actor);
+        // LBTerm: printable ASCII in the ground state, which prints and changes nothing else,
+        // handed over a run at a time (VTActor::print_ascii), where each byte went through the
+        // state table and its own call
+        let mut i = 0;
+        while i < bytes.len() {
+            // Two printable bytes at least, looked at first so other text pays a compare a byte
+            if self.state == State::Ground
+                && (0x20..0x7f).contains(&bytes[i])
+                && bytes.get(i + 1).map_or(false, |b| (0x20..0x7f).contains(b))
+            {
+                let run = bytes[i..]
+                    .iter()
+                    .take_while(|&&b| (0x20..0x7f).contains(&b))
+                    .count();
+                if run > 1 {
+                    if let Ok(s) = core::str::from_utf8(&bytes[i..i + run]) {
+                        actor.print_ascii(s);
+                        i += run;
+                        continue;
+                    }
+                }
+            }
+            self.parse_byte(bytes[i], actor);
+            i += 1;
         }
     }
 }

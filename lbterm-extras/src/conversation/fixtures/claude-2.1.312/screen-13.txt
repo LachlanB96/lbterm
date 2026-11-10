@@ -1,0 +1,52 @@
+[38:2::80:80:80m[48:2::55:55:55m❯ Show a 10-line Python function in a fenced code block, then one sentence about it.[39m[K
+
+[38:2::153:153:153m❯ [38:2::255:255:255mMake a markdown table of 6 planets with columns name, moons, ring.[39m[K
+
+[38:2::255:255:255m[49m●[39m ┌─────────┬───────┬──────┐
+  │  Name   │ Moons │ Ring │
+  ├─────────┼───────┼──────┤
+  │ Mercury │ 0     │ No   │
+  ├─────────┼───────┼──────┤
+  │ Venus   │ 0     │ No   │
+  ├─────────┼───────┼──────┤
+  │ Earth   │ 1     │ No   │
+  ├─────────┼───────┼──────┤
+  │ Mars    │ 2     │ No   │
+  ├─────────┼───────┼──────┤
+  │ Jupiter │ 95    │ Yes  │
+  ├─────────┼───────┼──────┤
+  │ Saturn  │ 146   │ Yes  │
+  └─────────┴───────┴──────┘
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mBrewed for 1s · done 15:12
+
+[48:2::55:55:55m❯ [38:2::255:255:255mWrite one long paragraph of about 120 words about terminals, no line breaks.[39m[K
+
+[38:2::255:255:255m[49m●[39m A terminal is one of the oldest and most durable ways to talk to a computer. It began as a
+  physical keyboard and screen wired to a mainframe, and it still exists today as a small window
+  that accepts text commands and prints text back. Every line you type is read by a shell, which
+  parses it, runs the named program, and streams the output back into the same window. Because the
+  interface is plain text, terminals are fast, scriptable, and easy to automate, which is why
+  developers rely on them for everything from building software to managing servers. Modern terminal
+  apps add tabs, colour, scrollback buffers, and GPU rendering, but the core idea has not changed:
+  you type, the machine answers, and the conversation continues line by line.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mBrewed for 2s · done 15:13
+
+[48:2::55:55:55m❯ [38:2::255:255:255mRead the file notes.txt and tell me its lines.[39m[K
+
+[49m  [38:2::153:153:153mRead (B[0;1m[38:2::153:153:153m1(B[0m[38:2::153:153:153m file 
+
+[38:2::255:255:255m●[39m The file has three lines: alpha, beta, gamma.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mSautéed for 3s · done 15:13
+[39m                                    [38:2::255:255:255m[48:2::55:55:55m Jump to bottom (ctrl+End) ↓ 
+
+[38:2::136:136:136m[49m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m▸ probe summary line
+[39m  [38:2::153:153:153mhaiku | probe | main
+[39m  [38:2::153:153:153mtoggles line
+[39m  [38:2::175:135:255m⏵⏵ accept edits on[38:2::153:153:153m (shift+tab to cycle) · ← 2 agents
+[39m

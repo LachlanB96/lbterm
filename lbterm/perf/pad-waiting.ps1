@@ -45,7 +45,8 @@ Invoke-Test {
     Invoke-Cli activate-tab --pane-id 0 --tab-index $i | Out-Null
     Wait-Change { param($s) $s.active_tab -eq $i } -What "tab $i open" -Animating | Out-Null
   }
-  Wait-Change { param($s) @($s.rail.rows)[0].waiting -eq 2 } -What 'the first pad waiting on two tasks' -Animating | Out-Null
+  # The third pad turning green counts as change on the rail too, so wait for it as well
+  Wait-Change { param($s) $r = @($s.rail.rows); $r[0].waiting -eq 2 -and $r[2].state -eq 'working' } -What 'the first pad waiting on two tasks and the third working' -Animating | Out-Null
 
   $railW = ConvertTo-Px 80 $w.Scale
   $a = Get-Shot $w

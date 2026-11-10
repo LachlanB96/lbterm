@@ -87,6 +87,7 @@ impl GuiFrontEnd {
                     .detach();
                 }
                 MuxNotification::TabTitleChanged { .. } => {}
+                MuxNotification::LbtermTabParked { .. } => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
@@ -227,7 +228,12 @@ impl GuiFrontEnd {
         // Re-evaluate the config so that folks that are using
         // `wezterm.gui.get_appearance()` can have that take effect
         // before any windows are created
-        config::reload();
+        // LBTerm: only for a config that asked for the GUI as it ran (window_funcs): this ran
+        // every config a second time on this thread before the first window, Lachlan's too, whose
+        // only use of wezterm.gui is in a paste callback
+        if window_funcs::asked_without_gui() {
+            config::reload();
+        }
 
         // And build the initial menu bar.
         // TODO: arrange for this to happen on config reload.
@@ -569,7 +575,7 @@ pub fn quit_application() {
     promise::spawn::spawn(async move {
         let give_up = std::time::Instant::now() + std::time::Duration::from_secs(4);
         while mux::activity::Activity::count() > 0 && std::time::Instant::now() < give_up {
-            smol::Timer::after(std::time::Duration::from_millis(50)).await;
+            lbterm_extras::counters::timer(smol::Timer::after(std::time::Duration::from_millis(50))).await;
         }
         Connection::get().unwrap().terminate_message_loop();
     })
@@ -579,6 +585,8 @@ pub fn quit_application() {
 pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
     let front_end = GuiFrontEnd::try_new()?;
     FRONT_END.with(|f| *f.borrow_mut() = Some(Rc::clone(&front_end)));
+    // LBTerm: a last tab whose program ends goes to its window first (termwindow/last_tab.rs)
+    crate::termwindow::last_tab::install_keeper();
 
     let config_subscription = config::subscribe_to_config_reload({
         move || {

@@ -2,16 +2,36 @@
 name = "lbterm-extras"
 version = "0.1.0"
 edition = "2021"
-description = "LBTerm's smaller additions, as logic tested without a window: taskbar progress, scrollbar marks, crash restore, Claude summaries, the window strip's words and last prompt, a test window's state file"
+description = "LBTerm's smaller additions, as logic tested without a window: taskbar progress, scrollbar marks, crash restore, Claude summaries, the window strip's words and last prompt, a test window's state file, image thumbnails"
 license = "MIT"
 publish = false
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
+image.workspace = true
 log.workspace = true
+# The transcripts' records found in each line as the scroll strip reads them (conversation.rs)
+memchr = "2.8"
+# Upstream's metrics handles, kept by each thread (recorder.rs)
+metrics.workspace = true
 notify.workspace = true
-serde = { workspace = true, features = ["derive", "std"] }
+# SVG thumbnails, drawn at the size of their box (thumbnails.rs): 0.45 is the last on the tiny-skia
+# the workspace already builds (0.11). Text with the system's fonts; no raster images inside an SVG
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+serde ={ workspace = true, features = ["derive", "std"] }
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The seat's pipe, read and written on one thread with every wait bounded (seat/link.rs)
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 serde_json.workspace = true

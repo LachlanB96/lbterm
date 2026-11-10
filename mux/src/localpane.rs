@@ -21,7 +21,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{Sgr, CSI};
@@ -36,32 +35,13 @@ use wezterm_term::{
     SemanticZone, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
 };
 
+// LBTerm: unix's leader alone; on Windows the pane's job says when to walk again (lbterm_procs)
+#[cfg_attr(windows, allow(dead_code))]
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 
-/// How divine_process_list brings a pane's process list up to date (LBTerm)
-#[derive(Debug, PartialEq, Eq)]
-enum ProcListRefresh {
-    /// Walk the processes before answering
-    Now,
-    /// Answer with the stale list and walk on a thread of its own
-    InBackground,
-    /// The list is fresh, or a refresh is already under way
-    No,
-}
-
-/// AllowStale callers run on the GUI thread (`cli list`, the tab bar's Lua, the tab panel), and
-/// on Windows a walk per pane there held up typing for 200-290 ms with ~18 panes. So only
-/// FetchImmediate, or a pane with no list yet, waits for the walk; a stale list is answered at
-/// once and refreshed in the background, as get_leader does on unix.
-fn proc_list_refresh(policy: CachePolicy, age: Option<Duration>, updating: bool) -> ProcListRefresh {
-    match (policy, age) {
-        (CachePolicy::FetchImmediate, _) | (_, None) => ProcListRefresh::Now,
-        (CachePolicy::AllowStale, Some(age)) if age > PROC_INFO_CACHE_TTL && !updating => {
-            ProcListRefresh::InBackground
-        }
-        _ => ProcListRefresh::No,
-    }
-}
+/// LBTerm: the process list's own, which its job's messages and asks bring up to date
+#[path = "lbterm_proclist.rs"]
+mod lbterm_proclist;
 
 #[derive(Debug)]
 enum ProcessState {
@@ -80,6 +60,7 @@ enum ProcessState {
 
 struct CachedProcInfo {
     root: LocalProcessInfo,
+    /// LBTerm: when its walk began, so a walk that began later is the newer
     updated: Instant,
     foreground: LocalProcessInfo,
 }
@@ -89,6 +70,7 @@ impl CachedProcInfo {
     /// system and reads each descendant's memory for its cwd and argv: milliseconds per pane.
     fn fetch(pid: u32) -> Option<Self> {
         log::trace!("CachedProcInfo expired, refresh");
+        let updated = Instant::now();
         let root = LocalProcessInfo::with_root_pid(pid)?;
 
         // Windows doesn't have any job control or session concept,
@@ -119,7 +101,7 @@ impl CachedProcInfo {
         Some(Self {
             root,
             foreground,
-            updated: Instant::now(),
+            updated,
         })
     }
 }
@@ -192,12 +174,13 @@ pub struct LocalPane {
     terminal: Mutex<Terminal>,
     process: Mutex<ProcessState>,
     pty: Mutex<Box<dyn MasterPty>>,
+    /// LBTerm: kept, though writer() goes through the terminal's own writer (lbterm_writer)
+    #[allow(dead_code)]
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
-    proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
-    /// A background refresh of proc_list is under way
-    proc_list_updating: Arc<AtomicBool>,
+    /// LBTerm: its process list, and the job that says when it's walked again (lbterm_proclist)
+    procs: Arc<lbterm_proclist::ProcShared>,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
@@ -257,6 +240,41 @@ impl Pane for LocalPane {
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
         terminal_get_dirty_lines(&mut self.terminal.lock(), lines, seqno)
+    }
+
+    /// LBTerm: the terminal read under one lock, the tmux domain's before it (each getter took
+    /// one of each, and the parser waited behind them or they behind it); then, the lock let go,
+    /// a default title made the foreground process's name, as get_title does, and a cwd the shell
+    /// didn't say taken as last listed, which the lbterm-procs thread reads again when the pane
+    /// printed since (lbterm_push_read.rs; FLOWS.md, the pane-output flow, row 27)
+    fn lbterm_read_for_push(&self, since: SequenceNo) -> crate::lbterm_push_read::PushRead {
+        let tmux = self.tmux_domain.lock().is_some();
+        let mut read =
+            crate::lbterm_push_read::from_terminal(&mut self.terminal.lock(), tmux, since);
+        read.title = self.title_or_process_name(read.title);
+        if read.working_dir.is_none() {
+            read.working_dir = self.lbterm_listed_cwd();
+        }
+        read
+    }
+
+    /// LBTerm: the title, cwd and size as `lbterm_read_for_push` reads them, under one lock of
+    /// the terminal and with no rows, the lock let go before the process list is asked
+    /// (PITFALLS 85)
+    fn lbterm_read_names(&self) -> crate::lbterm_push_read::Names {
+        let (title, working_dir, dimensions) = {
+            let mut terminal = self.terminal.lock();
+            (
+                terminal.get_title().to_string(),
+                terminal.get_current_dir().cloned(),
+                crate::renderable::terminal_get_dimensions(&mut terminal),
+            )
+        };
+        crate::lbterm_push_read::Names {
+            title: self.title_or_process_name(title),
+            working_dir: working_dir.or_else(|| self.lbterm_listed_cwd()),
+            dimensions,
+        }
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -456,7 +474,15 @@ impl Pane for LocalPane {
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+        // LBTerm: its shell may have moved to another folder, and its title and cwd may have
+        // become its own or gone back to its processes' (lbterm_proclist)
+        self.procs.printed();
+        let mut terminal = self.terminal.lock();
+        terminal.perform_actions(actions);
+        self.procs.shows(
+            terminal.get_title() == "wezterm",
+            terminal.get_current_dir().is_none(),
+        );
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -489,16 +515,17 @@ impl Pane for LocalPane {
             pixel_width: size.pixel_width.try_into()?,
             pixel_height: size.pixel_height.try_into()?,
         })?;
+        // LBTerm: a recorded pane's recording says so (lbterm_ptyrec.rs)
+        crate::lbterm_ptyrec::resized(self.pane_id, size.rows, size.cols);
         self.terminal.lock().resize(size);
         Ok(())
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
         Mux::get().record_input_for_current_identity();
-        MutexGuard::map(self.writer.lock(), |writer| {
-            let w: &mut dyn std::io::Write = writer;
-            w
-        })
+        // LBTerm: through the terminal's writer thread, behind the keys and pastes it was given
+        // before, not to the pty on this thread (term's lbterm_writer)
+        MutexGuard::map(self.terminal.lock(), |terminal| terminal.lbterm_writer())
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
@@ -516,18 +543,7 @@ impl Pane for LocalPane {
 
     fn get_title(&self) -> String {
         let title = self.terminal.lock().get_title().to_string();
-        // If the title is the default pane title, then try to spice
-        // things up a bit by returning the process basename instead
-        if title == "wezterm" {
-            if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
-                let proc_name = std::path::Path::new(&proc_name);
-                if let Some(name) = proc_name.file_name() {
-                    return name.to_string_lossy().to_string();
-                }
-            }
-        }
-
-        title
+        self.title_or_process_name(title)
     }
 
     fn get_progress(&self) -> Progress {
@@ -1010,13 +1026,42 @@ impl wezterm_term::DeviceControlHandler for LocalPaneDCSHandler {
 
 struct LocalPaneNotifHandler {
     pane_id: PaneId,
+    /// LBTerm: the alerts raised and the title set again, not yet delivered, one task on its
+    /// way for them all (lbterm_output.rs); upstream queued a task for each
+    held: Arc<crate::lbterm_output::HeldAlerts>,
 }
 
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
         let pane_id = self.pane_id;
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
+        // LBTerm: perf/title-storm.ps1 counts what the terminal raises (WEZTERM_LOG=lbterm::title=debug)
+        log::debug!(target: "lbterm::title", "alert pane {pane_id} {alert:?}");
+        if !self.held.add(alert) {
+            return;
+        }
+        deliver_held(pane_id, &self.held);
+    }
+
+    /// LBTerm: a title set again unchanged raises no alert (term's performer), but the window
+    /// still takes it, as upstream's did for each title set: whichever pane set one last. Its
+    /// window tells anyone only when that changes its title. The window is found by its tabs:
+    /// resolve_pane_id works out where every pane of every tab sits to find one
+    fn title_set_again(&mut self, title: &str) {
+        if self.held.set_again(title) {
+            deliver_held(self.pane_id, &self.held);
+        }
+    }
+}
+
+/// LBTerm: a task on the main thread that delivers what `pane_id` has held when it runs: each
+/// alert as upstream's own task for it did, then the title the pane set again, as upstream's did
+/// for each title set, the window taking whichever pane's title came last
+fn deliver_held(pane_id: PaneId, held: &Arc<crate::lbterm_output::HeldAlerts>) {
+    let held = Arc::clone(held);
+    promise::spawn::spawn_into_main_thread(async move {
+        let mux = Mux::get();
+        let (alerts, title_again) = held.take();
+        for alert in alerts {
             match &alert {
                 Alert::WindowTitleChanged(title) => {
                     if let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) {
@@ -1036,9 +1081,21 @@ impl AlertHandler for LocalPaneNotifHandler {
             }
 
             mux.notify(MuxNotification::Alert { pane_id, alert });
-        })
-        .detach();
-    }
+        }
+        // Its window tells anyone only when this changes its title. The window is found by its
+        // tabs: resolve_pane_id works out where every pane of every tab sits to find one
+        if let Some(title) = title_again {
+            let window_id = mux.iter_windows().into_iter().find(|&id| {
+                mux.get_window(id).map_or(false, |window| {
+                    window.iter_tabs().any(|tab| tab.contains_pane(pane_id))
+                })
+            });
+            if let Some(mut window) = window_id.and_then(|id| mux.get_window_mut(id)) {
+                window.set_title(&title);
+            };
+        }
+    })
+    .detach();
 }
 
 /// This is a little gross; on some systems, our pipe reader will continue
@@ -1078,19 +1135,25 @@ impl LocalPane {
     pub fn new(
         pane_id: PaneId,
         mut terminal: Terminal,
-        process: Box<dyn Child + Send>,
+        mut process: Box<dyn Child + Send>,
         pty: Box<dyn MasterPty>,
         writer: Box<dyn Write + Send>,
         domain_id: DomainId,
         command_description: String,
     ) -> Self {
+        // LBTerm: its processes as a job of their own, so its process list is walked again only
+        // when they move (lbterm_proclist); put in before its waiter takes the process
+        let procs = lbterm_proclist::ProcShared::new(pane_id, &mut process);
         let (process, signaller, pid) = split_child(process);
 
         terminal.set_device_control_handler(Box::new(LocalPaneDCSHandler {
             pane_id,
             tmux_domain: None,
         }));
-        terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
+        terminal.set_notification_handler(Box::new(LocalPaneNotifHandler {
+            pane_id,
+            held: Default::default(),
+        }));
 
         Self {
             pane_id,
@@ -1105,8 +1168,7 @@ impl LocalPane {
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain: Mutex::new(None),
-            proc_list: Arc::new(Mutex::new(None)),
-            proc_list_updating: Arc::new(AtomicBool::new(false)),
+            procs,
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
@@ -1149,45 +1211,67 @@ impl LocalPane {
             return None;
         }
 
+        // LBTerm: asking for the cwd, which moves without the processes (lbterm_proclist)
         #[cfg(windows)]
-        if let Some(fg) = self.divine_foreground_process(policy) {
-            return Url::from_directory_path(fg.cwd).ok();
+        if let Some(info) = self.divine_process_list_for(policy, lbterm_proclist::Ask::Cwd) {
+            return Url::from_directory_path(&info.foreground.cwd).ok();
         }
 
         #[allow(unreachable_code)]
         None
     }
 
+    /// LBTerm: the foreground process's cwd as last listed, for a mux server's push of a pane
+    /// whose shell says none (OSC 7): never read on the asking thread, which for a push is the
+    /// server's main thread, but on the lbterm-procs thread when the pane printed since it was
+    /// read, at most every lbterm_procs::PACE while it goes on printing and once after it stops,
+    /// a change raising the alert that has the next push carry it (lbterm_proclist's
+    /// `Ask::Listed`). Until perf/mux-client's flood trace (run 6) the push read it there and
+    /// then, with the pane's terminal lock held, at every push of a pane that printed: about
+    /// 75 us a push and 15% of a flooded server's main thread
+    fn lbterm_listed_cwd(&self) -> Option<Url> {
+        #[cfg(windows)]
+        return self
+            .divine_process_list_for(CachePolicy::AllowStale, lbterm_proclist::Ask::Listed)
+            .and_then(|info| Url::from_directory_path(&info.foreground.cwd).ok());
+        #[cfg(not(windows))]
+        self.divine_current_working_dir(CachePolicy::AllowStale)
+    }
+
+    /// LBTerm: the pane's title, `title` its terminal's: a title still the default made its
+    /// foreground process's name, as upstream's get_title did (and get_title still does, through
+    /// this)
+    fn title_or_process_name(&self, title: String) -> String {
+        // If the title is the default pane title, then try to spice
+        // things up a bit by returning the process basename instead
+        if title == "wezterm" {
+            if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
+                let proc_name = std::path::Path::new(&proc_name);
+                if let Some(name) = proc_name.file_name() {
+                    return name.to_string_lossy().to_string();
+                }
+            }
+        }
+
+        title
+    }
+
     fn divine_process_list(
         &self,
         policy: CachePolicy,
     ) -> Option<MappedMutexGuard<'_, CachedProcInfo>> {
+        self.divine_process_list_for(policy, lbterm_proclist::Ask::List)
+    }
+
+    /// LBTerm: walked again only when the pane's processes moved; `ask` for the list itself or
+    /// for the cwd alone (lbterm_proclist's `list`)
+    fn divine_process_list_for(
+        &self,
+        policy: CachePolicy,
+        ask: lbterm_proclist::Ask,
+    ) -> Option<MappedMutexGuard<'_, CachedProcInfo>> {
         if let ProcessState::Running { pid: Some(pid), .. } = &*self.process.lock() {
-            let pid = *pid;
-            let mut proc_list = self.proc_list.lock();
-            let age = proc_list.as_ref().map(|info| info.updated.elapsed());
-            let updating = self.proc_list_updating.load(Ordering::Acquire);
-
-            match proc_list_refresh(policy, age, updating) {
-                ProcListRefresh::Now => {
-                    proc_list.replace(CachedProcInfo::fetch(pid)?);
-                }
-                ProcListRefresh::InBackground
-                    if !self.proc_list_updating.swap(true, Ordering::AcqRel) =>
-                {
-                    let cache = Arc::clone(&self.proc_list);
-                    let updating = Arc::clone(&self.proc_list_updating);
-                    std::thread::spawn(move || {
-                        if let Some(fresh) = CachedProcInfo::fetch(pid) {
-                            cache.lock().replace(fresh);
-                        }
-                        updating.store(false, Ordering::Release);
-                    });
-                }
-                _ => {}
-            }
-
-            return Some(MutexGuard::map(proc_list, |info| info.as_mut().unwrap()));
+            return self.procs.list(*pid, policy, ask);
         }
         None
     }
@@ -1209,57 +1293,5 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
-    }
-}
-
-#[cfg(test)]
-mod lbterm_proc_list_tests {
-    use super::*;
-
-    const FRESH: Duration = Duration::from_millis(100);
-    const STALE: Duration = Duration::from_secs(5);
-
-    #[test]
-    fn a_pane_with_no_list_yet_waits_for_the_walk() {
-        assert_eq!(
-            proc_list_refresh(CachePolicy::AllowStale, None, false),
-            ProcListRefresh::Now
-        );
-    }
-
-    #[test]
-    fn fetch_immediate_always_waits_for_the_walk() {
-        for age in [None, Some(FRESH), Some(STALE)] {
-            for updating in [false, true] {
-                assert_eq!(
-                    proc_list_refresh(CachePolicy::FetchImmediate, age, updating),
-                    ProcListRefresh::Now
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_stale_list_is_answered_at_once_and_refreshed_in_the_background() {
-        assert_eq!(
-            proc_list_refresh(CachePolicy::AllowStale, Some(STALE), false),
-            ProcListRefresh::InBackground
-        );
-    }
-
-    #[test]
-    fn one_background_refresh_at_a_time() {
-        assert_eq!(
-            proc_list_refresh(CachePolicy::AllowStale, Some(STALE), true),
-            ProcListRefresh::No
-        );
-    }
-
-    #[test]
-    fn a_fresh_list_is_left_alone() {
-        assert_eq!(
-            proc_list_refresh(CachePolicy::AllowStale, Some(FRESH), false),
-            ProcListRefresh::No
-        );
     }
 }

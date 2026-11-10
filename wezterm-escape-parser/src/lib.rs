@@ -74,6 +74,13 @@ impl Action {
     /// `PrintString` then the elements are combined into `PrintString`
     /// to reduce heap utilization.
     pub fn append_to(self, dest: &mut Vec<Self>) {
+        // LBTerm: the parser's runs of ASCII (Parser::lbterm_print_runs) join the text before
+        if let Action::PrintString(s) = &self {
+            if let Some(Action::PrintString(prior)) = dest.last_mut() {
+                prior.push_str(s);
+                return;
+            }
+        }
         if let Action::Print(c) = &self {
             match dest.last_mut() {
                 Some(Action::PrintString(s)) => {
@@ -81,7 +88,10 @@ impl Action {
                     return;
                 }
                 Some(Action::Print(prior)) => {
-                    let mut s = prior.to_string();
+                    // LBTerm: room for a line's text from the start, where it grew by doubling,
+                    // four or five times a line
+                    let mut s = String::with_capacity(128);
+                    s.push(*prior);
                     dest.pop();
                     s.push(*c);
                     dest.push(Action::PrintString(s));

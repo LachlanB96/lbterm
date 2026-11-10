@@ -280,7 +280,7 @@ impl CopyRenderable {
         let pane_id = self.delegate.pane_id();
 
         promise::spawn::spawn(async move {
-            smol::Timer::after(Duration::from_millis(350)).await;
+            lbterm_extras::counters::timer(smol::Timer::after(Duration::from_millis(350))).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let state = term_window.pane_state(pane_id);
                 if let Some(overlay) = state.overlay.as_ref() {
@@ -1401,6 +1401,12 @@ impl Pane for CopyOverlay {
     ) {
         self.delegate
             .for_each_logical_line_in_stable_range_mut(lines, for_line);
+    }
+
+    /// LBTerm: the pane under it scans its own lines, as it does without the overlay: a mux
+    /// domain's pane keeps what it scanned only through its own (wezterm-client's scan_rows)
+    fn apply_hyperlinks(&self, lines: Range<StableRowIndex>, rules: &[termwiz::hyperlink::Rule]) {
+        self.delegate.apply_hyperlinks(lines, rules);
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {

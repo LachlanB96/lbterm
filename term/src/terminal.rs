@@ -82,6 +82,12 @@ pub enum Alert {
 
 pub trait AlertHandler: Send + Sync {
     fn alert(&mut self, alert: Alert);
+
+    /// LBTerm: a program set the title it has again (OSC 0 or 2), which raises no alert: an
+    /// alert is a PDU to every client and a window update, for nothing the pane shows. Upstream's
+    /// mux window takes the title of whichever pane set one last, so mux's LocalPane gives the
+    /// window this title again (Window::set_title, which tells anyone only when that changes it)
+    fn title_set_again(&mut self, _title: &str) {}
 }
 
 pub trait DownloadHandler: Send + Sync {
@@ -157,10 +163,22 @@ impl Terminal {
         // writing to the writer sends data to input of the pty
         writer: Box<dyn std::io::Write + Send>,
     ) -> Terminal {
+        // LBTerm: runs of ASCII as one PrintString each, which the performer takes whole
+        let mut parser = Parser::new();
+        parser.lbterm_print_runs(true);
         Terminal {
             state: TerminalState::new(size, config, term_program, term_version, writer),
-            parser: Parser::new(),
+            parser,
         }
+    }
+
+    /// LBTerm, tests only: print as upstream does, the parser's characters one at a time and each
+    /// grapheme into its line on its own, so a test can hold the ASCII runs to what upstream
+    /// writes (term/tests/lbterm_print.rs)
+    #[doc(hidden)]
+    pub fn lbterm_print_as_upstream(&mut self) {
+        self.parser.lbterm_print_runs(false);
+        self.state.lbterm_upstream_print = true;
     }
 
     /// Feed the terminal parser a slice of bytes from the output

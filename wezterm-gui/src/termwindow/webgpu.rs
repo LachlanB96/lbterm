@@ -1,7 +1,6 @@
 use crate::quad::Vertex;
 use crate::termwindow::compositor::Compositor;
-use anyhow::anyhow;
-use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
+use config::{ConfigHandle, GpuInfo};
 use std::cell::RefCell;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -43,6 +42,13 @@ pub struct WebGpuState {
     pub compositor: Option<Compositor>,
     /// LBTerm: set when wgpu says the device has gone (gpu_lost.rs)
     pub lost: crate::termwindow::gpu_lost::Lost,
+    /// LBTerm: what `surface`'s swapchain shows, with the compositor (the window background's
+    /// visual, drawn only when that changes: render/composited.rs); nothing known once it's
+    /// configured again
+    pub lbterm_under_shows: std::rc::Rc<std::cell::Cell<Option<u64>>>,
+    /// LBTerm: what a frame makes and writes on the GPU, and what's kept between frames
+    /// (gpu_work.rs)
+    pub lbterm_gpu: crate::termwindow::gpu_work::GpuWork,
 }
 
 #[derive(Clone, Copy)]
@@ -252,111 +258,49 @@ impl WebGpuState {
         config: &ConfigHandle,
         use_compositor: bool,
     ) -> anyhow::Result<Self> {
+        // LBTerm: how long each step of making a window's GPU state takes, said on lbterm::start
+        // at debug (lbterm/PERF.md, "What font setup costs": a window's start)
+        let mut steps = lbterm_extras::start::Steps::new("webgpu");
         let compositor = if use_compositor {
             Some(Compositor::new(handle.hwnd())?)
         } else {
             None
         };
+        steps.step("compositor");
         // A DComp visual takes a DXGI swapchain, so only DX12 will do
-        let backends = if compositor.is_some() {
-            wgpu::Backends::DX12
-        } else {
-            wgpu::Backends::all()
-        };
-        // LBTerm: WGPU_VALIDATION=1 and WGPU_DEBUG=1 turn on the D3D12 debug
-        // layer and validation, which log the call behind a failed submit
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            flags: wgpu::InstanceFlags::from_build_config().with_env(),
-            ..Default::default()
-        });
+        let backends = super::gpu_warm::backends_for(config, compositor.is_some());
+        // LBTerm: the instance and the adapter are the process's, made once and begun as the GUI
+        // starts (gpu_warm.rs); this waits for them if they're still being made
+        let gpu = super::gpu_warm::shared(backends, config)?;
+        let instance = gpu.instance.clone();
+        steps.step("instance");
         let surface = match &compositor {
             Some(compositor) => compositor.create_under_surface(&instance)?,
             None => unsafe {
                 instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
             },
         };
+        steps.step("surface");
 
-        let mut adapter: Option<wgpu::Adapter> = None;
-
-        if let Some(preference) = &config.webgpu_preferred_adapter {
-            for a in instance.enumerate_adapters(backends) {
-                if !a.is_surface_supported(&surface) {
-                    let info = adapter_info_to_gpu_info(a.get_info());
-                    log::warn!("{} is not compatible with surface", info.to_string());
-                    continue;
-                }
-
-                let info = a.get_info();
-
-                if preference.name != info.name {
-                    continue;
-                }
-
-                if preference.device_type != format!("{:?}", info.device_type) {
-                    continue;
-                }
-
-                if preference.backend != format!("{:?}", info.backend) {
-                    continue;
-                }
-
-                if let Some(driver) = &preference.driver {
-                    if *driver != info.driver {
-                        continue;
-                    }
-                }
-                if let Some(vendor) = &preference.vendor {
-                    if *vendor != info.vendor {
-                        continue;
-                    }
-                }
-                if let Some(device) = &preference.device {
-                    if *device != info.device {
-                        continue;
-                    }
-                }
-
-                adapter.replace(a);
-                break;
-            }
-
-            if adapter.is_none() {
+        let adapter = match &gpu.adapter {
+            Some(adapter) if adapter.is_surface_supported(&surface) => adapter.clone(),
+            Some(adapter) => {
                 let adapters = compute_compatibility_list(&instance, backends, &surface);
-                log::warn!(
-                    "Your webgpu preferred adapter '{}' was either not \
-                     found or is not compatible with your display. Available:\n{}",
-                    preference.to_string(),
+                anyhow::bail!(
+                    "{} can't draw to this window. Available:\n{}",
+                    adapter_info_to_gpu_info(adapter.get_info()).to_string(),
                     adapters.join("\n")
                 );
             }
-        }
-
-        if adapter.is_none() {
-            adapter = Some(
-                instance
-                    .request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: match config.webgpu_power_preference {
-                            WebGpuPowerPreference::HighPerformance => {
-                                wgpu::PowerPreference::HighPerformance
-                            }
-                            WebGpuPowerPreference::LowPower => wgpu::PowerPreference::LowPower,
-                        },
-                        compatible_surface: Some(&surface),
-                        force_fallback_adapter: config.webgpu_force_fallback_adapter,
-                    })
-                    .await?,
-            );
-        }
-
-        let adapter = adapter.ok_or_else(|| {
-            let adapters = compute_compatibility_list(&instance, backends, &surface);
-            anyhow!(
-                "no compatible adapter found. Available:\n{}",
-                adapters.join("\n")
-            )
-        })?;
-
+            None => {
+                let adapters = compute_compatibility_list(&instance, backends, &surface);
+                anyhow::bail!(
+                    "no compatible adapter found. Available:\n{}",
+                    adapters.join("\n")
+                );
+            }
+        };
+        steps.step("adapter");
         let adapter_info = adapter.get_info();
         log::trace!("Using adapter: {adapter_info:?}");
         let caps = surface.get_capabilities(&adapter);
@@ -369,17 +313,37 @@ impl WebGpuState {
                 required_features: wgpu::Features::empty(),
                 // WebGL doesn't support all of wgpu's features, so if
                 // we're building for the web we'll have to disable some.
-                required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::downlevel_defaults()
-                }
-                .using_resolution(adapter.limits()),
+                required_limits: wgpu::Limits {
+                    // LBTerm: D3D12's view heap the size of what a window binds, with room, where
+                    // the default's 1,000,000 views were 30.5 MB of the GPU's own memory a window
+                    // (config/src/lbterm.rs, GPU_VIEW_DESCRIPTORS; lbterm/PERF.md, finding 96)
+                    max_non_sampler_bindings: config::lbterm::GPU_VIEW_DESCRIPTORS,
+                    ..if cfg!(target_arch = "wasm32") {
+                        wgpu::Limits::downlevel_webgl2_defaults()
+                    } else {
+                        wgpu::Limits::downlevel_defaults()
+                    }
+                    .using_resolution(adapter.limits())
+                },
                 label: None,
-                memory_hints: Default::default(),
+                // LBTerm: D3D12's allocator's blocks smaller than Performance's 256 MB, which a
+                // window committed whole for the few MB a terminal draws with
+                // (config/src/lbterm.rs, GPU_MEMORY_BLOCK; lbterm/PERF.md, finding 95). Only
+                // D3D12's, the compositor's backend, where it was measured: Vulkan's allocator
+                // takes the hint its own way (gpu_alloc's free-list chunks, and its buddy
+                // allocator's first chunk 8 times Performance's), which nothing measured
+                memory_hints: if adapter_info.backend == wgpu::Backend::Dx12 {
+                    wgpu::MemoryHints::Manual {
+                        suballocated_device_memory_block_size: config::lbterm::GPU_MEMORY_BLOCK
+                            ..config::lbterm::GPU_MEMORY_BLOCK,
+                    }
+                } else {
+                    wgpu::MemoryHints::default()
+                },
                 trace: wgpu::Trace::Off,
             })
             .await?;
+        steps.step("device");
 
         // LBTerm: a lost device or an error nobody captured is noted, not a panic (gpu_lost.rs)
         let lost = crate::termwindow::gpu_lost::Lost::default();
@@ -445,6 +409,7 @@ impl WebGpuState {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        steps.step("configure");
         if let Some(compositor) = &compositor {
             // configure made the swapchain the visual's content
             compositor.commit()?;
@@ -456,6 +421,7 @@ impl WebGpuState {
         }
 
         let shader =device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
+        steps.step("shader");
 
         let shader_uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -563,6 +529,8 @@ impl WebGpuState {
             multiview: None,
             cache: None,
         });
+        steps.step("pipeline");
+        steps.done();
 
         Ok(Self {
             adapter_info,
@@ -581,6 +549,8 @@ impl WebGpuState {
             instance,
             compositor,
             lost,
+            lbterm_under_shows: Default::default(),
+            lbterm_gpu: Default::default(),
         })
     }
 
@@ -603,6 +573,19 @@ impl WebGpuState {
     }
 
     #[allow(unused_mut)]
+    /// LBTerm: the window's size now, as Windows has it, which the surface is made at
+    pub fn client_size(&self) -> Option<(usize, usize)> {
+        match self.handle.window {
+            #[cfg(windows)]
+            RawWindowHandle::Win32(h) => {
+                let mut rect = unsafe { std::mem::zeroed() };
+                unsafe { winapi::um::winuser::GetClientRect(h.hwnd.get() as _, &mut rect) };
+                Some(((rect.right - rect.left) as usize, (rect.bottom - rect.top) as usize))
+            }
+            _ => None,
+        }
+    }
+
     pub fn resize(&self, mut dims: Dimensions) {
         // During a live resize on Windows, the Dimensions that we're processing may be
         // lagging behind the true client size. We have to take the very latest value
@@ -631,6 +614,7 @@ impl WebGpuState {
             // panic in that case
             // <https://github.com/wezterm/wezterm/issues/2881>
             self.surface.configure(&self.device, &config);
+            self.lbterm_under_shows.set(None);
         }
     }
 }

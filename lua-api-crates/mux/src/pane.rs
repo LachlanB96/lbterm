@@ -19,9 +19,19 @@ impl MuxPane {
             .ok_or_else(|| mlua::Error::external(format!("pane id {} not found in mux", self.0)))
     }
 
+    /// LBTerm: the pane, brought current for a read of its lines, cursor or size: a mux client
+    /// pane its server holds has its push asked and applied first, the GUI thread waiting up to
+    /// config's `HELD_READ_WAIT` (Lachlan's 6b of 2026-11-08; lbterm/MUX.md, "What reads a held
+    /// pane's lines"); any other pane is its own, at the cost of a call
+    fn resolve_current<'a>(&self, mux: &'a Arc<Mux>) -> mlua::Result<Arc<dyn Pane>> {
+        let pane = self.resolve(mux)?;
+        pane.lbterm_current_now();
+        Ok(pane)
+    }
+
     fn get_text_from_semantic_zone(&self, zone: SemanticZone) -> mlua::Result<String> {
         let mux = get_mux()?;
-        let pane = self.resolve(&mux)?;
+        let pane = self.resolve_current(&mux)?;
 
         let mut last_was_wrapped = false;
         let first_row = zone.start_y;
@@ -182,13 +192,13 @@ impl UserData for MuxPane {
 
         methods.add_method("get_cursor_position", |_, this, _: ()| {
             let mux = get_mux()?;
-            let pane = this.resolve(&mux)?;
+            let pane = this.resolve_current(&mux)?;
             Ok(pane.get_cursor_position())
         });
 
         methods.add_method("get_dimensions", |_, this, _: ()| {
             let mux = get_mux()?;
-            let pane = this.resolve(&mux)?;
+            let pane = this.resolve_current(&mux)?;
             Ok(pane.get_dimensions())
         });
 
@@ -243,7 +253,7 @@ impl UserData for MuxPane {
 
         methods.add_method("is_alt_screen_active", |_, this, _: ()| {
             let mux = get_mux()?;
-            let pane = this.resolve(&mux)?;
+            let pane = this.resolve_current(&mux)?;
             Ok(pane.is_alt_screen_active())
         });
 
@@ -254,7 +264,7 @@ impl UserData for MuxPane {
         // The returned string will have trailing whitespace trimmed.
         methods.add_method("get_lines_as_text", |_, this, nlines: Option<usize>| {
             let mux = get_mux()?;
-            let pane = this.resolve(&mux)?;
+            let pane = this.resolve_current(&mux)?;
             let dims = pane.get_dimensions();
             let nlines = nlines.unwrap_or(dims.viewport_rows);
             let bottom_row = dims.physical_top + dims.viewport_rows as isize;
@@ -276,7 +286,7 @@ impl UserData for MuxPane {
 
         methods.add_method("get_lines_as_escapes", |_, this, nlines: Option<usize>| {
             let mux = get_mux()?;
-            let pane = this.resolve(&mux)?;
+            let pane = this.resolve_current(&mux)?;
             let dims = pane.get_dimensions();
             let nlines = nlines.unwrap_or(dims.viewport_rows);
             let bottom_row = dims.physical_top + dims.viewport_rows as isize;
@@ -290,7 +300,7 @@ impl UserData for MuxPane {
             "get_logical_lines_as_text",
             |_, this, nlines: Option<usize>| {
                 let mux = get_mux()?;
-                let pane = this.resolve(&mux)?;
+                let pane = this.resolve_current(&mux)?;
                 let dims = pane.get_dimensions();
                 let nlines = nlines.unwrap_or(dims.viewport_rows);
                 let bottom_row = dims.physical_top + dims.viewport_rows as isize;

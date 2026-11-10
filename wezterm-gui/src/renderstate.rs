@@ -176,10 +176,7 @@ impl MappedVertexBuffer {
     fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [Vertex] {
         match self {
             Self::Glium(g) => &mut g.mapping[range],
-            Self::WebGpu(g) => {
-                let mapping: &mut [Vertex] = bytemuck::cast_slice_mut(&mut g.mapping);
-                &mut mapping[range]
-            }
+            Self::WebGpu(g) => &mut g.mapping[range],
         }
     }
 }
@@ -188,18 +185,27 @@ pub struct MappedQuads<'a> {
     mapping: MappedVertexBuffer,
     next: RefMut<'a, usize>,
     capacity: usize,
+    /// LBTerm: each quad's hash (quad.rs, `fold`)
+    hashes: RefMut<'a, Vec<u64>>,
 }
 
+/// LBTerm: the paint pass writes a WebGpu layer's quads here, on this side
+/// (`WebGpuVertexBuffer::upload`)
 pub struct WebGpuMappedVertexBuffer {
-    mapping: wgpu::BufferViewMut<'static>,
-    // Owner mapping, must be dropped after mapping
-    _slice: wgpu::BufferSlice<'static>,
+    mapping: &'static mut [Vertex],
+    // Owner of what `mapping` points into, kept borrowed while it's written
+    _owner: RefMut<'static, VertexBuffer>,
 }
 
+/// LBTerm: a layer's quads, written on this side by the paint pass, and the GPU's copy of them,
+/// written only in part and only when it's drawn from (termwindow/gpu_work.rs, `upload`)
 pub struct WebGpuVertexBuffer {
-    buf: wgpu::Buffer,
-    num_vertices: usize,
-    state: Rc<WebGpuState>,
+    pub(crate) buf: wgpu::Buffer,
+    pub(crate) num_vertices: usize,
+    /// LBTerm: what the paint pass writes, what `buf` holds and how it's written from this
+    /// (termwindow/gpu_work.rs, `upload`)
+    pub(crate) lbterm: crate::termwindow::gpu_work::Uploads,
+    pub(crate) state: Rc<WebGpuState>,
 }
 
 impl std::ops::Deref for WebGpuVertexBuffer {
@@ -211,39 +217,18 @@ impl std::ops::Deref for WebGpuVertexBuffer {
 
 impl WebGpuVertexBuffer {
     pub fn new(num_vertices: usize, state: &Rc<WebGpuState>) -> Self {
+        state.lbterm_gpu.made(1);
         Self {
             buf: state.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Vertex Buffer"),
                 size: (num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::VERTEX,
-                mapped_at_creation: true,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             }),
             num_vertices,
+            lbterm: crate::termwindow::gpu_work::Uploads::new(num_vertices),
             state: Rc::clone(state),
         }
-    }
-
-    pub fn map(&self) -> WebGpuMappedVertexBuffer {
-        unsafe {
-            let slice = self.buf.slice(..).extend_lifetime();
-            let mapping = slice.get_mapped_range_mut();
-
-            WebGpuMappedVertexBuffer {
-                mapping,
-                _slice: slice,
-            }
-        }
-    }
-
-    pub fn recreate(&mut self) -> wgpu::Buffer {
-        let mut new_buf = self.state.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Vertex Buffer"),
-            size: (self.num_vertices * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::VERTEX,
-            mapped_at_creation: true,
-        });
-        std::mem::swap(&mut new_buf, &mut self.buf);
-        new_buf
     }
 }
 
@@ -260,6 +245,7 @@ impl std::ops::Deref for WebGpuIndexBuffer {
 
 impl WebGpuIndexBuffer {
     pub fn new(indices: &[u32], state: &WebGpuState) -> Self {
+        state.lbterm_gpu.made(1);
         Self {
             buf: state
                 .device
@@ -296,10 +282,18 @@ impl<'a> QuadAllocator for MappedQuads<'a> {
             idx
         };
 
+        let hash = &mut self.hashes[idx];
+        *hash = 0;
         let idx = idx * VERTICES_PER_CELL;
         let mut quad = Quad {
             vert: self.mapping.slice_mut(idx..idx + VERTICES_PER_CELL),
+            hash,
         };
+        // LBTerm: from nothing, as a buffer made for the frame was, so what a quad isn't given
+        // is the same every frame, not what the last quad here had (its hash folds only what
+        // it's given: quad.rs). A layer's buffer is written into frame after frame since
+        // WebGpuVertexBuffer::upload
+        quad.vert.fill(Vertex::default());
 
         quad.set_has_color(false);
 
@@ -315,22 +309,77 @@ impl<'a> QuadAllocator for MappedQuads<'a> {
         // Only copy in if there is enough room.
         // We'll detect the out of space condition at the end of
         // the render pass.
+        let first = idx;
         let idx = idx * VERTICES_PER_CELL;
         let capacity = self.capacity * VERTICES_PER_CELL;
         if idx + len <= capacity {
             self.mapping
                 .slice_mut(idx..idx + len)
                 .copy_from_slice(vertices);
+            // LBTerm: each quad's hash, from its vertices (quad.rs, `fold_vertices`)
+            for (quad, verts) in vertices.chunks_exact(VERTICES_PER_CELL).enumerate() {
+                let hash = &mut self.hashes[first + quad];
+                *hash = 0;
+                crate::quad::fold_vertices(hash, verts);
+            }
+        }
+    }
+}
+
+impl<'a> MappedQuads<'a> {
+    /// LBTerm: `extend_with` for quads whose hashes are made already, `vertices` four to each of
+    /// `hashes`, so their vertices aren't folded again every frame: one copy of them all
+    /// (quad.rs, `HeapQuadAllocator::apply_to`; render/kept_quads.rs)
+    pub fn lbterm_extend_all_hashed(&mut self, vertices: &[Vertex], hashes: &[u64]) {
+        let idx = *self.next;
+        let n = hashes.len().min(vertices.len() / VERTICES_PER_CELL);
+        *self.next += n;
+        // As extend_with: what doesn't fit isn't copied in, and the pass is painted again with more
+        let fit = n.min(self.capacity.saturating_sub(idx));
+        if fit > 0 {
+            let at = idx * VERTICES_PER_CELL;
+            self.mapping
+                .slice_mut(at..at + fit * VERTICES_PER_CELL)
+                .copy_from_slice(&vertices[..fit * VERTICES_PER_CELL]);
+            self.hashes[idx..idx + fit].copy_from_slice(&hashes[..fit]);
+        }
+    }
+
+    /// LBTerm: `lbterm_extend_all_hashed` for a pane's line, laid out at row 0 and kept so (the
+    /// line quad cache, render/pane.rs): copied in `dy` pixels lower, at its row, each quad's
+    /// hash moved with it (`lbterm_motion::content::place`)
+    pub fn lbterm_extend_all_moved(&mut self, vertices: &[Vertex], hashes: &[u64], dy: f32) {
+        let idx = *self.next;
+        let n = hashes.len().min(vertices.len() / VERTICES_PER_CELL);
+        *self.next += n;
+        // As extend_with: what doesn't fit isn't copied in, and the pass is painted again with more
+        let fit = n.min(self.capacity.saturating_sub(idx));
+        if fit > 0 {
+            let at = idx * VERTICES_PER_CELL;
+            lbterm_motion::content::place(
+                self.mapping.slice_mut(at..at + fit * VERTICES_PER_CELL),
+                &mut self.hashes[idx..idx + fit],
+                &vertices[..fit * VERTICES_PER_CELL],
+                &hashes[..fit],
+                VERTICES_PER_CELL,
+                dy,
+                crate::quad::move_down,
+            );
         }
     }
 }
 
 pub struct TripleVertexBuffer {
     pub index: RefCell<usize>,
-    pub bufs: RefCell<[VertexBuffer; 3]>,
+    /// LBTerm: three with Glium, one with WebGpu (`RenderContext::vertex_buffers_per_layer`)
+    pub bufs: RefCell<Vec<VertexBuffer>>,
     pub indices: IndexBuffer,
     pub capacity: usize,
     pub next_quad: RefCell<usize>,
+    /// LBTerm: what each quad allocated this frame was given, folded into one number as it was
+    /// written (quad.rs, `fold`), so the compositor can tell which visuals' quads are what they
+    /// were last frame (render/composited.rs)
+    pub hashes: RefCell<Vec<u64>>,
 }
 
 /// A trait to avoid broadly-scoped transmutes; we only want to
@@ -426,13 +475,23 @@ impl TripleVertexBuffer {
                     mapping,
                 })
             }
-            VertexBuffer::WebGpu(vb) => MappedVertexBuffer::WebGpu(vb.map()),
+            // LBTerm: the vertices on this side, which the owner keeps borrowed while they're
+            // written; the GPU's copy is written from them when it's drawn from
+            VertexBuffer::WebGpu(vb) => {
+                let vertices = &mut vb.lbterm.vertices;
+                let mapping = unsafe { std::slice::from_raw_parts_mut(vertices.as_mut_ptr(), vertices.len()) };
+                MappedVertexBuffer::WebGpu(WebGpuMappedVertexBuffer {
+                    mapping,
+                    _owner: bufs,
+                })
+            }
         };
 
         MappedQuads {
             mapping,
             next: self.next_quad.borrow_mut(),
             capacity: self.capacity,
+            hashes: self.hashes.borrow_mut(),
         }
     }
 
@@ -445,7 +504,8 @@ impl TripleVertexBuffer {
     pub fn next_index(&self) {
         let mut index = self.index.borrow_mut();
         *index += 1;
-        if *index >= 3 {
+        // LBTerm: WebGpu keeps one (RenderContext::vertex_buffers_per_layer)
+        if *index >= self.bufs.borrow().len() {
             *index = 0;
         }
     }
@@ -453,8 +513,11 @@ impl TripleVertexBuffer {
 
 pub struct RenderLayer {
     pub vb: RefCell<[TripleVertexBuffer; 3]>,
-    context: RenderContext,
+    pub(crate) context: RenderContext,
     zindex: i8,
+    /// LBTerm: what its owner last made its quads from, and how many each of its three held then:
+    /// kept while nothing writes over them (render/kept.rs, `lbterm_keep`)
+    pub(crate) lbterm_kept: std::cell::Cell<Option<(u64, [usize; 3])>>,
 }
 
 impl RenderLayer {
@@ -469,6 +532,7 @@ impl RenderLayer {
             context: context.clone(),
             vb: RefCell::new(vb),
             zindex,
+            lbterm_kept: Default::default(),
         })
     }
 
@@ -508,6 +572,8 @@ impl RenderLayer {
     pub fn reallocate_quads(&self, idx: usize, num_quads: usize) -> anyhow::Result<()> {
         let vb = Self::compute_vertices(&self.context, num_quads)?;
         self.vb.borrow_mut()[idx] = vb;
+        // LBTerm: what it kept went with its buffer
+        self.lbterm_kept.set(None);
         Ok(())
     }
 
@@ -545,14 +611,15 @@ impl RenderLayer {
 
         let buffer = TripleVertexBuffer {
             index: RefCell::new(0),
-            bufs: RefCell::new([
-                context.allocate_vertex_buffer(num_quads, &verts)?,
-                context.allocate_vertex_buffer(num_quads, &verts)?,
-                context.allocate_vertex_buffer(num_quads, &verts)?,
-            ]),
+            bufs: RefCell::new(
+                (0..context.vertex_buffers_per_layer())
+                    .map(|_| context.allocate_vertex_buffer(num_quads, &verts))
+                    .collect::<anyhow::Result<_>>()?,
+            ),
             capacity: num_quads,
             indices: context.allocate_index_buffer(&indices)?,
             next_quad: RefCell::new(0),
+            hashes: RefCell::new(vec![0; num_quads.max(1)]),
         };
 
         Ok(buffer)
@@ -589,6 +656,8 @@ pub struct RenderState {
     pub util_sprites: UtilSprites,
     pub glyph_prog: Option<glium::Program>,
     pub layers: RefCell<Vec<Rc<RenderLayer>>>,
+    /// LBTerm: frames painted since the glyph atlas was made (render/paint.rs)
+    pub lbterm_atlas_frames: usize,
 }
 
 impl RenderState {
@@ -618,6 +687,7 @@ impl RenderState {
                         util_sprites,
                         glyph_prog,
                         layers: RefCell::new(vec![main_layer]),
+                        lbterm_atlas_frames: 0,
                     });
                 }
                 Err(OutOfTextureSpace {
@@ -667,6 +737,7 @@ impl RenderState {
                     // Round up to next multiple of 128 that is >=
                     // the number of needed quads for this frame
                     let num_quads = (need_quads + 127) & !127;
+                    let num_quads = layer.lbterm_grow_to(vb_idx, num_quads);
                     layer.reallocate_quads(vb_idx, num_quads).with_context(|| {
                         format!(
                             "Failed to allocate {} quads (needed {})",
@@ -787,6 +858,7 @@ impl RenderState {
         );
 
         *glyph_cache = new_glyph_cache;
+        self.lbterm_atlas_frames = 0;
         Ok(())
     }
 }

@@ -23,7 +23,7 @@ pub const DRAG_START: f64 = 6.0;
 pub const TEAR_OFF: f64 = 24.0;
 
 /// A rectangle on the screen, in pixels
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rect {
     pub x: f64,
     pub y: f64,

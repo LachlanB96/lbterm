@@ -1,0 +1,42 @@
+  - Line 37 of the long answer about where the spinner turns.
+  - Line 38 of the long answer about where the spinner turns.
+  - Line 39 of the long answer about where the spinner turns.
+  - Line 40 of the long answer about where the spinner turns.
+  - Line 41 of the long answer about where the spinner turns.
+  - Line 42 of the long answer about where the spinner turns.
+  - Line 43 of the long answer about where the spinner turns.
+  - Line 44 of the long answer about where the spinner turns.
+  - Line 45 of the long answer about where the spinner turns.
+  - Line 46 of the long answer about where the spinner turns.
+  - Line 47 of the long answer about where the spinner turns.
+  - Line 48 of the long answer about where the spinner turns.
+  - Line 49 of the long answer about where the spinner turns.
+  - Line 50 of the long answer about where the spinner turns.
+  - Line 51 of the long answer about where the spinner turns.
+  - Line 52 of the long answer about where the spinner turns.
+  - Line 53 of the long answer about where the spinner turns.
+  - Line 54 of the long answer about where the spinner turns.
+  - Line 55 of the long answer about where the spinner turns.
+  - Line 56 of the long answer about where the spinner turns.
+  - Line 57 of the long answer about where the spinner turns.
+  - Line 58 of the long answer about where the spinner turns.
+  - Line 59 of the long answer about where the spinner turns.
+  - Line 60 of the long answer about where the spinner turns.
+  - Line 61 of the long answer about where the spinner turns.
+  - Line 62 of the long answer about where the spinner turns.
+  - Line 63 of the long answer about where the spinner turns.
+  - Line 64 of the long answer about where the spinner turns.
+  - Line 65 of the long answer about where the spinner turns.
+  - Line 66 of the long answer about where the spinner turns.
+  - Line 67 of the long answer about where the spinner turns.
+  - Line 68 of the long answer about where the spinner turns.
+  - Line 69 of the long answer about where the spinner turns.
+  - Line 70 of the long answer about where the spinner turns.
+
+[38:2::153:153:153m✻[39m [38:2::153:153:153mCrunched for 0s · done 8:03
+
+[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ (B[0;7m 
+(B[0m[38:2::136:136:136m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38:2::153:153:153m⏸ manual mode on · ? for shortcuts · ← for agents
+[39m

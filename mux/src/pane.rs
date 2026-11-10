@@ -191,6 +191,38 @@ pub trait Pane: Downcast + Send + Sync {
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex>;
 
+    /// LBTerm: what a mux server's push compares with what it last sent the client, the rows
+    /// changed since `since` with it (lbterm_push_read.rs): a local pane reads it under one lock
+    /// of its terminal, any other a getter at a time
+    fn lbterm_read_for_push(&self, since: SequenceNo) -> crate::lbterm_push_read::PushRead {
+        crate::lbterm_push_read::by_getters(self, since)
+    }
+
+    /// LBTerm: the title, cwd and size alone, as `lbterm_read_for_push` reads them, for a mux
+    /// server's push of a pane out of its client's view whose lines it holds
+    /// (wezterm-mux-server-impl's lbterm_flow.rs): no rows read, which after a long hold would
+    /// walk every line's seqno
+    fn lbterm_read_names(&self) -> crate::lbterm_push_read::Names {
+        crate::lbterm_push_read::Names {
+            title: self.get_title(),
+            working_dir: self.get_current_working_dir(CachePolicy::AllowStale),
+            dimensions: self.get_dimensions(),
+        }
+    }
+
+    /// LBTerm: what a read that must see the pane as its program has it awaits first: None when
+    /// the lines here are the pane's, as every pane's are but a mux client pane's whose server
+    /// holds its output (wezterm-client's lbterm_current.rs; lbterm/MUX.md, "What reads a held
+    /// pane's lines"), else a wait for its push, bounded, that ends with it applied. For a reader
+    /// in a task (a cli request, the control pipe); Lua's methods use `lbterm_current_now`
+    fn lbterm_current(&self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> {
+        None
+    }
+
+    /// LBTerm: `lbterm_current`, waited for on this thread: Lua's reads, synchronous on the GUI
+    /// thread, which does nothing else meanwhile, up to config's `HELD_READ_WAIT`
+    fn lbterm_current_now(&self) {}
+
     /// Returns a set of lines from the scrollback or visible portion of
     /// the display.  The lines are indexed using StableRowIndex, which
     /// can be invalidated if the scrollback is busy, or when switching

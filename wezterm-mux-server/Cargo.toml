@@ -33,6 +33,7 @@ wezterm-gui-subcommands.workspace = true
 wezterm-term.workspace = true
 
 [target."cfg(windows)".dependencies]
+filedescriptor.workspace = true
 winapi = { workspace=true, features = [ "winuser" ]}
 
 [target.'cfg(windows)'.build-dependencies]

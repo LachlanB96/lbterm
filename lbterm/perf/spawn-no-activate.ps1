@@ -1,8 +1,8 @@
 #Requires -Version 7
-# Covers: wezterm/src/cli/spawn_command.rs, codec/src/lib.rs, wezterm-client/src/client.rs, wezterm-mux-server-impl/src/sessionhandler.rs
+# Covers: wezterm/src/cli/spawn_command.rs, codec/src/lib.rs, wezterm-client/src/client.rs, wezterm-client/src/domain.rs, wezterm-mux-server-impl/src/sessionhandler.rs, lua-api-crates/mux/src/lib.rs, mux/src/domain.rs, mux/src/lib.rs
 <#
 `lbterm cli spawn --no-activate` adds a tab without switching the window to it, so nothing
-Lachlan types lands in a tab an agent opened (Conductor's sessions, AI Dashboard's launches).
+Lachlan types lands in a tab an agent opened (Conductor's sessions, the Claude project's launches).
 
 In test windows of their own class, never the daily LBTerm:
 
@@ -12,11 +12,16 @@ In test windows of their own class, never the daily LBTerm:
 2. A window on a mux domain of its own (target\perf\spawn-no-activate), as Lachlan's LBTerm is.
    The server's Lua logs each change of the tab its window has active, looking every 50 ms
    (server.json, a line each); the GUI's state file says which pane it shows. With --no-activate
-   neither ever moves to the new tab. A plain spawn moves the server's record but not the GUI:
-   the cli's fallback for an older server relies on that.
+   neither ever moves to the new tab. A plain spawn moves the server's record but not the GUI.
+Each also through Lua: the GUI's config's handlers, fired through the control pipe, call
+`window:mux_window():spawn_tab { activate = false }` (the new-tab picker's Shift+Enter from
+Lachlan's lbterm.lua, lbterm/NEW-TAB.md), which leaves the window where it was, on a mux domain its
+server's window too (ClientDomain sends SpawnNoActivate); and `spawn_tab {}`, which goes to the new
+tab, as upstream's does.
+
 3. With -OldServer <folder of an older build>: the mux server is that build, which doesn't know
-   the SpawnNoActivate PDU. --no-activate still opens the tab (spawned the usual way, with a line
-   on stderr saying so) and the GUI stays where it was.
+   the SpawnNoActivate PDU. --no-activate fails out loud, saying so, and opens nothing (until
+   2026-10-29 the cli spawned the usual way instead, a fallback the no-fallbacks rule took out).
 
   pwsh -File lbterm\perf\spawn-no-activate.ps1 [-Bin <build>] [-OldServer <build>]
 #>
@@ -27,11 +32,10 @@ $T = Start-Test 'spawn-no-activate' -Bin $Bin
 if ($OldServer) { $OldServer = (Resolve-Path $OldServer).Path }
 $note = Join-Path $env:APPDATA "lbterm\session-$($T.Class).json"
 # The configs and the server's report share a folder, as they always have here: see
-# Write-Configs on why the report must sit beside the config. The socket doesn't, and each
-# domain has the same one in turn: a socket's path must be under 108 characters (AF_UNIX), and an
-# e2e run's folder in a worktree is most of that
+# Write-Configs on why the report must sit beside the config. The socket doesn't (Start-Test's
+# short one, Get-TestSocket), and each domain has the same one in turn
 $dir = Join-Path $T.Out 'config'
-$sock = Join-Path $T.Out 'sock'
+$sock = $T.Sock
 New-Item -ItemType Directory -Force $dir | Out-Null
 $serverReport = Join-Path $dir 'server.json'
 $pwshExe = 'C:/Program Files/PowerShell/7/pwsh.exe'
@@ -49,6 +53,7 @@ function Write-Configs([string]$Domain, [string]$ServerExe) {
   front_end = 'WebGpu',
   window_close_confirmation = 'NeverPrompt',
   lbterm_crash_restore = false,
+  wsl_domains = {},
   default_prog = { '$pwshExe', '-NoProfile', '-Command', 'Start-Sleep 600' },
   default_cwd = 'C:/Windows',
 "@
@@ -68,6 +73,14 @@ local encode = (wezterm.serde and wezterm.serde.json_encode) or wezterm.json_enc
 wezterm.on('update-status', function(window, pane)
   local f = io.open('$(ConvertTo-LuaPath (Join-Path $dir 'gui.json'))', 'w')
   if f then f:write(encode({ tabs = #window:mux_window():tabs() })); f:close() end
+end)
+-- Lua's spawn_tab, behind and in front, fired through the control pipe
+local sleeper = { '$pwshExe', '-NoProfile', '-Command', 'Start-Sleep 600' }
+wezterm.on('spawn-behind', function(window, pane)
+  window:mux_window():spawn_tab { activate = false, args = sleeper }
+end)
+wezterm.on('spawn-front', function(window, pane)
+  window:mux_window():spawn_tab { args = sleeper }
 end)
 return {
   status_update_interval = 250,
@@ -147,6 +160,27 @@ function Invoke-Spawn([int]$From, [int]$Tabs, [switch]$NoActivate, [switch]$Serv
   }
 }
 
+# The same, the tab asked for by Lua's spawn_tab in the GUI ($Event: spawn-behind, spawn-front),
+# fired through the control pipe; the new pane is the one the cli didn't list before
+function Invoke-LuaSpawn([string]$Event, [int]$Tabs, [switch]$Server) {
+  $before = (Read-ServerLog).Count
+  $had = @(Get-Panes -Server:$Server | ForEach-Object pane_id)
+  Send-Emit $Event -Window $T.Current
+  try { Wait-Change { param($x) @($x.tabs).Count -eq $Tabs } -Animating -What "$Tabs tabs in the GUI" -TimeoutSec 30 | Out-Null } catch { }
+  if ($Server) { Wait-Until { (Read-ServerLog | Select-Object -Last 1).tabs -eq $Tabs } -TimeoutSec 30 -IntervalMs 100 | Out-Null }
+  # A late switch would come after: no state says it won't
+  Start-Sleep 1.5
+  $g = Get-GuiView
+  $log = Read-ServerLog
+  $s = $log | Select-Object -Last 1
+  $panes = Get-Panes -Server:$Server
+  $new = @($panes | Where-Object { $_.pane_id -notin $had })[0]
+  [pscustomobject]@{
+    New = $(if ($new) { [int]$new.pane_id } else { -1 }); NewTab = $(if ($new) { $new.tab_id }); Gui = $g.active; GuiTabs = $g.tabs
+    ServerTab = $s.tab; ServerTabs = $s.tabs; ServerSeen = @($log | Select-Object -Skip $before | ForEach-Object tab | Get-Unique)
+  }
+}
+
 # Opens a test window, on the given domain or on its own, and waits for its first pane
 function Open-Window($Cfg, [string]$Domain) {
   Remove-Item $note, $serverReport, $Cfg.Sock -ErrorAction SilentlyContinue
@@ -178,6 +212,14 @@ Invoke-Test {
   "local, --no-activate: the window shows $($r.Gui) ($was before), $($r.GuiTabs) tabs"
   if ($r.Gui -ne $was) { Add-Failure "local, --no-activate: the window moved to $($r.Gui) from $was" }
   if ($r.GuiTabs -ne 3) { Add-Failure "local, --no-activate: $($r.GuiTabs) tabs, not 3" }
+  # Lua's spawn_tab { activate = false }, then spawn_tab {}
+  $r = Invoke-LuaSpawn spawn-behind -Tabs 4
+  "local, Lua activate = false: the window shows $($r.Gui) ($was before), $($r.GuiTabs) tabs, the new pane $($r.New)"
+  if ($r.New -lt 0) { Add-Failure 'local, Lua activate = false: no new pane' }
+  if ($r.Gui -ne $was) { Add-Failure "local, Lua activate = false: the window moved to $($r.Gui) from $was" }
+  $r = Invoke-LuaSpawn spawn-front -Tabs 5
+  "local, Lua spawn_tab: the window shows $($r.Gui), the new pane is $($r.New)"
+  if ($r.Gui -ne $r.New) { Add-Failure "local, Lua spawn_tab: the window shows $($r.Gui), not the new pane $($r.New)" }
   Close-Window $w
 
   # 2. A mux domain of its own
@@ -196,18 +238,34 @@ Invoke-Test {
   $newTab = & $r.TabOf $r.New
   "mux, plain: the GUI shows $($r.Gui); the server's window had tabs $($r.ServerSeen -join ', ') active since (the new tab is $newTab)"
   if ($newTab -notin $r.ServerSeen) { Add-Failure "mux, plain: the server's window never switched to the new tab $newTab, so the log can't show a switch" }
-  if ($r.Gui -ne $w.First) { Add-Failure "mux, plain: the GUI followed the server to $($r.Gui), so the cli's fallback for an older server would take the keyboard" }
+  if ($r.Gui -ne $w.First) { Add-Failure "mux, plain: the GUI followed the server to $($r.Gui)" }
+  # Lua's spawn_tab { activate = false } in the GUI: neither it nor its server's window goes to the
+  # new tab (SpawnNoActivate, through ClientDomain::spawn)
+  $r = Invoke-LuaSpawn spawn-behind -Tabs 4 -Server
+  "mux, Lua activate = false: the GUI shows $($r.Gui); the server's window had tabs $($r.ServerSeen -join ', ') active since (the new tab is $($r.NewTab))"
+  if ($r.New -lt 0) { Add-Failure 'mux, Lua activate = false: no new pane' }
+  if ($r.Gui -ne $w.First) { Add-Failure "mux, Lua activate = false: the GUI moved to $($r.Gui)" }
+  if ($null -ne $r.NewTab -and $r.NewTab -in $r.ServerSeen) { Add-Failure "mux, Lua activate = false: the server's window switched to the new tab $($r.NewTab)" }
+  if ($r.ServerTabs -ne 4) { Add-Failure "mux, Lua activate = false: the server has $($r.ServerTabs) tabs, not 4" }
+  # And spawn_tab {}: both go to it
+  $r = Invoke-LuaSpawn spawn-front -Tabs 5 -Server
+  "mux, Lua spawn_tab: the GUI shows $($r.Gui); the server's window had tabs $($r.ServerSeen -join ', ') active since (the new tab is $($r.NewTab))"
+  if ($r.Gui -ne $r.New) { Add-Failure "mux, Lua spawn_tab: the GUI shows $($r.Gui), not the new pane $($r.New)" }
+  if ($r.NewTab -notin $r.ServerSeen) { Add-Failure "mux, Lua spawn_tab: the server's window never switched to the new tab $($r.NewTab)" }
   Close-Window $w
 
-  # 3. An older server, which doesn't know SpawnNoActivate
+  # 3. An older server, which doesn't know SpawnNoActivate: the spawn fails, saying why, and opens nothing
   if ($OldServer) {
     $cfg = Write-Configs 'perfspawnold' (Join-Path $OldServer 'lbterm-mux-server.exe')
     $w = Open-Window $cfg 'perfspawnold'
-    $r = Invoke-Spawn -From $w.First -Tabs 2 -NoActivate -Server
-    "old server, --no-activate: the GUI shows $($r.Gui), $($r.ServerTabs) tabs; stderr: $($r.Stderr)"
-    if ($r.Stderr -notmatch 'older build') { Add-Failure "old server: no word of the fallback on stderr (does $OldServer know SpawnNoActivate?)" }
-    if ($r.Gui -ne $w.First) { Add-Failure "old server: the GUI moved to $($r.Gui)" }
-    if ($r.ServerTabs -ne 2) { Add-Failure "old server: the server has $($r.ServerTabs) tabs, not 2" }
+    $failed = $null
+    try { Invoke-Spawn -From $w.First -Tabs 2 -NoActivate -Server | Out-Null } catch { $failed = "$_" }
+    Start-Sleep 1.5
+    $tabs = @(Get-Panes -Server | ForEach-Object tab_id | Select-Object -Unique).Count
+    "old server, --no-activate: $(if ($failed) { "failed: $failed" } else { 'it spawned' }); the server has $tabs tab(s)"
+    if (-not $failed) { Add-Failure "old server: --no-activate spawned, though $OldServer shouldn't know SpawnNoActivate" }
+    elseif ($failed -notmatch '7502|Invalid') { Add-Failure "old server: the failure doesn't say the server didn't know the request: $failed" }
+    if ($tabs -ne 1) { Add-Failure "old server: the server has $tabs tabs, not 1" }
     Close-Window $w
   }
-} -Passed 'spawn-no-activate: --no-activate leaves the window and its server on the tab they were on'
+} -Passed 'spawn-no-activate: --no-activate and Lua''s spawn_tab { activate = false } leave the window and its server on the tab they were on; spawn_tab {} goes to the new one'

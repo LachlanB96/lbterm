@@ -10,7 +10,7 @@
 //! renamed (`TabTitleChanged`) paints only while the tab bar holds the tabs' words
 //! (`show_tabs_in_tab_bar`); the rail and the strip name it either way. What the window does
 //! itself (a key, a click) paints anyway; these come from outside it: `lbterm cli` (the
-//! Conductor, AI Dashboard, Relay, terminal.ahk), Lua, and on a mux domain the server telling its
+//! Conductor, the Claude project, Relay), Lua, and on a mux domain the server telling its
 //! client about either. The GUI asks `repaints` of each notification it gets (wezterm-gui's
 //! termwindow/mod.rs, `mux_pane_output_event_callback`).
 
@@ -33,9 +33,10 @@ pub enum Changed {
 pub fn changed(notification: &MuxNotification) -> Option<Changed> {
     match notification {
         MuxNotification::PaneFocused(pane_id) => Some(Changed::Pane(*pane_id)),
-        MuxNotification::TabResized(tab_id) | MuxNotification::TabTitleChanged { tab_id, .. } => {
-            Some(Changed::Tab(*tab_id))
-        }
+        // LBTerm: and a tab parked or unparked, which the rail dims (lbterm_parked.rs)
+        MuxNotification::TabResized(tab_id)
+        | MuxNotification::TabTitleChanged { tab_id, .. }
+        | MuxNotification::LbtermTabParked { tab_id, .. } => Some(Changed::Tab(*tab_id)),
         _ => None,
     }
 }
@@ -91,6 +92,13 @@ mod test {
                 title: "Repaint".to_string()
             }),
             Some(Changed::Tab(4))
+        );
+        assert_eq!(
+            changed(&MuxNotification::LbtermTabParked {
+                tab_id: 6,
+                parked: true
+            }),
+            Some(Changed::Tab(6))
         );
     }
 

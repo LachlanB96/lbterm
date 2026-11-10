@@ -58,6 +58,9 @@ impl TerminalState {
             MouseButton::WheelDown(_) => 65,
             MouseButton::WheelLeft(_) => 66,
             MouseButton::WheelRight(_) => 67,
+            // LBTerm: the GUI never hands the side buttons to a pane, so if one came here it would
+            // report as no button (xterm's 128 and 129 for buttons 8 and 9 don't fit an i8)
+            MouseButton::Back | MouseButton::Forward => 3,
         };
 
         if event.modifiers.contains(KeyModifiers::SHIFT) {

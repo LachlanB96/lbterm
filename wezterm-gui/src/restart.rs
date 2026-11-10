@@ -1,8 +1,10 @@
 //! LBTerm: the "Restart to update" pill and Ctrl+Shift+F5 (`LbtermRestart`), whose logic is
 //! lbterm_extras::restart.
 //!
-//! A thread reads version.txt beside the running exe every 10 s. While it names another build
-//! than this one, the window strip shows the pill (fancy_tab_bar.rs). Restarting starts the
+//! A thread reads version.txt beside the running exe as it starts and whenever Windows says it
+//! changed (lbterm_extras::watch, through the exe's folder), and sleeps between: it read it every
+//! 10 s until 2026-10-30, so an install showed up to 10 s late. While it names another build than
+//! this one, the window strip shows the pill (fancy_tab_bar.rs). Restarting starts the
 //! installed lbterm-gui.exe with this process's arguments and its pid in LBTERM_RESTART_AFTER,
 //! then ends this process the way `lbterm.ps1 restart` does, as a crash would: the tabs live on
 //! in lbterm-mux-server and the new GUI attaches to them (lbterm/MUX.md). The new GUI waits for
@@ -12,9 +14,11 @@
 use crate::termwindow::TermWindowNotif;
 use anyhow::Context;
 use lbterm_extras::restart as logic;
+use mux::tab::Tab;
 use mux::Mux;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use wezterm_dynamic::Value;
 use window::WindowOps;
@@ -78,6 +82,7 @@ pub fn wait_for_predecessor() {
 /// Starts reading version.txt, when this GUI runs from a folder that has one: an install made
 /// by lbterm.ps1, not target\release or a try window
 pub fn watch() {
+    use lbterm_extras::watch::{Seen, Target, Watch};
     let file = match exe_dir() {
         Some(dir) => dir.join(logic::VERSION_FILE),
         None => return,
@@ -88,19 +93,55 @@ pub fn watch() {
     let running = config::wezterm_version().to_string();
     let spawned = std::thread::Builder::new()
         .name("lbterm-version".into())
-        .spawn(move || loop {
-            let installed = std::fs::read_to_string(&file).ok();
-            let other = logic::other_build_installed(installed.as_deref(), &running);
-            if OTHER_BUILD.swap(other, Ordering::Relaxed) != other {
-                log::info!(
-                    "{} names {:?}, this is {running}: the restart pill {}",
-                    file.display(),
-                    installed.as_deref().map(str::trim),
-                    if other { "shows" } else { "goes" }
-                );
-                promise::spawn::spawn_into_main_thread(async move { redraw_strips() }).detach();
+        .spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watch = match Watch::new(move |s| {
+                let _ = tx.send(s);
+            }) {
+                Ok(watch) => watch,
+                Err(err) => {
+                    log::error!(
+                        "lbterm-version: can't watch {}, so the restart pill won't show: {err:#}",
+                        file.display()
+                    );
+                    return;
+                }
+            };
+            let targets = [Target::File(file.clone())];
+            loop {
+                // Watched before it's read, so an install in between isn't missed
+                for _ in 0..8 {
+                    if !watch.follow(&targets) {
+                        break;
+                    }
+                }
+                let installed = std::fs::read_to_string(&file).ok();
+                let other = logic::other_build_installed(installed.as_deref(), &running);
+                if OTHER_BUILD.swap(other, Ordering::Relaxed) != other {
+                    log::info!(
+                        "{} names {:?}, this is {running}: the restart pill {}",
+                        file.display(),
+                        installed.as_deref().map(str::trim),
+                        if other { "shows" } else { "goes" }
+                    );
+                    promise::spawn::spawn_into_main_thread(async move { redraw_strips() }).detach();
+                }
+                // Asleep until it may have changed
+                loop {
+                    match rx.recv() {
+                        Err(_) => return,
+                        Ok(Seen::Changed(paths)) if watch.matters(&paths) => break,
+                        Ok(Seen::Changed(_)) => {}
+                        Ok(Seen::Failed(err)) => {
+                            log::error!("lbterm-version: the watch of {}: {err}; reading it again", file.display());
+                            break;
+                        }
+                    }
+                }
+                // An install writes it whole: its changes are taken together
+                std::thread::sleep(Duration::from_millis(25));
+                while rx.try_recv().is_ok() {}
             }
-            std::thread::sleep(Duration::from_secs(logic::POLL_SECS));
         });
     if let Err(err) = spawned {
         log::error!("starting the lbterm-version thread: {err:#}");
@@ -206,11 +247,18 @@ pub fn pill_element(
         .hover_colors(Some(colors(true)))
 }
 
-/// Restarts into the installed build: Ctrl+Shift+F5, and a click on the pill. Says why in a
-/// toast when it can't.
+/// Restarts into the installed build: Ctrl+Shift+F5, and a click on the pill. Says why when it
+/// can't, in the window's strip and in a toast: the toast alone can go unseen, and then the click
+/// seems to do nothing (2026-10-23: three clicks, nothing to show for them).
 pub fn restart() {
-    if let Err(err) = try_restart() {
+    let local = local_panes();
+    let result = match logic::refusal(local) {
+        Some(why) => Err((logic::refusal_notice(local), anyhow::anyhow!(why))),
+        None => start_installed().map_err(|err| (logic::FAILED_NOTICE.to_string(), err)),
+    };
+    if let Err((notice, err)) = result {
         log::error!("restart: {err:#}");
+        strip_notice(notice);
         wezterm_toast_notification::persistent_toast_notification(
             "LBTerm didn't restart",
             &format!("{err:#}"),
@@ -218,15 +266,39 @@ pub fn restart() {
     }
 }
 
-fn try_restart() -> anyhow::Result<()> {
-    let local = Mux::get()
-        .iter_panes()
-        .iter()
-        .filter(|pane| !in_mux_server(pane.get_metadata()))
-        .count();
-    if let Some(why) = logic::refusal(local) {
-        anyhow::bail!(why);
+/// The panes in this GUI's tabs that it holds itself, outside a mux server: they'd end with it.
+/// Only panes in tabs count. Overlays (the launcher, the command palette, a confirm prompt) are
+/// panes of the GUI's too, added to its mux, and one whose tab or pane closed under it is never
+/// taken out again; nothing runs in them, and until 2026-10-23 a leftover one refused every
+/// restart of a GUI whose tabs were all in the server.
+fn local_panes() -> usize {
+    let mux = Mux::get();
+    // Each window's tabs, its lock let go before the tabs are asked for their panes
+    let tabs: Vec<Arc<Tab>> = mux
+        .iter_windows()
+        .into_iter()
+        .filter_map(|id| mux.get_window(id).map(|w| w.iter_tabs().cloned().collect::<Vec<_>>()))
+        .flatten()
+        .collect();
+    tabs.iter()
+        .flat_map(|tab| tab.iter_panes_ignoring_zoom())
+        .filter(|positioned| !in_mux_server(positioned.pane.get_metadata()))
+        .count()
+}
+
+/// Says `text` in every window's strip, in the caption's place
+fn strip_notice(text: String) {
+    if let Some(fe) = crate::frontend::try_front_end() {
+        for win in fe.gui_windows() {
+            let text = text.clone();
+            win.window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.lbterm_strip_notice(text);
+            })));
+        }
     }
+}
+
+fn start_installed() -> anyhow::Result<()> {
     let dir = exe_dir().context("finding the folder LBTerm runs from")?;
     let gui = dir.join(format!("{}.exe", config::lbterm::GUI_EXE));
     std::process::Command::new(&gui)
@@ -250,7 +322,7 @@ fn try_restart() -> anyhow::Result<()> {
         }
     }
     promise::spawn::spawn(async {
-        smol::Timer::after(Duration::from_millis(logic::RESTART_SHOWN_MS)).await;
+        lbterm_extras::counters::timer(smol::Timer::after(Duration::from_millis(logic::RESTART_SHOWN_MS))).await;
         end_this_process()
     })
     .detach();

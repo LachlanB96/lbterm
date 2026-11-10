@@ -26,7 +26,7 @@ param([string]$Bin)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
 $T = Start-Test 'scrollbar-apps' -Bin $Bin
-$sock = Join-Path $T.Out 'sock'
+$sock = $T.Sock
 $cfg = Join-Path $T.Out 'config\apps.lua'
 $report = Join-Path $T.Out 'report.json'
 $step = Join-Path $T.Out 'step.txt'
@@ -80,6 +80,7 @@ return {
   initial_rows = 24,
   status_update_interval = 250,
   lbterm_crash_restore = false,
+  wsl_domains = {},
   automatically_reload_config = false,
   window_close_confirmation = 'NeverPrompt',
   default_prog = { 'C:/Program Files/PowerShell/7/pwsh.exe', '-NoProfile', '-File', '$(ConvertTo-LuaPath $driver)' },

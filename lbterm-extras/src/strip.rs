@@ -10,7 +10,7 @@
 
 use crate::tabs::Rect;
 use chrono::NaiveDateTime;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Between the title and the summary
 pub const SEPARATOR: &str = " \u{b7} ";
@@ -61,6 +61,44 @@ pub fn changed_rows(old: &Content, new: &Content) -> (bool, bool) {
         || old.badge != new.badge;
     let prompt = old.prompt != new.prompt || old.note != new.note;
     (words, prompt)
+}
+
+/// How long after a press the strip waits for the tab it opens before saying it's on its way: a
+/// tab that comes sooner shows nothing, since a notice there for a frame would only flicker
+pub const OPENING_AFTER: Duration = Duration::from_millis(250);
+/// How long "Opening ..." waits for its tab at most
+pub const OPENING_FOR: Duration = Duration::from_secs(20);
+
+/// A tab on its way to the window (Lua's `window:lbterm_expect_tab(text)`; Lachlan's E4,
+/// 2026-10-29): what to say, since when, and the tabs the window had then, by id
+#[derive(Debug, Clone, PartialEq)]
+pub struct Opening {
+    pub text: String,
+    pub since: Instant,
+    pub tabs: Vec<usize>,
+}
+
+/// What the strip does about an [`Opening`] at `now`, the window having `tabs` (by id)
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpeningNow {
+    /// A tab it didn't have came, or the wait is over: forget it
+    Done,
+    /// Say nothing yet; look again at the instant
+    Waiting(Instant),
+    /// Say this in the caption's place until the instant
+    Say(String, Instant),
+}
+
+pub fn opening_now(opening: &Opening, now: Instant, tabs: &[usize]) -> OpeningNow {
+    let until = opening.since + OPENING_FOR;
+    if now >= until || tabs.iter().any(|t| !opening.tabs.contains(t)) {
+        return OpeningNow::Done;
+    }
+    let show = opening.since + OPENING_AFTER;
+    if now < show {
+        return OpeningNow::Waiting(show);
+    }
+    OpeningNow::Say(format!("{}\u{2026}", opening.text.trim_end_matches(['.', '\u{2026}'])), until)
 }
 
 /// The badge for a zoomed tab: which of its panes shows, in the order the tab lays them out
@@ -403,6 +441,41 @@ pub fn visual_bounds(card: &Rect, scale: f64, window: (u32, u32)) -> Option<(i32
 mod test {
     use super::*;
     use chrono::NaiveDate;
+
+    fn opening(t: Instant) -> Opening {
+        Opening { text: "Opening Chronos's InMail".into(), since: t, tabs: vec![1, 4, 7] }
+    }
+
+    #[test]
+    fn an_opening_says_nothing_for_a_quarter_second_then_says_it_until_a_new_tab_comes() {
+        let t = Instant::now();
+        let o = opening(t);
+        let tabs = [1, 4, 7];
+        assert_eq!(opening_now(&o, t + Duration::from_millis(100), &tabs), OpeningNow::Waiting(t + OPENING_AFTER));
+        assert_eq!(
+            opening_now(&o, t + Duration::from_millis(300), &tabs),
+            OpeningNow::Say("Opening Chronos's InMail\u{2026}".into(), t + OPENING_FOR)
+        );
+        assert_eq!(opening_now(&o, t + Duration::from_millis(300), &[1, 4, 7, 9]), OpeningNow::Done);
+        // A tab closing meanwhile isn't the new one; a tab it didn't have is, though the count is the same
+        assert!(matches!(opening_now(&o, t + Duration::from_secs(1), &[1, 4]), OpeningNow::Say(..)));
+        assert_eq!(opening_now(&o, t + Duration::from_secs(1), &[1, 4, 9]), OpeningNow::Done);
+    }
+
+    #[test]
+    fn an_opening_gives_up_after_its_wait() {
+        let t = Instant::now();
+        assert_eq!(opening_now(&opening(t), t + OPENING_FOR, &[1, 4, 7]), OpeningNow::Done);
+    }
+
+    #[test]
+    fn an_opening_ends_in_one_ellipsis_whatever_it_was_given() {
+        let t = Instant::now();
+        let mut o = opening(t);
+        o.text = "Opening Home's last conversation...".into();
+        assert!(matches!(opening_now(&o, t + OPENING_AFTER, &[1, 4, 7]),
+            OpeningNow::Say(s, _) if s == "Opening Home's last conversation\u{2026}"));
+    }
 
     fn at(day: u32, h: u32, m: u32, s: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(2026, 10, day)

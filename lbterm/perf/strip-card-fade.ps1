@@ -84,6 +84,7 @@ return {
   cursor_blink_rate = 0,
   default_cursor_style = 'SteadyBlock',
   lbterm_crash_restore = false,
+  wsl_domains = {},
   lbterm_tab_panel = { enabled = true },
   lbterm_summaries = '$(ConvertTo-LuaPath $sums)',
   default_prog = { $prog },
