@@ -1,15 +1,17 @@
 //! LBTerm: each Claude Code session's conversation, for the scroll strip
-//! (render/scroll_strip.rs) and the context pill's list of the files in it
-//! (render/context.rs), read from its transcript on a thread of its own
-//! (lbterm_extras::conversation) and shared by every window.
+//! (render/scroll_strip.rs) and the context bar (render/context_bar.rs), read
+//! from its transcript on a thread of its own (lbterm_extras::conversation) and
+//! shared by every window.
 //!
 //! A pane's session is its `claude_session` user var. Each window's strip, and
-//! its context list while it's open, says which session's conversation it
-//! shows ([`shows`]), and the reading thread follows those as their transcripts
+//! its context bar, says which session's conversation it shows ([`shows`]), and the reading thread follows those as their transcripts
 //! grow; [`get`] answers from memory. Each says it for itself (a [`Reader`]), so
 //! one saying none doesn't stop what the other shows being followed. When what's
 //! read of a session changes, the windows showing it repaint, and no others:
-//! until 2026-10-30 every window repainted for every session's growth.
+//! until 2026-10-30 every window repainted for every session's growth. A window
+//! whose only reader of it is the context bar repaints only when its context
+//! changed (a new `Snapshot::context`, which the reading thread says with each
+//! wake), since the bar draws nothing else of it.
 
 use lbterm_extras::conversation::{Conversations, Snapshot};
 use mux::window::WindowId as MuxWindowId;
@@ -27,8 +29,11 @@ type Folders = (PathBuf, Option<PathBuf>);
 pub enum Reader {
     /// The scroll strip, for the active pane's Claude Code in its full-screen view
     ScrollStrip,
-    /// The context pill's list, while it's open
-    Context,
+    /// The context bar, always, for the open tab's session (render/context_bar.rs)
+    Bar,
+    /// The questions pane, while a hold shows it (render/questions_pane.rs): its rows say
+    /// which questions his prompts answered, from the turns read here
+    Questions,
 }
 
 struct Store {
@@ -46,8 +51,9 @@ fn lock() -> MutexGuard<'static, Option<Store>> {
 }
 
 /// The configured folders; `None` with neither `lbterm_scroll_strip` nor `lbterm_context` set,
-/// the two that read the conversations (the context pill's list is the files in one,
-/// render/context.rs). The scroll strip's transcripts folder wins, since one reader serves both
+/// the two that read the conversations (the context pill's dollars and the context bar's
+/// sections come from one, render/context.rs and render/context_bar.rs; the bar needs
+/// `lbterm_context` too). The scroll strip's transcripts folder wins, since one reader serves both
 fn folders() -> Option<Folders> {
     let config = config::configuration();
     if config.lbterm_scroll_strip.is_none() && config.lbterm_context.is_none() {
@@ -69,9 +75,9 @@ fn folders() -> Option<Folders> {
 /// and again if they change
 fn store<'a>(guard: &'a mut MutexGuard<'static, Option<Store>>, folders: Folders) -> &'a mut Store {
     if guard.as_ref().map_or(true, |s| s.folders != folders) {
-        let conversations = Arc::new(Conversations::start(folders.0.clone(), folders.1.clone(), |sid: &str| {
+        let conversations = Arc::new(Conversations::start(folders.0.clone(), folders.1.clone(), |sid: &str, context: bool| {
             let sid = sid.to_string();
-            promise::spawn::spawn_into_main_thread(async move { repaint_showing(&sid) }).detach();
+            promise::spawn::spawn_into_main_thread(async move { repaint_showing(&sid, context) }).detach();
         }));
         **guard = Some(Store {
             folders,
@@ -80,6 +86,12 @@ fn store<'a>(guard: &'a mut MutexGuard<'static, Option<Store>>, folders: Folders
         });
     }
     guard.as_mut().expect("started above")
+}
+
+/// The transcripts' folder, `~/.claude/projects` unless the config names another: where the cost
+/// pane's count finds a session's transcript (crate::cost)
+pub fn transcripts_folder() -> Option<PathBuf> {
+    folders().map(|(projects, _)| projects)
 }
 
 /// What's known of session `sid`'s conversation, if a reader is on: from
@@ -91,8 +103,7 @@ pub fn get(sid: &str) -> Option<Arc<Snapshot>> {
 }
 
 /// Window `window`'s `reader` shows session `sid`'s conversation now, or none.
-/// Each paint of the strip says so, and the context pill as its list opens and
-/// shuts; only a change reaches the reading thread, with every session a pane
+/// Each paint of the strip and of the context bar says so; only a change reaches the reading thread, with every session a pane
 /// names, so a session not shown any more keeps what's been read of it while
 /// its pane is there.
 pub fn shows(window: MuxWindowId, reader: Reader, sid: Option<&str>) {
@@ -130,9 +141,12 @@ fn tell(store: &Store) {
     store.conversations.show(shown, live);
 }
 
-/// The windows showing session `sid` repaint, for what's new in it. A window
-/// that's gone is forgotten here, the only time it costs anything.
-fn repaint_showing(sid: &str) {
+/// The windows showing session `sid` repaint, for what's new in it: those whose scroll strip
+/// shows it for any change, those only whose context bar does only when its `context` changed
+/// (the bar draws nothing else of it; the reader wakes for every record, each text block, tool
+/// call and result, and a window whose strip showed another session or none painted a frame
+/// for each). A window that's gone is forgotten here, the only time it costs anything.
+fn repaint_showing(sid: &str, context: bool) {
     let Some(fe) = crate::frontend::try_front_end() else {
         return;
     };
@@ -151,7 +165,7 @@ fn repaint_showing(sid: &str) {
         store
             .shown
             .iter()
-            .filter(|(_, s)| s.as_str() == sid)
+            .filter(|((_, reader), s)| s.as_str() == sid && (context || *reader == Reader::ScrollStrip))
             .map(|((w, _), _)| *w)
             .collect()
     };

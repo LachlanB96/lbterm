@@ -1,6 +1,6 @@
 //! LBTerm: the voice drafts' cards (lbterm/CONTROL.md, "Drafts"; the drafts are crate::drafts',
 //! the logic lbterm_extras::drafts). Over each pane with a draft, just above Claude Code's input
-//! box (or what has its place: a picker, a permission prompt), a card shows the draft's lines as
+//! box (or what has its place: a permission prompt, a menu), a card shows the draft's lines as
 //! they'll be typed, each answer with a bar in its question's colour, under a line saying what to
 //! say to it. While a draft's open the pane's question colours show too, and the questions it
 //! answers are ticked (render/questions.rs).
@@ -19,7 +19,7 @@ use crate::termwindow::render::words::{Word, Words};
 use crate::termwindow::TermWindow;
 use crate::utilsprites::RenderMetrics;
 use config::SrgbaTuple;
-use lbterm_extras::drafts::{self, Body, Draft};
+use lbterm_extras::drafts::{self, Draft};
 use lbterm_extras::questions;
 use lbterm_extras::strip;
 use lbterm_extras::tabs::Rect;
@@ -41,7 +41,6 @@ const BAR_PLAIN: u32 = 0x8A8AA0;
 const BAR_ALPHA: f64 = 0.9;
 /// What the card says over the draft
 const HEAD_TEXT: &str = "Voice draft \u{b7} say \u{201c}send\u{201d}, \u{201c}scratch that\u{201d} or \u{201c}edit\u{201d}";
-const HEAD_PICKER: &str = "Picks for the picker \u{b7} say \u{201c}send\u{201d} or \u{201c}scratch that\u{201d}";
 
 /// A card as last drawn, for the state file
 #[derive(Debug, Clone)]
@@ -49,7 +48,6 @@ pub struct Drawn {
     /// The pane, by the mux server's id
     pub pane: u64,
     pub rect: Rect,
-    pub kind: &'static str,
     pub text: String,
 }
 
@@ -81,25 +79,15 @@ struct KeptCard {
     anchor: usize,
 }
 
-/// A card's lines: the head, the draft's lines with their questions' colours, and what a picker
-/// still waits for
+/// A card's lines: the head, and the draft's lines with their questions' colours
 fn card_rows(draft: &Draft) -> Vec<Row> {
     let session = draft.session.as_deref();
-    let mut rows: Vec<Row> = vec![(
-        (if draft.is_picker() { HEAD_PICKER } else { HEAD_TEXT }).to_string(),
-        None,
-        HEAD_ALPHA,
-    )];
+    let mut rows: Vec<Row> = vec![(HEAD_TEXT.to_string(), None, HEAD_ALPHA)];
     for line in draft.lines() {
         let bar = line
             .question
             .map(|n| question_colour(session, n).unwrap_or(BAR_PLAIN));
         rows.push((line.text, bar, TEXT_ALPHA));
-    }
-    if let Body::Picker { missing, .. } = &draft.body {
-        if !missing.is_empty() {
-            rows.push((format!("Still to pick: {}", missing.join(", ")), None, HEAD_ALPHA));
-        }
     }
     rows
 }
@@ -150,7 +138,6 @@ impl TermWindow {
             .iter()
             .map(|d| lbterm_extras::state::DraftCard {
                 pane: d.pane,
-                kind: d.kind.to_string(),
                 text: d.text.clone(),
                 rect: lbterm_extras::state::Rect::round(d.rect.x, d.rect.y, d.rect.w, d.rect.h),
             })
@@ -285,7 +272,6 @@ impl TermWindow {
             self.lbterm_drafts.drawn.push(Drawn {
                 pane: draft.pane,
                 rect: card,
-                kind: if draft.is_picker() { "picker" } else { "text" },
                 text: draft.text(),
             });
         }

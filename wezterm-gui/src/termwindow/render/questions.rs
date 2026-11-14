@@ -66,6 +66,8 @@ pub struct QuestionsState {
     bands: RefCell<KeptQuads>,
     chips: RefCell<KeptQuads>,
     pub(crate) words: RefCell<Words>,
+    /// The questions pane beside them while a hold shows them (render/questions_pane.rs)
+    pub(crate) pane: super::questions_pane::PaneState,
 }
 
 /// The last layout: what it was made from, the screen it was made of (by its read and by its
@@ -96,6 +98,37 @@ struct Shown {
     pane: PaneId,
     /// The button that showed them, which holds them
     held: Option<MousePress>,
+    /// The pane's Claude session, read once as they're shown: every frame of a hold draws for it
+    pub(crate) session: Option<String>,
+    /// When, and the press's click streak, for the line logged when they go
+    at: std::time::Instant,
+    streak: Option<usize>,
+    /// What the last frame showed, or why it showed nothing
+    outcome: Outcome,
+}
+
+/// What a frame of the colours showed, or why nothing: logged once when they go, so a hold that
+/// showed nothing in Lachlan's window says why in its log (lbterm/FLOWS.md, "A right hold, to the
+/// question colours", "What could go")
+#[derive(Debug, Clone, Default, PartialEq)]
+enum Outcome {
+    /// No frame drew them yet
+    #[default]
+    Unpainted,
+    /// The pane they were shown on isn't among the panes drawn
+    PaneNotDrawn,
+    /// The pane has no `claude_session` user var
+    NoSession,
+    /// `lbterm_summaries` is unset
+    NoSummaries,
+    /// The session's summary isn't read yet: asked for now, read off the GUI thread
+    NotRead,
+    /// The session has no questions file, or one with no replies
+    NoQuestions,
+    /// Questions, but none of them on the screen: the newest reply's labels, and the
+    /// conversation's rows (above Claude Code's input box)
+    NoneOnScreen { newest: Vec<String>, rows: usize },
+    Shown { bands: usize, markers: usize },
 }
 
 /// What a layout was made from, besides its screen
@@ -109,7 +142,7 @@ struct Key {
     generation: u64,
 }
 
-fn srgb(rgb: u32, alpha: f64) -> LinearRgba {
+pub(crate) fn srgb(rgb: u32, alpha: f64) -> LinearRgba {
     let (r, g, b) = palette::bytes(rgb);
     LinearRgba::with_srgba(r, g, b, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
@@ -181,9 +214,22 @@ impl TermWindow {
             Some(WMEK::Press(press)) if mode == LbtermQuestions::Show => Some(*press),
             _ => None,
         };
+        let session = pane
+            .copy_user_vars()
+            .remove("claude_session")
+            .filter(|sid| !sid.is_empty());
+        // A hold shows the questions pane, whose rows need the session's turns read
+        // (render/questions_pane.rs); a voice draft's colours show no pane
+        if held.is_some() {
+            crate::conversations::shows(self.mux_window_id, crate::conversations::Reader::Questions, session.as_deref());
+        }
         self.lbterm_questions.shown = Some(Shown {
             pane: pane.pane_id(),
             held,
+            session,
+            at: std::time::Instant::now(),
+            streak: self.last_mouse_click.as_ref().map(|c| c.streak),
+            outcome: Outcome::default(),
         });
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -192,7 +238,18 @@ impl TermWindow {
 
     pub(crate) fn lbterm_questions_hide(&mut self) {
         self.lbterm_questions.cache = None;
-        if self.lbterm_questions.shown.take().is_some() {
+        if let Some(shown) = self.lbterm_questions.shown.take() {
+            if shown.held.is_some() {
+                crate::conversations::shows(self.mux_window_id, crate::conversations::Reader::Questions, None);
+            }
+            log::info!(
+                "questions: shown {} ms on pane {} (held {:?}, streak {:?}): {:?}",
+                shown.at.elapsed().as_millis(),
+                shown.pane,
+                shown.held,
+                shown.streak,
+                shown.outcome
+            );
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
@@ -252,10 +309,11 @@ impl TermWindow {
     /// conversation (what's above Claude Code's input box) or its session's questions change.
     /// None without a Claude session or questions.
     fn lbterm_questions_layout(&mut self, pane: &Arc<dyn Pane>) -> Option<(Rc<Layout>, u64)> {
-        let sid = pane
-            .copy_user_vars()
-            .remove("claude_session")
-            .filter(|sid| !sid.is_empty())?;
+        // A hold's session as read when it was shown; a voice draft's read each frame
+        let sid = match self.lbterm_questions.shown.as_ref().filter(|s| s.pane == pane.pane_id()) {
+            Some(shown) => shown.session.clone(),
+            None => pane.copy_user_vars().remove("claude_session").filter(|sid| !sid.is_empty()),
+        }?;
         let store = crate::summaries::store()?;
         let dims = pane.get_dimensions();
         let key = Key {
@@ -304,6 +362,38 @@ impl TermWindow {
         layout.map(|l| (l, id))
     }
 
+    /// What a frame of the colours held by the button showed, for the line logged when they go
+    fn lbterm_questions_saw(&mut self, outcome: Outcome) {
+        if let Some(shown) = self.lbterm_questions.shown.as_mut() {
+            shown.outcome = outcome;
+        }
+    }
+
+    /// Why `pane` has no layout: the first of [`Self::lbterm_questions_layout`]'s steps that has
+    /// nothing. Only while the colours are held and show nothing
+    fn lbterm_questions_why_none(&self, pane: &Arc<dyn Pane>) -> Outcome {
+        // The hold's session, read once at its press and the one its layout used; a voice
+        // draft's pane is read for it
+        let read;
+        let sid = match self.lbterm_questions.shown.as_ref() {
+            Some(shown) => shown.session.as_deref(),
+            None => {
+                read = pane.copy_user_vars().remove("claude_session");
+                read.as_deref()
+            }
+        };
+        let Some(sid) = sid.filter(|s| !s.is_empty()) else {
+            return Outcome::NoSession;
+        };
+        let Some(store) = crate::summaries::store() else {
+            return Outcome::NoSummaries;
+        };
+        match store.get(sid) {
+            None => Outcome::NotRead,
+            Some(_) => Outcome::NoQuestions,
+        }
+    }
+
     /// Draw the colours, while they're shown: a band over each question and passage with a bar
     /// down its left, a bar for each question a passage goes with, and the markers at the
     /// conversation's top and bottom edges, right-aligned. Under a voice draft, a tick on each
@@ -312,6 +402,13 @@ impl TermWindow {
     pub(crate) fn paint_lbterm_questions(&mut self) -> anyhow::Result<()> {
         self.lbterm_drafts.ticked.clear();
         self.lbterm_drafts.next = None;
+        self.lbterm_questions.pane.drawn = None;
+        self.lbterm_questions.pane.visual = None;
+        // The questions pane going back under the window's edge once the hold that showed it has
+        // ended, drawn as it was until it's gone (render/questions_pane.rs)
+        if !self.lbterm_questions.shown.as_ref().map_or(false, |s| s.held.is_some()) {
+            self.paint_lbterm_questions_pane_leaving()?;
+        }
         // Nothing shown and no draft anywhere, as nearly always: no pane is looked at
         if self.lbterm_questions.shown.is_none() && !crate::drafts::any() {
             return Ok(());
@@ -330,27 +427,54 @@ impl TermWindow {
                 .max_by_key(|p| p.is_active),
         };
         let Some(pos) = pos else {
+            self.lbterm_questions_saw(Outcome::PaneNotDrawn);
             return Ok(());
+        };
+        // The colours' layout first, so the questions bar can say which way each question is
+        let laid = self.lbterm_questions_layout(&pos.pane);
+        // The questions bar down the window's right, while the button holds them
+        // (render/questions_pane.rs): drawn whatever the colours find on the screen, each
+        // question's arrow from where the layout puts it (Lachlan's E15 of 2026-11-14), and the
+        // ticks stay left of it
+        let pane_left = match self.lbterm_questions.shown.as_ref().filter(|s| s.held.is_some()) {
+            Some(shown) => {
+                let session = shown.session.clone();
+                let places = laid.as_ref().map(|(layout, _)| &layout.places[..]).unwrap_or(&[]);
+                self.paint_lbterm_questions_pane(session.as_deref(), true, Some(places))?
+            }
+            None => None,
         };
         let draft = draft_for(&pos.pane);
         let answered = draft.as_ref().map(|d| d.answered()).unwrap_or_default();
-        let Some((layout, layout_id)) = self.lbterm_questions_layout(&pos.pane) else {
+        let Some((layout, layout_id)) = laid else {
+            if self.lbterm_questions.shown.is_some() {
+                let why = self.lbterm_questions_why_none(&pos.pane);
+                self.lbterm_questions_saw(why);
+            }
             return Ok(());
         };
         if layout.is_empty() {
+            self.lbterm_questions_saw(Outcome::NoneOnScreen {
+                newest: layout.newest.iter().map(|a| a.label.clone()).collect(),
+                rows: layout.area.end,
+            });
             return Ok(());
         }
+        self.lbterm_questions_saw(Outcome::Shown {
+            bands: layout.bands.len(),
+            markers: layout.markers.len(),
+        });
         let ticks: Vec<&Asked> = layout
             .asked
             .iter()
             .filter(|a| a.newest && a.number.map_or(false, |n| answered.contains(&n)))
             .collect();
         self.lbterm_drafts.ticked = ticks.iter().filter_map(|a| a.number).collect();
-        // A voice draft's next question to answer, ringed in red. Not a picker's: its questions
-        // are the picker's, not the reply's
-        let next = match &draft {
-            Some(d) if !d.is_picker() => layout.next(&answered, self.config.lbterm_next_question_extras),
-            _ => None,
+        // A voice draft's next question to answer, ringed in red
+        let next = if draft.is_some() {
+            layout.next(&answered, self.config.lbterm_next_question_extras)
+        } else {
+            None
         };
 
         let (padding_left, padding_top) = self.padding_left_top();
@@ -370,6 +494,8 @@ impl TermWindow {
         };
         let pad = 4.0 * scale;
         let bar_w = (3.0 * scale).max(2.0);
+        // The markers and ticks, right-aligned to the pane, or short of the questions pane over it
+        let chips_right = pane_left.map_or(right, |l| right.min(l - 6.0 * scale));
 
         // The next question on the screen: a ring just outside its band and its options'
         let next_ring = match &next {
@@ -426,8 +552,10 @@ impl TermWindow {
             Ok(())
         })?;
 
-        // The markers, with one of its own for the next question when none of it is on the screen
-        let mut markers = layout.markers.clone();
+        // The markers, with one of its own for the next question when none of it is on the
+        // screen. While the bar is out its arrows say which way each question is, so the edges'
+        // markers aren't drawn (Lachlan's E15 of 2026-11-14); a voice draft's ring still is
+        let mut markers = if pane_left.is_some() { vec![] } else { layout.markers.clone() };
         let next_label = match &next {
             Some(Next::Off(marker)) => marker.label.clone(),
             _ => String::new(),
@@ -472,7 +600,7 @@ impl TermWindow {
                 })
                 .collect();
             let total: f64 = edge.iter().map(|(_, w, _, _)| w + gap).sum();
-            let mut x = right - total;
+            let mut x = chips_right - total;
             for (label, w, colour, ring) in edge {
                 let chip = Rect { x, y, w, h: chip_h };
                 if ring {
@@ -490,7 +618,7 @@ impl TermWindow {
             );
             let w = label.chars().count() as f64 * text_w + 2.0 * pad;
             let y = row_y(tick.row) + (cell_h - chip_h) / 2.0;
-            chips.push((Rect { x: right - w - gap, y, w, h: chip_h }, label, questions::colour(tick.colour)));
+            chips.push((Rect { x: chips_right - w - gap, y, w, h: chip_h }, label, questions::colour(tick.colour)));
         }
         // The next question off the screen: a ring round its marker
         let chip_ring = ringed_chip.map(|chip| {

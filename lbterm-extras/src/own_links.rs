@@ -31,7 +31,7 @@ mod tests {
             "lbterm://inmail/Terminal?message=2026-11-02-2023-from-Terminal-x.md",
             "lbterm://session/6f1c0d4e-0000-4000-8000-000000000000",
             "lbterm://image/C:/Users/x/shot.png?row=2&of=5",
-            "LBTerm://inmail/Earshot",
+            "LBTerm://inmail/LyreBird",
             "lbterm:",
         ] {
             assert!(is_own(uri), "{uri}");
@@ -46,9 +46,9 @@ mod tests {
             "http://127.0.0.1:27151/d/terminal",
             "file:///C:/Users/x/notes.md",
             "mailto:someone@example.com",
-            "lbtermx://inmail/Earshot",
-            "lbter://inmail/Earshot",
-            "xlbterm://inmail/Earshot",
+            "lbtermx://inmail/LyreBird",
+            "lbter://inmail/LyreBird",
+            "xlbterm://inmail/LyreBird",
             "lbterm",
             "",
         ] {

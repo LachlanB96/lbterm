@@ -386,6 +386,25 @@ pub struct Event {
     pub text: String,
 }
 
+/// A stretch of the conversation that a message to Claude starts: one of his prompts, with the
+/// questions it names by number, or a message of another's (a task finishing, another session's).
+/// The questions pane reads them (crate::questions::pane): a reply's questions are answered by
+/// his prompts in the turns after the one the reply ended in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    /// When the message that starts it was sent
+    pub at_ms: i64,
+    /// When the turn last wrote something a snapshot shows: its message's time until Claude
+    /// writes after it
+    pub last_ms: i64,
+    /// The questions his prompt names ([`crate::drafts::picks_in`]); none for another's message
+    pub picks: Vec<crate::drafts::Pick>,
+    /// It's started by his prompt, typed or queued while Claude worked: not a task finishing or
+    /// another session's message. A prompt of his in words answers a reply that asked one
+    /// question (crate::questions::pane::rows, Lachlan's 6a of 2026-11-14)
+    pub his: bool,
+}
+
 /// A tool call, kept until its result says how it went
 #[derive(Debug, Clone)]
 struct ToolUse {
@@ -419,6 +438,11 @@ pub struct Conversation {
     /// The files in its context now (crate::context), for the pill under the InMail button:
     /// shared with the snapshots, and copied only when one changes
     pub context: Arc<crate::context::Context>,
+    /// What the records of Claude Code's requests say, for the context's scale and Claude Code's
+    /// parts (crate::context::Requests)
+    requests: crate::context::Requests,
+    /// Each `Read` of a memory file waiting on its result, by its call's id: the file's path
+    memory_reads: HashMap<String, String>,
     /// The tools block a run of calls is adding to, until something else is drawn
     open_tools: Option<usize>,
     /// The turn's last text block, for a question at its end
@@ -431,6 +455,9 @@ pub struct Conversation {
     asked: Vec<u32>,
     /// The session's scratchpad ([`scratchpad_of`]), where an edit folds; empty when unknown
     pub scratchpad: String,
+    /// Each turn a message to Claude started, in order, in pieces a snapshot shares: a turn
+    /// that's still writing copies only its own piece
+    pub turns: Chunks<Turn>,
     /// The pieces of the last [`Snapshot`]'s marks and of where to find things in it, and the first
     /// block changed since (a snapshot builds again only the pieces from that one's on)
     events_pieces: Vec<Arc<Vec<Event>>>,
@@ -1100,21 +1127,64 @@ impl Conversation {
                 self.context_change(|c| c.saw_folder(cwd));
             }
         }
+        let was = self.revision;
         match str_of(record, "type") {
             Some("user") => self.user(record, at_ms),
             Some("assistant") => self.assistant(record, at_ms),
             Some("system") => self.system(record, at_ms),
             Some("attachment") => self.attachment(record, at_ms),
+            // Claude Code's requests, for the context bar's scale and Claude Code's own parts
+            // (crate::context::Requests)
+            Some("api-request-shape") => self.requests.shape(record),
+            Some("api-request-blob") => self.requests.blob(record),
+            Some("api-request") => {
+                if let Some(shape) = self.requests.request(record).filter(|s| self.context.requests_differ(*s)) {
+                    self.context_change(|c| c.requested(shape));
+                }
+            }
             _ => {}
+        }
+        // The turn wrote what a snapshot shows: a record that changed nothing leaves its time,
+        // so a snapshot's turns are as new as its blocks
+        if self.revision != was && at_ms > 0 {
+            if let Some(last) = self.turns.len().checked_sub(1) {
+                if self.turns[last].last_ms < at_ms {
+                    self.turns.make_mut(last).last_ms = at_ms;
+                }
+            }
         }
     }
 
-    /// Change the context's files with `change`, which says whether it changed anything: the
-    /// shared copy is copied only then, and the revision moves so a snapshot takes it
+    /// A message to Claude starts a turn: his prompt, with the questions it names, or another's
+    fn turn(&mut self, at_ms: i64, text: Option<&str>) {
+        let picks = text.map(crate::drafts::picks_in).unwrap_or_default();
+        self.turns.push(Turn { at_ms, last_ms: at_ms, picks, his: text.is_some() });
+    }
+
+    /// Whether the records of message blobs are wanted: only until the first main request's
+    /// reply has made the context's scale
+    pub fn wants_blobs(&self) -> bool {
+        !self.requests.done
+    }
+
+    /// Change the context with `change`, which says whether it changed anything, and the revision
+    /// moves when it did so a snapshot takes it. Changed in place while no snapshot shares it (a
+    /// transcript read from its start takes none until the read is done); else on a copy, kept
+    /// only when it changed. The records that come often (each reply's usage, each request) ask
+    /// the context whether they'd change it before they come here, so they copy nothing when not
     fn context_change(&mut self, change: impl FnOnce(&mut crate::context::Context) -> bool) {
-        let mut context = (*self.context).clone();
-        if change(&mut context) {
-            self.context = Arc::new(context);
+        let changed = match Arc::get_mut(&mut self.context) {
+            Some(context) => change(context),
+            None => {
+                let mut context = (*self.context).clone();
+                let changed = change(&mut context);
+                if changed {
+                    self.context = Arc::new(context);
+                }
+                changed
+            }
+        };
+        if changed {
             self.revision += 1;
         }
     }
@@ -1200,6 +1270,13 @@ impl Conversation {
             let mut any = false;
             for part in parts.iter().filter(|p| str_of(p, "type") == Some("tool_result")) {
                 any = true;
+                // A memory file Claude read: its own section of the context bar
+                if let Some(path) = str_of(part, "tool_use_id").and_then(|id| self.memory_reads.remove(id)) {
+                    if part.get("is_error").and_then(Value::as_bool) != Some(true) {
+                        let text = result_text(part.get("content").unwrap_or(&Value::Null));
+                        self.context_change(|c| c.remembered(&path, &text));
+                    }
+                }
                 let Some(&i) = str_of(part, "tool_use_id").and_then(|id| self.by_id.get(id)) else {
                     continue;
                 };
@@ -1242,6 +1319,7 @@ impl Conversation {
         }
         // A background command or a subagent finishing: "● Background command "…" completed"
         if let Some(summary) = notification(content) {
+            self.turn(at_ms, None);
             self.note(&summary, at_ms);
             return;
         }
@@ -1256,14 +1334,24 @@ impl Conversation {
         let origin = record.get("origin").and_then(|o| str_of(o, "kind"));
         if origin.is_some_and(|o| o != "human") {
             // A task finishing, another session's message: a line of Claude Code's, no mark
+            self.turn(at_ms, None);
             self.push(Block::new(BlockKind::Note, at_ms));
             return;
         }
+        self.turn(at_ms, Some(&text));
+        self.prompt(&text, at_ms);
+    }
+
+    /// His prompt's block and its mark on the scroll strip: typed when Claude waited (a `user`
+    /// record), or typed while Claude worked (a `queued_command` attachment), which Claude Code
+    /// draws in the conversation with the same component (read from its bundle on 2026-11-14:
+    /// both render through the one user-text message component)
+    fn prompt(&mut self, text: &str, at_ms: i64) {
         let mut block = Block::new(BlockKind::Prompt, at_ms);
         block.lines = text.lines().map(|l| Line::words(l, 2)).collect();
         block.line_keys = text.lines().map(line_key).collect();
-        block.key = Some(prompts::key(&text));
-        block.text = cut(&prompts::one_line(&text), TEXT_MAX);
+        block.key = Some(prompts::key(text));
+        block.text = cut(&prompts::one_line(text), TEXT_MAX);
         let words = block.text.clone();
         let i = self.push(block);
         self.last_text = None;
@@ -1274,6 +1362,21 @@ impl Conversation {
         let Some(message) = record.get("message") else {
             return;
         };
+        // What's in use: the size of the request this reply answers, and the first's makes the
+        // context's scale (crate::context::InUse, Scale)
+        if let Some(usage) = message.get("usage") {
+            // Asked first, so a reply repeating the count (each of a turn's records) copies nothing
+            if let Some((in_use, scale)) = self.context.answer(usage, self.requests.first()) {
+                self.context_change(|c| {
+                    (c.in_use, c.scale) = (in_use, scale);
+                    c.replies += 1;
+                    true
+                });
+            }
+            if self.context.scale.is_some() && !self.requests.done {
+                self.requests.finish();
+            }
+        }
         let api_error = record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
         for part in message.get("content").and_then(Value::as_array).into_iter().flatten() {
             match str_of(part, "type") {
@@ -1328,6 +1431,12 @@ impl Conversation {
                     let (what, kind) = describe_tool(&name, input);
                     if let Some(id) = str_of(part, "id") {
                         self.by_id.insert(id.to_string(), self.tools.len());
+                        // A memory file read: its result is its section of the context bar
+                        if let Some(path) = (name == "Read").then(|| str_of(input, "file_path")).flatten() {
+                            if self.context.is_memory_file(path) {
+                                self.memory_reads.insert(id.to_string(), path.to_string());
+                            }
+                        }
                     }
                     self.add_tool(ToolUse {
                         name,
@@ -1354,21 +1463,47 @@ impl Conversation {
         self.push(block);
     }
 
-    /// An attachment: a subagent's notification delivered while Claude was working, which Claude
-    /// Code draws as a line ("● Agent "…" finished · 7m 9s")
+    /// An attachment: a message to Claude delivered while Claude was working (`queued_command`).
+    /// A subagent's notification Claude Code draws as a line ("● Agent "…" finished · 7m 9s").
+    /// A prompt he typed while Claude worked is written only as this, never as a `user` record,
+    /// so it starts a turn here, with the questions it names, and its block and mark on the
+    /// scroll strip, as a typed prompt does in `user` (Lachlan's 7a of 2026-11-14); another
+    /// session's message starts one with none, and no block (lbterm/PITFALLS.md 361)
     fn attachment(&mut self, record: &Value, at_ms: i64) {
         // The files Claude Code put in the context (crate::context): every one at the start and
-        // after a compaction, and a CLAUDE.md a file read pulled in later
+        // after a compaction, a CLAUDE.md a file read pulled in later, and the files it attached
+        // again after a compaction's summary
         match record.get("attachment").and_then(|a| str_of(a, "type").map(|t| (a, t))) {
             Some((a, "instructions")) => return self.context_change(|c| c.instructions(a)),
+            Some((_, "file")) => return self.context_change(|c| c.attached(record)),
             Some((a, "nested_memory")) => return self.context_change(|c| c.nested(a)),
+            Some((_, "skill_listing")) => return self.context_change(|c| c.skills(record)),
             _ => {}
         }
         let Some(a) = record.get("attachment").filter(|a| str_of(a, "type") == Some("queued_command")) else {
             return;
         };
-        if let Some(summary) = a.get("prompt").and_then(notification) {
+        let Some(prompt) = a.get("prompt") else {
+            return;
+        };
+        if let Some(summary) = notification(prompt) {
+            self.turn(at_ms, None);
             self.note(&summary, at_ms);
+            return;
+        }
+        // His prompt, or another session's message ("commandMode": "prompt", its origin "human"
+        // or "peer"). His gets a prompt's block and mark, as a typed one does; another session's
+        // turn alone moves the revision, so a snapshot takes it
+        let Some(text) = prompt_text(prompt) else {
+            return;
+        };
+        let origin = a.get("origin").and_then(|o| str_of(o, "kind"));
+        let his = origin.map_or(true, |o| o == "human");
+        self.turn(at_ms, his.then_some(text.as_str()));
+        if his {
+            self.prompt(&text, at_ms);
+        } else {
+            self.revision += 1;
         }
     }
 
@@ -1377,7 +1512,8 @@ impl Conversation {
             Some("compact_boundary") => {
                 // What it had loaded goes with what came before: the instructions record after
                 // the boundary loads the start's files again
-                self.context_change(|c| c.compacted());
+                let post = record.pointer("/compactMetadata/postTokens").and_then(Value::as_u64).unwrap_or(0);
+                self.context_change(|c| c.compacted(post));
                 let i = self.push(Block::new(BlockKind::Compaction, at_ms));
                 self.compacted_at = Some(i);
                 self.mark(Kind::Compaction, i, at_ms, "Conversation compacted".into());
@@ -1478,6 +1614,7 @@ impl Conversation {
             compacted_at: self.compacted_at,
             context: Arc::clone(&self.context),
             found: self.found_pieces.clone(),
+            turns: self.turns.clone(),
             revision: self.revision,
         }
     }
@@ -1519,6 +1656,8 @@ pub struct Snapshot {
     pub context: Arc<crate::context::Context>,
     /// Where to find each block and line by the words on a screen row, a piece of the blocks each
     found: Vec<Arc<pieces::Found>>,
+    /// Each turn a message to Claude started ([`Conversation::turns`]), shared with it
+    pub turns: Chunks<Turn>,
     /// The conversation's [`Conversation::revision`] when it was taken
     pub revision: u64,
 }
@@ -1532,6 +1671,7 @@ impl PartialEq for Snapshot {
             && self.context == other.context
             && self.found.len() == other.found.len()
             && self.found.iter().zip(&other.found).all(|(a, b)| a == b)
+            && self.turns == other.turns
     }
 }
 
@@ -2329,15 +2469,26 @@ pub struct Follow {
 /// The kinds of record the conversation reads, and the attachments it does (a subagent's
 /// notification delivered mid-turn, and the files Claude Code put in the context, crate::context):
 /// other lines aren't parsed. Inside a JSON string every quote is escaped, so these match only a
-/// record's own keys, never quoted text
-const WANTED: [&[u8]; 6] = [
+/// record's own keys, never quoted text. For the context bar (crate::context): the skills list,
+/// and the records of Claude Code's requests, their shapes (a few a transcript, about 50 KB each)
+/// and the requests themselves (one a reply, about 1.6 KB); the messages' blobs only until the
+/// first request's reply is in ([`BLOB`], [`Conversation::wants_blobs`]), since they're most of a
+/// transcript's bytes after that; and a `file` attachment, a file attached again after a
+/// compaction's summary (or named in a prompt, which the context leaves to the conversation)
+const WANTED: [&[u8]; 10] = [
     br#""type":"user""#,
     br#""type":"assistant""#,
     br#""type":"system""#,
     br#""type":"queued_command""#,
     br#""type":"instructions""#,
     br#""type":"nested_memory""#,
+    br#""type":"skill_listing""#,
+    br#""type":"file""#,
+    br#""type":"api-request-shape""#,
+    br#""type":"api-request""#,
 ];
+/// A message blob's record: read only while [`Conversation::wants_blobs`]
+const BLOB: &[u8] = br#""type":"api-request-blob""#;
 /// The most read at a time: a long transcript is read to its end in pieces of this
 const READ_MAX: u64 = 32 * 1024 * 1024;
 
@@ -2372,7 +2523,7 @@ impl Follow {
     }
 
     fn line(&mut self, line: &[u8]) {
-        if !wanted(line) {
+        if !wanted(line) && !(self.conversation.wants_blobs() && memchr::memmem::find(line, BLOB).is_some()) {
             return;
         }
         if let Ok(record) = serde_json::from_slice::<Value>(line) {
@@ -2444,8 +2595,9 @@ struct Shared {
     /// Each session's conversation as last read, for the sessions shown and those kept
     known: std::sync::Mutex<HashMap<String, Arc<Snapshot>>>,
     generation: std::sync::atomic::AtomicU64,
-    /// Told the session whose conversation changed
-    wake: Box<dyn Fn(&str) + Send + Sync>,
+    /// Told the session whose conversation changed, and whether its context did (a new
+    /// `Snapshot::context`): a window only the context bar reads it for repaints only then
+    wake: Box<dyn Fn(&str, bool) + Send + Sync>,
     /// Claude Code's transcripts, one folder per project: `~/.claude/projects`
     projects: std::path::PathBuf,
     /// Where claudehook writes `<sid>.events.jsonl`, the summaries' folder
@@ -2483,11 +2635,11 @@ pub struct Conversations {
 impl Conversations {
     /// Start the reading thread for transcripts under `projects`, with claudehook's permission
     /// records in `summaries`; `wake` is called from it with the session whose conversation, shown,
-    /// changed.
+    /// changed, and whether its context did.
     pub fn start(
         projects: std::path::PathBuf,
         summaries: Option<std::path::PathBuf>,
-        wake: impl Fn(&str) + Send + Sync + 'static,
+        wake: impl Fn(&str, bool) + Send + Sync + 'static,
     ) -> Self {
         Self::start_shared(Shared {
             known: std::sync::Mutex::new(HashMap::new()),
@@ -2505,7 +2657,7 @@ impl Conversations {
     #[cfg(test)]
     fn start_probed(
         projects: std::path::PathBuf,
-        wake: impl Fn(&str) + Send + Sync + 'static,
+        wake: impl Fn(&str, bool) + Send + Sync + 'static,
         before_follow: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         Self::start_shared(Shared {
@@ -2732,14 +2884,17 @@ fn follow(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Msg>, events: std::
             if session.given != Some(revision) {
                 let snapshot = Arc::new(session.follow.conversation.snapshot());
                 session.given = Some(revision);
-                lock(&shared.known).insert(sid.clone(), snapshot);
-                woke.push(sid);
+                let context = snapshot.context.clone();
+                let was = lock(&shared.known).insert(sid.clone(), snapshot);
+                // Its context moved when the snapshot's is another Arc than the last one given
+                // (Conversation::context_change makes a new one only for a change)
+                woke.push((sid, was.map_or(true, |w| !Arc::ptr_eq(&w.context, &context))));
             }
         }
         if !woke.is_empty() {
             shared.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            for sid in &woke {
-                (shared.wake)(sid);
+            for (sid, context) in &woke {
+                (shared.wake)(sid, *context);
             }
         }
 

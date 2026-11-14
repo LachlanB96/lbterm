@@ -692,9 +692,44 @@ pub fn hides_tabs(config: &crate::Config) -> bool {
     config.lbterm_tab_panel.enabled && !config.lbterm_tab_panel.tab_bar
 }
 
-/// 68 px at 96 DPI: the ring, and a pill round each pad clear of its corners
+/// The closed tab rail's width, ring included: 68 px at 96 DPI, the ring and a pill round each pad
+/// clear of its corners. `lbterm_tab_panel.rail_width`'s default
+pub const RAIL_WIDTH: crate::Dimension = crate::Dimension::Points(51.);
+
+/// The questions pane's width, ring included (lbterm/QUESTIONS.md, "The questions pane"): the
+/// closed tab rail's, Lachlan's 3c of 2026-11-14 ("all the other designs would hide the
+/// conversation text"), so it holds each question's chip, label and mark and no words of it
+pub const QUESTIONS_PANE_WIDTH: crate::Dimension = RAIL_WIDTH;
+
+/// The weights' colours (lbterm/QUESTIONS.md, "The weights"; lbterm/DESIGN.md, "Colour"): an
+/// option's share of 100 runs from red at 0 through amber at 50 to green at 100 (Lachlan,
+/// 2026-11-12: "close to 0 would be red and close to 100 would be green"). Each reads on the
+/// panes' #121212, red the dimmest at about 6:1, and stands apart from the question colours'
+/// six (`lbterm_extras::questions::COLOURS`): the green leans yellow (a hue of about 95 degrees)
+/// where Q2's green and Q5's teal lean blue, the amber is a full gold where Q3's is a soft one,
+/// and the red is a red, not Q6's pink
+pub const WEIGHT_RED: u32 = 0xFF5A4A;
+pub const WEIGHT_AMBER: u32 = 0xFFD426;
+pub const WEIGHT_GREEN: u32 = 0x8BDB4A;
+
+/// A share's colour, 0xRRGGBB: straight between the stops either side of it, channel by channel
+/// as they're written, rounded, so 70 is 0xD1D734, a yellow-green. A share past 100 is 100's
+pub fn weight_colour(share: u8) -> u32 {
+    let share = u32::from(share.min(100));
+    let (from, to, at) = if share <= 50 {
+        (WEIGHT_RED, WEIGHT_AMBER, share)
+    } else {
+        (WEIGHT_AMBER, WEIGHT_GREEN, share - 50)
+    };
+    let channel = |shift: u32| {
+        let (a, b) = ((from >> shift) & 0xFF, (to >> shift) & 0xFF);
+        ((a * (50 - at) + b * at + 25) / 50) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
 fn default_panel_rail() -> crate::Dimension {
-    crate::Dimension::Points(51.)
+    RAIL_WIDTH
 }
 
 /// 290 px at 96 DPI
@@ -953,13 +988,16 @@ fn default_scroll_strip_open_delay() -> u64 {
     150
 }
 
-/// `config.lbterm_projects`: a pad at the top of the objectives strip (level with the Conductor's on
-/// the tab rail) that opens a card of every project in `projects` while the pointer rests on it:
-/// how many Claude sessions are open in each, working, waiting on you or idle, their subagents
-/// and background tasks, the InMail waiting for it (counted from `lbterm_inbox`'s folders), and
-/// buttons that fire the `lbterm-project-action` Lua event to start a session there, one told to
-/// read its InMail, or resume its last (lbterm/OBJECTIVES.md, "The projects card"). A project with
-/// a `parent` is a repo of that one, listed under it. Needs `lbterm_objectives`.
+/// `config.lbterm_projects`: a pad on the window strip's second row, right of the context pill
+/// under the InMail button (in the pill's place without it), that opens a card of every project in
+/// `projects` while the pointer rests on it: how many Claude sessions are open in each, working,
+/// waiting on you or idle, their subagents and background tasks, the InMail waiting for it
+/// (counted from `lbterm_inbox`'s folders), and buttons that fire the `lbterm-project-action` Lua
+/// event to start a session there, one told to read its InMail, or resume its last
+/// (lbterm/OBJECTIVES.md, "The projects card"). A project with a `parent` is a repo of that one,
+/// listed under it. Needs the tab panel and the strip's second row (`lbterm_prompt_history`), and
+/// no longer `lbterm_objectives` (Lachlan's 1 of 2026-11-08: it moved off the objectives strip
+/// when the context bar took that strip's room).
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub struct LbtermProjects {
     /// The projects, in any order: the card puts the busiest first
@@ -967,6 +1005,12 @@ pub struct LbtermProjects {
     /// How wide the card is
     #[dynamic(try_from = "crate::units::PixelUnit", default = "default_projects_card_width")]
     pub card_width: crate::Dimension,
+    /// How long the pointer rests on the pad before the card opens (a left press opens it at once)
+    #[dynamic(default = "default_objectives_open_delay")]
+    pub open_delay_ms: u64,
+    /// And how long after it leaves the pad and the card they close
+    #[dynamic(default = "default_objectives_close_delay")]
+    pub close_delay_ms: u64,
     /// Where the new-tab picker keeps the last projects picked from it (a JSON list of names,
     /// newest first), read once at start and written through a rename, both off the GUI thread
     /// (lbterm_extras::newtab). Unset, the picks are kept in memory alone, for as long as the GUI
@@ -1060,7 +1104,99 @@ pub struct LbtermContext {
     /// `lbterm_scroll_strip.transcripts`, which wins, since one reader serves both
     #[dynamic(default)]
     pub transcripts: Option<String>,
+    /// LBTerm counts what each conversation has cost itself, from its transcript and its
+    /// subagents', for the cost pane the pill's press opens: the split by what spent it, the token
+    /// types and the graph (lbterm/CONTEXT.md, "The cost pane"). Off unless asked for (Lachlan's
+    /// 2b of 2026-11-10, his kept off): then nothing of the count runs (no thread, no transcript
+    /// read for it). Here, not in `lbterm_context_bar`, since the pane hangs from the pill, which
+    /// works with the bar off (his 2b of that night). For someone without the Claude project's
+    /// count
+    #[dynamic(default)]
+    pub count_cost: bool,
 }
+
+/// `config.lbterm_context_bar`: the context bar down the window's right, in the objectives
+/// strip's room right of the scroll strip (lbterm/CONTEXT.md, "The context bar"; Lachlan's ask of
+/// 2026-11-08): the open tab's Claude Code conversation's whole context window, top to bottom,
+/// each file loaded into it a section of its own (memory files yellow), then Claude Code's own
+/// parts, the conversation, and free space. Needs `lbterm_context` (the transcripts, and the
+/// reader it shares with the scroll strip), `lbterm_summaries` (the window's size, from
+/// `<session>.usage.json`) and the tab panel, whose rail's top and bottom it lines up with; with
+/// `lbterm_objectives` set too, the bar takes the room and the objectives strip isn't drawn.
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct LbtermContextBar {
+    /// How wide the bar is at rest, its ring included
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_context_bar_width")]
+    pub width: crate::Dimension,
+    /// How wide the pane that slides out from under it is, less when the window hasn't the room
+    #[dynamic(try_from = "crate::units::PixelUnit", default = "default_context_bar_pane_width")]
+    pub pane_width: crate::Dimension,
+    /// How long the pointer rests on the bar before it widens
+    #[dynamic(default = "default_context_bar_widen_delay")]
+    pub widen_delay_ms: u64,
+    /// How long it rests on a section before the pane opens
+    #[dynamic(default = "default_context_bar_open_delay")]
+    pub open_delay_ms: u64,
+    /// How long after the pointer leaves both the bar and the pane they close
+    #[dynamic(default = "default_context_bar_close_delay")]
+    pub close_delay_ms: u64,
+}
+
+impl Default for LbtermContextBar {
+    fn default() -> Self {
+        Self {
+            width: default_context_bar_width(),
+            pane_width: default_context_bar_pane_width(),
+            widen_delay_ms: default_context_bar_widen_delay(),
+            open_delay_ms: default_context_bar_open_delay(),
+            close_delay_ms: default_context_bar_close_delay(),
+        }
+    }
+}
+
+/// Whether LBTerm counts conversations' cost itself (`lbterm_context.count_cost`): off unless the
+/// pill is asked for with it, the bar on or off
+pub fn counts_cost(config: &crate::Config) -> bool {
+    config.lbterm_context.as_ref().map_or(false, |context| context.count_cost)
+}
+
+/// 14 px at 96 DPI: the objectives strip's width, whose room the bar takes
+fn default_context_bar_width() -> crate::Dimension {
+    crate::Dimension::Points(10.5)
+}
+
+/// 400 px at 96 DPI
+fn default_context_bar_pane_width() -> crate::Dimension {
+    crate::Dimension::Points(300.)
+}
+
+fn default_context_bar_widen_delay() -> u64 {
+    150
+}
+
+fn default_context_bar_open_delay() -> u64 {
+    300
+}
+
+fn default_context_bar_close_delay() -> u64 {
+    250
+}
+
+/// The least a context bar section is drawn at rest, in pixels at 96 DPI (scaled with the
+/// window's): `CONTEXT_SECTION_GAP` of the track under its colour, and the rest its colour. In a
+/// 1M window a 300-token file is half a pixel of a 1,700 px bar, so every section is drawn at
+/// least this tall, the pixels taken from the biggest, and the filled part still ends where
+/// what's in use puts it (lbterm_extras::context_bar::runs; lbterm/CONTEXT.md, "Small sections")
+pub const CONTEXT_SECTION_MIN: f64 = 3.0;
+
+/// The track's colour under each context bar section that's drawn at least
+/// `CONTEXT_SECTION_MIN` tall, so neighbours read apart, in pixels at 96 DPI
+pub const CONTEXT_SECTION_GAP: f64 = 1.0;
+
+/// How long the cost pane the context pill's press opens stays open after the pointer has left
+/// the pill and the pane (lbterm/CONTEXT.md, "The cost pane"): the context bar's pane's grace
+/// (`lbterm_context_bar.close_delay_ms`' default), since the two are panes of one kind
+pub const COST_CLOSE_MS: u64 = 250;
 
 /// `config.lbterm_summon`: a key that brings LBTerm forward from any other app (held with
 /// RegisterHotKey only while LBTerm hasn't got the keyboard). Lachlan's is PageUp.
@@ -1502,6 +1638,45 @@ pub fn default_line_cache_size() -> usize {
     4096
 }
 
+/// The longest click streak a press counts to when no mouse binding names a longer one: a
+/// triple click, the longest upstream's own bindings name ([`count_click`])
+pub const CLICK_STREAK_MOST: usize = 3;
+
+/// A press counted onto the last one (`last`, taken from the window), as upstream's
+/// `LastMouseClick::add` counts it: the same button on the same cell within its 500 ms adds one
+/// to the streak, anything else starts one at 1. Upstream's streak has no end, so a mouse
+/// binding made for streaks 1 to 3 missed a fourth quick press, which then went to the pane's
+/// program: Terminal's lbterm.lua binds the right button's hold, the question colours, for
+/// streaks 1 to 3, and a fourth quick right press in Claude Code pasted instead
+/// (lbterm/FLOWS.md, "A right hold, to the question colours", What could go 3; PITFALLS 356).
+/// So the streak is held at the longest any of `bound`'s triggers for the button names, and at
+/// [`CLICK_STREAK_MOST`] at least: every quick press past it counts as that one again, which a
+/// binding of that streak takes, and a binding of a longer streak still gets its streak. The
+/// window's other readers of the streak (the tab bar's double click) see 2 as before. `bound`
+/// is the window's mouse bindings' triggers (`InputMap::mouse`'s keys): a few dozen compares a
+/// press, on the GUI thread
+pub fn count_click<'a>(
+    last: Option<wezterm_term::LastMouseClick>,
+    button: wezterm_term::input::MouseButton,
+    position: wezterm_term::ClickPosition,
+    bound: impl Iterator<Item = &'a crate::keyassignment::MouseEventTrigger>,
+) -> wezterm_term::LastMouseClick {
+    let mut click = match last {
+        None => wezterm_term::LastMouseClick::new(button, position),
+        Some(click) => click.add(button, position),
+    };
+    use crate::keyassignment::MouseEventTrigger::*;
+    let longest = bound
+        .filter_map(|trigger| match trigger {
+            Down { streak, button: b } | Drag { streak, button: b } | Up { streak, button: b } => {
+                (*b == button).then(|| *streak)
+            }
+        })
+        .fold(CLICK_STREAK_MOST, usize::max);
+    click.streak = click.streak.min(longest);
+    click
+}
+
 /// The config files tried in order when no override or `WEZTERM_CONFIG_FILE`
 /// is given; the first that exists wins. `exe_dir` is set on Windows, where a
 /// config next to the executable comes first for portable installs.
@@ -1780,6 +1955,8 @@ mod test {
             })
         };
         assert_eq!(px(config.lbterm_tab_panel.rail_width), 68.);
+        // The questions pane is the closed rail's width (Lachlan's 3c of 2026-11-14)
+        assert_eq!(px(QUESTIONS_PANE_WIDTH), 68.);
         assert_eq!(px(config.lbterm_tab_panel.width), 290.);
         assert!(validate_idle_full_minutes(&0.0).is_err());
         // Labels under the pads, two lines of 7pt
@@ -2152,6 +2329,45 @@ mod test {
     }
 
     #[test]
+    fn the_context_bar_comes_from_lua_and_is_off_unless_asked_for() -> anyhow::Result<()> {
+        assert!(crate::Config::default_config().lbterm_context_bar.is_none());
+        let lua = crate::lua::make_lua_context(Path::new("testing"))?;
+        let value: mlua::Value = lua.load(r#"return { lbterm_context_bar = {} }"#).eval()?;
+        let config: crate::Config = luahelper::from_lua_value_dynamic(value)?;
+        let bar = config.lbterm_context_bar.expect("the bar, as asked for");
+        assert_eq!(bar, LbtermContextBar::default());
+        let px = |d: crate::Dimension| {
+            d.evaluate_as_pixels(crate::DimensionContext { dpi: 96., pixel_max: 1000., pixel_cell: 10. })
+        };
+        assert_eq!((px(bar.width), px(bar.pane_width)), (14., 400.));
+        assert_eq!((bar.widen_delay_ms, bar.open_delay_ms, bar.close_delay_ms), (150, 300, 250));
+        let value: mlua::Value = lua.load(r#"return { lbterm_context_bar = { width = '12pt', open_delay_ms = 400 } }"#).eval()?;
+        let config: crate::Config = luahelper::from_lua_value_dynamic(value)?;
+        let bar = config.lbterm_context_bar.unwrap();
+        assert_eq!((px(bar.width), bar.open_delay_ms, bar.close_delay_ms), (16., 400, 250));
+        Ok(())
+    }
+
+    #[test]
+    fn the_cost_is_counted_only_when_asked_for() -> anyhow::Result<()> {
+        assert!(!counts_cost(&crate::Config::default_config()), "no pill, no count");
+        let lua = crate::lua::make_lua_context(Path::new("testing"))?;
+        let counts = |text: &str| -> anyhow::Result<bool> {
+            let value: mlua::Value = lua.load(text).eval()?;
+            let config: crate::Config = luahelper::from_lua_value_dynamic(value)?;
+            Ok(counts_cost(&config))
+        };
+        assert!(!counts(r#"return { lbterm_context = {} }"#)?, "the pill alone doesn't count");
+        assert!(!counts(r#"return { lbterm_context = { count_cost = false } }"#)?);
+        assert!(counts(r#"return { lbterm_context = { count_cost = true } }"#)?);
+        // The pane hangs from the pill, so the bar is neither needed nor where it's asked for: its
+        // old place counts nothing (and warns of a field the bar doesn't have)
+        assert!(counts(r#"return { lbterm_context = { count_cost = true }, lbterm_context_bar = {} }"#)?);
+        assert!(!counts(r#"return { lbterm_context = {}, lbterm_context_bar = { count_cost = true } }"#)?);
+        Ok(())
+    }
+
+    #[test]
     fn the_agenda_comes_from_lua() -> anyhow::Result<()> {
         let lua = crate::lua::make_lua_context(Path::new("testing"))?;
         let value: mlua::Value = lua
@@ -2235,6 +2451,14 @@ mod test {
         );
         let px = projects.card_width.evaluate_as_pixels(crate::DimensionContext { dpi: 96., pixel_max: 1000., pixel_cell: 10. });
         assert_eq!(px, 480.);
+        // Its own rest and grace, the objectives strip's until the pad left it
+        assert_eq!((projects.open_delay_ms, projects.close_delay_ms), (300, 200));
+        let value: mlua::Value = lua
+            .load(r#"return { lbterm_projects = { projects = {}, open_delay_ms = 0, close_delay_ms = 50 } }"#)
+            .eval()?;
+        let config: crate::Config = luahelper::from_lua_value_dynamic(value)?;
+        let projects = config.lbterm_projects.expect("the card, as asked for");
+        assert_eq!((projects.open_delay_ms, projects.close_delay_ms), (0, 50));
         Ok(())
     }
 
@@ -2334,5 +2558,113 @@ mod test {
         assert!(crate::lua::has_event_handler(&lua, "format-tab-title"));
         assert!(!crate::lua::has_event_handler(&lua, "format-window-title"));
         Ok(())
+    }
+
+    fn cell(column: usize) -> wezterm_term::ClickPosition {
+        wezterm_term::ClickPosition {
+            column,
+            row: 5,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        }
+    }
+
+    /// The streaks quick presses of `button` on one cell count to, with `bound` the bindings
+    fn streaks(
+        presses: usize,
+        button: wezterm_term::input::MouseButton,
+        bound: &[crate::keyassignment::MouseEventTrigger],
+    ) -> Vec<usize> {
+        let mut last = None;
+        (0..presses)
+            .map(|_| {
+                let click = count_click(last.take(), button, cell(3), bound.iter());
+                let streak = click.streak;
+                last = Some(click);
+                streak
+            })
+            .collect()
+    }
+
+    /// Terminal's lbterm.lua's right-button bindings: a press and a release for each of streaks
+    /// 1 to 3 (its loop over the hold's Show and Hide, the paste and the Nop)
+    fn right_hold() -> Vec<crate::keyassignment::MouseEventTrigger> {
+        use crate::keyassignment::MouseEventTrigger;
+        use wezterm_term::input::MouseButton;
+        (1..=3)
+            .flat_map(|streak| {
+                [
+                    MouseEventTrigger::Down {
+                        streak,
+                        button: MouseButton::Right,
+                    },
+                    MouseEventTrigger::Up {
+                        streak,
+                        button: MouseButton::Right,
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    /// FLOWS.md's "A right hold, to the question colours", What could go 3: a fourth quick
+    /// right press found no binding (upstream counts it streak 4), so it went to Claude Code,
+    /// which pasted, and the colours didn't show. Every quick press now finds the hold's
+    #[test]
+    fn every_quick_press_finds_a_binding_made_for_streaks_1_to_3() {
+        use crate::keyassignment::MouseEventTrigger;
+        use wezterm_term::input::MouseButton;
+        let bound = right_hold();
+        let counted = streaks(6, MouseButton::Right, &bound);
+        for (press, streak) in counted.iter().enumerate() {
+            let down = MouseEventTrigger::Down {
+                streak: *streak,
+                button: MouseButton::Right,
+            };
+            assert!(bound.contains(&down), "press {} counted streak {streak}, which nothing binds", press + 1);
+        }
+        assert_eq!(counted, [1, 2, 3, 3, 3, 3]);
+    }
+
+    /// A binding of a longer streak than a triple click still gets its streak, and is where
+    /// that button's streak stops; another button, or another cell, starts a streak at 1
+    #[test]
+    fn a_streak_counts_as_far_as_a_binding_names() {
+        use crate::keyassignment::MouseEventTrigger;
+        use wezterm_term::input::MouseButton;
+        let mut bound = right_hold();
+        bound.push(MouseEventTrigger::Down {
+            streak: 5,
+            button: MouseButton::Left,
+        });
+        assert_eq!(streaks(7, MouseButton::Left, &bound), [1, 2, 3, 4, 5, 5, 5]);
+        // A button nothing binds counts to a triple click: the tab bar's double click is read
+        // from the streak whatever's bound
+        assert_eq!(streaks(5, MouseButton::Middle, &[]), [1, 2, 3, 3, 3]);
+
+        let first = count_click(None, MouseButton::Right, cell(3), bound.iter());
+        let other = count_click(Some(first.clone()), MouseButton::Left, cell(3), bound.iter());
+        assert_eq!(other.streak, 1);
+        let moved = count_click(Some(first), MouseButton::Right, cell(4), bound.iter());
+        assert_eq!(moved.streak, 1);
+    }
+
+    /// lbterm/QUESTIONS.md, "The weights": red at 0, amber at 50, green at 100, and between them
+    /// each step of 10 another colour, the red falling and the green rising
+    #[test]
+    fn a_share_runs_from_red_at_0_through_amber_at_50_to_green_at_100() {
+        assert_eq!(weight_colour(0), WEIGHT_RED);
+        assert_eq!(weight_colour(50), WEIGHT_AMBER);
+        assert_eq!(weight_colour(70), 0xD1D734);
+        assert_eq!(weight_colour(100), WEIGHT_GREEN);
+        assert_eq!(weight_colour(255), WEIGHT_GREEN);
+        let steps: Vec<u32> = (0..=10).map(|s| weight_colour(s * 10)).collect();
+        for pair in steps.windows(2) {
+            let red = |c: u32| c >> 16;
+            let green = |c: u32| (c >> 8) & 0xFF;
+            assert_ne!(pair[0], pair[1]);
+            assert!(red(pair[1]) <= red(pair[0]), "{:06X} then {:06X}", pair[0], pair[1]);
+            assert!(green(pair[1]) >= green(pair[0]), "{:06X} then {:06X}", pair[0], pair[1]);
+        }
     }
 }

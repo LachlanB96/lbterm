@@ -184,9 +184,8 @@ pub enum Prim {
 pub enum BoxKey {
     /// The box at the bottom: his words to the Conductor
     Main,
-    /// A waiting session's answer: the box for a question in text (`question` none), or the
-    /// words of his own for a picker's question
-    Answer { waiting: String, question: Option<usize> },
+    /// A waiting session's answer: the box for its question in text
+    Answer { waiting: String },
 }
 
 impl Default for BoxKey {
@@ -199,11 +198,7 @@ impl BoxKey {
     pub fn name(&self) -> String {
         match self {
             BoxKey::Main => "main".to_string(),
-            BoxKey::Answer { waiting, question: None } => format!("answer:{waiting}"),
-            BoxKey::Answer {
-                waiting,
-                question: Some(q),
-            } => format!("other:{waiting}:{q}"),
+            BoxKey::Answer { waiting } => format!("answer:{waiting}"),
         }
     }
 }
@@ -219,10 +214,6 @@ pub enum Target {
     Send,
     /// `seat.interrupt`
     Stop,
-    /// A picker's option, counting from 0
-    Pick { waiting: String, question: usize, option: usize },
-    /// Words of his own for a picker's question
-    Other { waiting: String, question: usize },
     /// A `1a`-style option of a question in text, into its box
     Chip { waiting: String, code: String },
     /// Send a waiting session its answer
@@ -265,12 +256,6 @@ impl Target {
             Target::Deny(id) => format!("deny:{id}"),
             Target::Send => "send".to_string(),
             Target::Stop => "stop".to_string(),
-            Target::Pick {
-                waiting,
-                question,
-                option,
-            } => format!("pick:{waiting}:{question}:{option}"),
-            Target::Other { waiting, question } => format!("other:{waiting}:{question}"),
             Target::Chip { waiting, code } => format!("chip:{waiting}:{code}"),
             Target::Answer { waiting } => format!("answer:{waiting}"),
             Target::Session { session_id, .. } => format!("session:{session_id}"),
@@ -348,8 +333,8 @@ impl WrapCache {
     }
 }
 
-/// What the window keeps of the view between frames: what's typed, what's picked, where it's
-/// scrolled, what the pointer is on
+/// What the window keeps of the view between frames: what's typed, where it's scrolled, what the
+/// pointer is on
 #[derive(Debug, Default)]
 pub struct Ui {
     /// The box at the bottom
@@ -358,10 +343,6 @@ pub struct Ui {
     pub boxes: HashMap<BoxKey, Input>,
     /// Where typing goes
     pub focus: BoxKey,
-    /// Pickers' questions he chose to answer in words of his own: (waiting, question)
-    pub others: HashSet<(String, usize)>,
-    /// Pickers' options picked so far, by waiting question, per question, counting from 1
-    pub picks: HashMap<String, Vec<Vec<u32>>>,
     /// Buttons waiting on the seat's answer, by name: they say so
     pub pending: HashSet<String>,
     /// How far the conversation is scrolled up from the newest, in pixels
@@ -425,61 +406,10 @@ impl Ui {
         }
     }
 
-    /// A picker's option picked or unpicked: one question's only pick, or one of several
-    pub fn pick(&mut self, waiting: &Waiting, question: usize, option: usize) {
-        let picks = self
-            .picks
-            .entry(waiting.id.clone())
-            .or_insert_with(|| vec![vec![]; waiting.questions.len()]);
-        picks.resize(waiting.questions.len(), vec![]);
-        let Some(chosen) = picks.get_mut(question) else {
-            return;
-        };
-        let n = option as u32 + 1;
-        let multi = waiting.questions.get(question).map_or(false, |q| q.multi_select);
-        if chosen.contains(&n) {
-            chosen.retain(|p| *p != n);
-        } else if multi {
-            chosen.push(n);
-            chosen.sort_unstable();
-        } else {
-            *chosen = vec![n];
-        }
-    }
-
-    /// The answer as it stands: each question's picks and words of his own, and a question in
-    /// text's words; `None` while a question has neither
-    pub fn answer(&self, waiting: &Waiting) -> Option<(Vec<Vec<u32>>, Vec<Option<String>>, Option<String>)> {
-        if !waiting.questions.is_empty() {
-            let picks = self.picks.get(&waiting.id);
-            let mut all_picks = vec![];
-            let mut others = vec![];
-            for q in 0..waiting.questions.len() {
-                let p = picks.and_then(|p| p.get(q)).cloned().unwrap_or_default();
-                let key = BoxKey::Answer {
-                    waiting: waiting.id.clone(),
-                    question: Some(q),
-                };
-                let other = self
-                    .others
-                    .contains(&(waiting.id.clone(), q))
-                    .then(|| self.boxes.get(&key).map(|b| b.text().trim().to_string()))
-                    .flatten()
-                    .filter(|t| !t.is_empty());
-                if p.is_empty() && other.is_none() {
-                    return None;
-                }
-                all_picks.push(p);
-                others.push(other);
-            }
-            return Some((all_picks, others, None));
-        }
-        let key = BoxKey::Answer {
-            waiting: waiting.id.clone(),
-            question: None,
-        };
-        let words = self.boxes.get(&key).map(|b| b.text().trim().to_string()).filter(|t| !t.is_empty())?;
-        Some((vec![], vec![], Some(words)))
+    /// The answer as it stands: what's typed in its box, `None` while it's empty
+    pub fn answer(&self, waiting: &Waiting) -> Option<String> {
+        let key = BoxKey::Answer { waiting: waiting.id.clone() };
+        self.boxes.get(&key).map(|b| b.text().trim().to_string()).filter(|t| !t.is_empty())
     }
 
     /// The fonts changed (the DPI, the config): words wrapped in the old ones go
@@ -491,8 +421,6 @@ impl Ui {
     /// What's kept for waiting questions that are gone goes too
     pub fn forget_gone(&mut self, view: &View) {
         let here = |id: &str| view.waiting.iter().any(|w| w.id == id);
-        self.picks.retain(|id, _| here(id));
-        self.others.retain(|(id, _)| here(id));
         self.boxes.retain(|key, _| match key {
             BoxKey::Main => true,
             BoxKey::Answer { waiting, .. } => here(waiting),
@@ -783,7 +711,7 @@ enum Tone {
     Tonal(u32),
     /// A hairline round it, its words in its colour (Deny, a mode not picked)
     Outlined(u32),
-    /// Words only, a faint fill under the pointer (Restart, Dismiss, Other…)
+    /// Words only, a faint fill under the pointer (Restart, Dismiss)
     Plain(u32),
     /// A filter chip: a hairline, filled faintly in its colour with a check while it's on
     Chip(u32),
@@ -2500,205 +2428,90 @@ fn side_cards(
                 let why = format!("Can't answer from here: {}", w.why.as_deref().unwrap_or("no pane to type into"));
                 y = b.wrapped(inner_x, y, inner_w, &why, Font::Small, blend(card_rgb, ORANGE, 0.85), 4) + b.px(6.0);
             }
-            if !w.questions.is_empty() {
-                for (qi, q) in w.questions.iter().enumerate() {
-                    if !q.header.is_empty() {
-                        let hw = b.w(&q.header, Font::SmallStrong) + b.px(16.0);
-                        let hh = b.px(22.0);
-                        b.fill(Rect { x: inner_x, y, w: hw, h: hh }, hh / 2.0, blend(card_rgb, PRIMARY, 0.16), Layer::Mid);
-                        b.text(inner_x + b.px(8.0), y + ((hh - small_lh) / 2.0).round(), &q.header, Font::SmallStrong, PRIMARY, Layer::Text);
-                        y += hh + b.px(8.0);
-                    }
-                    y = b.wrapped(inner_x, y, inner_w, &q.question, Font::Text, blend(card_rgb, WHITE, 0.9), 8) + b.px(8.0);
-                    let picked = ui.picks.get(&w.id).and_then(|p| p.get(qi)).cloned().unwrap_or_default();
-                    for (oi, opt) in q.options.iter().enumerate() {
-                        let on = picked.contains(&(oi as u32 + 1));
-                        let ostart = y;
-                        let label = if on { format!("{ICON_CHECK} {}", opt.label) } else { opt.label.clone() };
-                        let mut oy = y + b.px(8.0);
-                        // Laid out first to know its height, then its fill under it
-                        let probe_prims = b.prims.len();
-                        oy = b.wrapped(inner_x + b.px(14.0), oy, inner_w - b.px(28.0), &label, Font::Strong, if on { PRIMARY } else { blend(card_rgb, WHITE, 0.92) }, 4);
-                        if !opt.description.is_empty() {
-                            oy = b.wrapped(inner_x + b.px(14.0), oy, inner_w - b.px(28.0), &opt.description, Font::Small, blend(card_rgb, WHITE, 0.55), 4);
-                        }
-                        oy += b.px(8.0);
-                        let r = Rect { x: inner_x, y: ostart, w: inner_w, h: oy - ostart };
-                        let target = Target::Pick {
-                            waiting: w.id.clone(),
-                            question: qi,
-                            option: oi,
-                        };
-                        let pending = ui.pending.contains(&Target::Answer { waiting: w.id.clone() }.name());
-                        let hovered = ui.hovered.as_ref() == Some(&target);
-                        let fill = if on {
-                            blend(card_rgb, PRIMARY, 0.16)
-                        } else if hovered && w.answerable {
-                            blend(card_rgb, WHITE, 0.08)
-                        } else {
-                            card_rgb
-                        };
-                        let edge = if on { blend(card_rgb, PRIMARY, 0.6) } else { blend(card_rgb, WHITE, 0.16) };
-                        // The fill goes under the words already laid out: put it before them
-                        if let Some(rect) = intersect(r, b.clip) {
-                            b.prims.insert(
-                                probe_prims,
-                                Prim::Fill {
-                                    rect,
-                                    radius: b.px(12.0),
-                                    rgb: fill,
-                                    layer: Layer::Mid,
-                                },
-                            );
-                        }
-                        b.outline(r, b.px(12.0), edge, Layer::Mid);
-                        if w.answerable && !pending {
-                            b.hit(r, target.clone());
-                        }
-                        b.buttons.push(state::ViewButton {
-                            name: target.name(),
-                            label: opt.label.clone(),
-                            rect: intersect(r, b.clip).map(said_rect),
-                            on,
-                            enabled: w.answerable,
-                            pending,
-                        });
-                        y = oy + b.px(6.0);
-                    }
-                    if w.answerable {
-                        let other = (w.id.clone(), qi);
-                        let open = ui.others.contains(&other);
-                        let ph = b.pill_h(Font::SmallStrong);
-                        let label = "Other…";
-                        b.button(
-                            Rect { x: inner_x - b.px(8.0), y, w: b.pill_w(label, Font::SmallStrong), h: ph },
-                            label,
-                            Tone::Plain(PRIMARY),
-                            Target::Other { waiting: w.id.clone(), question: qi },
-                            ui,
-                            card_rgb,
-                            true,
-                            open,
-                            Font::SmallStrong,
-                        );
+            let words = w.text.as_deref().unwrap_or(&w.gist);
+            y = b.wrapped(inner_x, y, inner_w, words, Font::Text, blend(card_rgb, WHITE, 0.84), QUESTION_LINES) + b.px(8.0);
+            if w.answerable {
+                let key = BoxKey::Answer { waiting: w.id.clone() };
+                // What's typed: a chip whose code is in it is lit
+                let typed = ui.input_of(&key).map(|i| i.text().to_string()).unwrap_or_default();
+                let mut x = inner_x;
+                let ph = b.pill_h(Font::SmallStrong);
+                for (code, label) in text::options(words) {
+                    let chip = if label.is_empty() { code.clone() } else { format!("{code} {}", b.fit(&label, b.px(130.0), Font::SmallStrong)) };
+                    let on = input::has_code(&typed, &code);
+                    let pw = b.pill_w(&if on { format!("{ICON_CHECK} {chip}") } else { chip.clone() }, Font::SmallStrong);
+                    if x + pw > inner_x + inner_w && x > inner_x {
+                        x = inner_x;
                         y += ph + b.px(6.0);
-                        if open {
-                            let key = BoxKey::Answer {
-                                waiting: w.id.clone(),
-                                question: Some(qi),
-                            };
-                            let h = text_box(b, ui, &key, inner_x, y, inner_w, 0.0, 4, "In your own words", card_rgb, false, boxes, caret, said_boxes);
-                            y += h + b.px(8.0);
-                        }
                     }
-                }
-                let ready = ui.answer(w).is_some();
-                let any_other = (0..w.questions.len()).any(|q| ui.others.contains(&(w.id.clone(), q)));
-                if w.answerable && (!w.one_click() || any_other) {
-                    let ph = b.pill_h(Font::Strong);
-                    let label = "Send answer";
                     b.button(
-                        Rect { x: inner_x, y, w: b.pill_w(label, Font::Strong), h: ph },
-                        label,
-                        Tone::Filled(PRIMARY),
-                        Target::Answer { waiting: w.id.clone() },
+                        Rect { x, y, w: pw.min(inner_w), h: ph },
+                        &chip,
+                        Tone::Chip(PRIMARY),
+                        Target::Chip { waiting: w.id.clone(), code: code.clone() },
                         ui,
                         card_rgb,
-                        ready,
-                        false,
-                        Font::Strong,
+                        true,
+                        on,
+                        Font::SmallStrong,
                     );
-                    y += ph + b.px(4.0);
+                    x += pw + b.px(6.0);
                 }
-            } else {
-                let words = w.text.as_deref().unwrap_or(&w.gist);
-                y = b.wrapped(inner_x, y, inner_w, words, Font::Text, blend(card_rgb, WHITE, 0.84), QUESTION_LINES) + b.px(8.0);
-                if w.answerable {
-                    let key = BoxKey::Answer {
-                        waiting: w.id.clone(),
-                        question: None,
-                    };
-                    // What's typed: a chip whose code is in it is lit
-                    let typed = ui.input_of(&key).map(|i| i.text().to_string()).unwrap_or_default();
-                    let mut x = inner_x;
-                    let ph = b.pill_h(Font::SmallStrong);
-                    for (code, label) in text::options(words) {
-                        let chip = if label.is_empty() { code.clone() } else { format!("{code} {}", b.fit(&label, b.px(130.0), Font::SmallStrong)) };
-                        let on = input::has_code(&typed, &code);
-                        let pw = b.pill_w(&if on { format!("{ICON_CHECK} {chip}") } else { chip.clone() }, Font::SmallStrong);
-                        if x + pw > inner_x + inner_w && x > inner_x {
-                            x = inner_x;
-                            y += ph + b.px(6.0);
-                        }
+                if x > inner_x {
+                    y += ph + b.px(10.0);
+                }
+                // Each extra on a row of its own, with a yes and a no ("E2+", "E2-")
+                for (code, label) in text::extras(words) {
+                    let yes = format!("{code}+");
+                    let no = format!("{code}-");
+                    let chips: Vec<(&str, String, u32, bool)> = vec![
+                        ("Yes", yes.clone(), GREEN, input::has_code(&typed, &yes)),
+                        ("No", no.clone(), RED, input::has_code(&typed, &no)),
+                    ];
+                    let widths: Vec<f64> = chips.iter().map(|(l, ..)| b.pill_w(&format!("{ICON_CHECK} {l}"), Font::SmallStrong)).collect();
+                    let chips_w: f64 = widths.iter().sum::<f64>() + b.px(6.0);
+                    let ty = y + ((ph - small_lh) / 2.0).round();
+                    b.text(inner_x, ty, &code, Font::SmallStrong, blend(card_rgb, WHITE, 0.85), Layer::Text);
+                    let lx = inner_x + b.w(&code, Font::SmallStrong) + b.px(8.0);
+                    let words = b.fit(&label, inner_x + inner_w - chips_w - b.px(8.0) - lx, Font::Small);
+                    b.text(lx, ty, &words, Font::Small, muted, Layer::Text);
+                    let mut cx = inner_x + inner_w - chips_w;
+                    for ((word, code, colour, on), cw) in chips.into_iter().zip(widths) {
                         b.button(
-                            Rect { x, y, w: pw.min(inner_w), h: ph },
-                            &chip,
-                            Tone::Chip(PRIMARY),
-                            Target::Chip { waiting: w.id.clone(), code: code.clone() },
+                            Rect { x: cx, y, w: cw, h: ph },
+                            word,
+                            Tone::Chip(colour),
+                            Target::Chip { waiting: w.id.clone(), code },
                             ui,
                             card_rgb,
                             true,
                             on,
                             Font::SmallStrong,
                         );
-                        x += pw + b.px(6.0);
+                        cx += cw + b.px(6.0);
                     }
-                    if x > inner_x {
-                        y += ph + b.px(10.0);
-                    }
-                    // Each extra on a row of its own, with a yes and a no ("E2+", "E2-")
-                    for (code, label) in text::extras(words) {
-                        let yes = format!("{code}+");
-                        let no = format!("{code}-");
-                        let chips: Vec<(&str, String, u32, bool)> = vec![
-                            ("Yes", yes.clone(), GREEN, input::has_code(&typed, &yes)),
-                            ("No", no.clone(), RED, input::has_code(&typed, &no)),
-                        ];
-                        let widths: Vec<f64> = chips.iter().map(|(l, ..)| b.pill_w(&format!("{ICON_CHECK} {l}"), Font::SmallStrong)).collect();
-                        let chips_w: f64 = widths.iter().sum::<f64>() + b.px(6.0);
-                        let ty = y + ((ph - small_lh) / 2.0).round();
-                        b.text(inner_x, ty, &code, Font::SmallStrong, blend(card_rgb, WHITE, 0.85), Layer::Text);
-                        let lx = inner_x + b.w(&code, Font::SmallStrong) + b.px(8.0);
-                        let words = b.fit(&label, inner_x + inner_w - chips_w - b.px(8.0) - lx, Font::Small);
-                        b.text(lx, ty, &words, Font::Small, muted, Layer::Text);
-                        let mut cx = inner_x + inner_w - chips_w;
-                        for ((word, code, colour, on), cw) in chips.into_iter().zip(widths) {
-                            b.button(
-                                Rect { x: cx, y, w: cw, h: ph },
-                                word,
-                                Tone::Chip(colour),
-                                Target::Chip { waiting: w.id.clone(), code },
-                                ui,
-                                card_rgb,
-                                true,
-                                on,
-                                Font::SmallStrong,
-                            );
-                            cx += cw + b.px(6.0);
-                        }
-                        y += ph + b.px(6.0);
-                    }
-                    if !text::extras(words).is_empty() {
-                        y += b.px(4.0);
-                    }
-                    let send_w = b.pill_w("Send", Font::SmallStrong);
-                    let room = send_w + b.px(4.0);
-                    let h = text_box(b, ui, &key, inner_x, y, inner_w, room, 4, "Your answer", card_rgb, false, boxes, caret, said_boxes);
-                    let ready = ui.answer(w).is_some();
-                    let ph = b.pill_h(Font::SmallStrong);
-                    b.button(
-                        Rect { x: inner_x + inner_w - b.px(6.0) - send_w, y: y + h - b.px(6.0) - ph, w: send_w, h: ph },
-                        "Send",
-                        Tone::Filled(PRIMARY),
-                        Target::Answer { waiting: w.id.clone() },
-                        ui,
-                        blend(card_rgb, WHITE, 0.05),
-                        ready,
-                        false,
-                        Font::SmallStrong,
-                    );
-                    y += h + b.px(4.0);
+                    y += ph + b.px(6.0);
                 }
+                if !text::extras(words).is_empty() {
+                    y += b.px(4.0);
+                }
+                let send_w = b.pill_w("Send", Font::SmallStrong);
+                let room = send_w + b.px(4.0);
+                let h = text_box(b, ui, &key, inner_x, y, inner_w, room, 4, "Your answer", card_rgb, false, boxes, caret, said_boxes);
+                let ready = ui.answer(w).is_some();
+                let ph = b.pill_h(Font::SmallStrong);
+                b.button(
+                    Rect { x: inner_x + inner_w - b.px(6.0) - send_w, y: y + h - b.px(6.0) - ph, w: send_w, h: ph },
+                    "Send",
+                    Tone::Filled(PRIMARY),
+                    Target::Answer { waiting: w.id.clone() },
+                    ui,
+                    blend(card_rgb, WHITE, 0.05),
+                    ready,
+                    false,
+                    Font::SmallStrong,
+                );
+                y += h + b.px(4.0);
             }
             y += ipad - b.px(4.0);
             card(b, said, "waiting", &w.id, &w.gist, start, y, Some(blend(surface, ORANGE, 0.4)), card_rgb);
@@ -3152,8 +2965,8 @@ mod test {
             r#"{"type":"seat.view","conductor":{"state":"on","mode":"most","listening":true,"busy":true,"queued":1},
             "asks":[{"id":"ask-3","at":1000,"tool":"SendMessage","title":"Message Publishing in Website","detail":"Push the site now, please.","session":"website-a6","label":"Publishing","project":"Website"}],
             "waiting":[
-              {"id":"s1:t1","sessionId":"s1","session":"website-a6","label":"Publishing","project":"Website","kind":"picker","gist":"Which layout?","at":1000,
-               "questions":[{"question":"Which layout?","header":"Layout","multiSelect":false,"options":[{"label":"Two columns","description":"Side by side"},{"label":"One"}]}],"answerable":true},
+              {"id":"s1:t1","sessionId":"s1","session":"website-a6","label":"Publishing","project":"Website","kind":"text","gist":"Which layout?","at":1000,
+               "text":"Which layout, two columns or one?","answerable":true},
               {"id":"s2:9","sessionId":"s2","session":"terminal-b1","label":null,"project":"Terminal","kind":"text","text":"Q1. Which?\n1a. Red\n1b. Blue","answerable":true}],
             "sessions":[{"sessionId":"s1","name":"website-a6","project":"Website","status":"waiting","label":"Publishing","summary":"Pushing the site","percent":40,"left":240,"agents":[{"id":"a","percent":10}],"conductor":"acting","pane":"17"}],
             "events":[{"seq":1,"at":2000,"kind":"waiting","session":"website-a6","label":"Publishing","project":"Website","text":"asks which layout","wake":true}],
@@ -3242,14 +3055,13 @@ mod test {
             let (x, y) = centre(r);
             assert_eq!(s.hit(x, y).map(Target::name).as_deref(), Some(b.name.as_str()), "{}", b.name);
         }
-        for name in ["control:mode read", "control:mode most", "control:mode all", "control:listen off", "control:restart", "control:off", "send", "stop", "allow:ask-3", "deny:ask-3", "pick:s1:t1:0:0", "other:s1:t1:0", "chip:s2:9:1a", "chip:s2:9:1b", "session:s1", "rsi:g1:send", "rsi:g1:dismiss", "rsi:g1:useful", "rsi:g1:not"] {
+        for name in ["control:mode read", "control:mode most", "control:mode all", "control:listen off", "control:restart", "control:off", "send", "stop", "allow:ask-3", "deny:ask-3", "chip:s2:9:1a", "chip:s2:9:1b", "session:s1", "rsi:g1:send", "rsi:g1:dismiss", "rsi:g1:useful", "rsi:g1:not"] {
             button(&s, name);
         }
         assert!(button(&s, "control:mode most").on, "the mode in force is lit");
         assert!(!button(&s, "send").enabled, "nothing to send yet");
         assert!(!button(&s, "answer:s2:9").enabled, "an empty answer can't be sent");
-        // One question, one pick: its options answer at once, no Send answer button
-        assert!(s.said.buttons.iter().all(|b| b.name != "answer:s1:t1"));
+        assert!(!button(&s, "answer:s1:t1").enabled, "every question is answered in words, with Send answer");
         assert_eq!(s.said.state, "on");
         assert!(s.said.busy);
         let kinds: Vec<&str> = s.said.cards.iter().map(|c| c.kind.as_str()).collect();
@@ -3618,35 +3430,25 @@ mod test {
     }
 
     #[test]
-    fn picks_and_answers() {
+    fn answers_are_the_words_in_their_box() {
         let v = on_view();
         let mut ui = Ui::default();
-        let picker = &v.waiting[0];
-        assert_eq!(ui.answer(picker), None);
-        ui.pick(picker, 0, 1);
-        assert_eq!(ui.answer(picker), Some((vec![vec![2]], vec![None], None)));
-        ui.pick(picker, 0, 0);
-        assert_eq!(ui.answer(picker).unwrap().0, vec![vec![1]], "one pick: the new one replaces it");
-        ui.pick(picker, 0, 0);
-        assert_eq!(ui.answer(picker), None, "picked again: unpicked");
-        // Words of his own
-        ui.others.insert((picker.id.clone(), 0));
-        ui.input(&BoxKey::Answer { waiting: picker.id.clone(), question: Some(0) }).insert(" mine ");
-        assert_eq!(ui.answer(picker), Some((vec![vec![]], vec![Some("mine".into())], None)));
         let text = &v.waiting[1];
         assert_eq!(ui.answer(text), None);
-        ui.input(&BoxKey::Answer { waiting: text.id.clone(), question: None }).insert("1b");
-        assert_eq!(ui.answer(text), Some((vec![], vec![], Some("1b".into()))));
+        ui.input(&BoxKey::Answer { waiting: text.id.clone() }).insert("  ");
+        assert_eq!(ui.answer(text), None, "blanks are no answer");
+        ui.input(&BoxKey::Answer { waiting: text.id.clone() }).insert("1b ");
+        assert_eq!(ui.answer(text).as_deref(), Some("1b"));
         let mut c = Conversation::default();
         c.apply(true, vec![]);
         let s = lay_out(Rect { h: 3000.0, ..AREA }, &metrics(), 0x121212, &model(Some(&v), &c.shown(), true), &mut ui);
         assert!(button(&s, "answer:s2:9").enabled);
-        assert!(button(&s, "answer:s1:t1").enabled, "with Other open, the picker sends with its button");
-        // A question that's gone takes its picks and boxes with it
+        assert!(!button(&s, "answer:s1:t1").enabled, "the other question's box is still empty");
+        // A question that's gone takes its box with it
         let gone = view(r#"{"type":"seat.view","conductor":{"state":"on"}}"#);
-        ui.focus = BoxKey::Answer { waiting: text.id.clone(), question: None };
+        ui.focus = BoxKey::Answer { waiting: text.id.clone() };
         ui.forget_gone(&gone);
-        assert!(ui.picks.is_empty() && ui.others.is_empty() && ui.boxes.is_empty());
+        assert!(ui.boxes.is_empty());
         assert_eq!(ui.focus, BoxKey::Main);
     }
 
@@ -3831,7 +3633,7 @@ mod test {
         let tall = Rect { h: 3000.0, ..AREA };
         let s = lay_out(tall, &metrics(), 0x121212, &model(Some(&v), &c.shown(), true), &mut ui);
         assert!(!button(&s, "chip:s2:9:E2+").on && !button(&s, "chip:s2:9:E2-").on);
-        ui.input(&BoxKey::Answer { waiting: "s2:9".into(), question: None }).set("1b E2+");
+        ui.input(&BoxKey::Answer { waiting: "s2:9".into() }).set("1b E2+");
         let s = lay_out(tall, &metrics(), 0x121212, &model(Some(&v), &c.shown(), true), &mut ui);
         assert!(button(&s, "chip:s2:9:E2+").on, "its yes lit while the answer holds it");
         assert!(button(&s, "chip:s2:9:1b").on && !button(&s, "chip:s2:9:1a").on, "an option's chip too");
@@ -3957,7 +3759,7 @@ mod test {
     fn clock_is_when_its_words_change() {
         // The GUI lays the view out again when its clock says, and not before: laid out a
         // second apart for six minutes, it changes only where its clock said it would, and the
-        // clock then says when the next change is. The ask and the picker were asked at 1 s.
+        // clock then says when the next change is. The ask and the first question were asked at 1 s.
         let v = on_view();
         let c = convo();
         let shown = c.shown();

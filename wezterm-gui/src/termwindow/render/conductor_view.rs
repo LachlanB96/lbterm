@@ -1017,43 +1017,9 @@ impl TermWindow {
             ),
             Target::Send => self.lbterm_view_say(),
             Target::Stop => self.lbterm_view_send(Command::Interrupt, &name, None),
-            Target::Pick {
-                waiting,
-                question,
-                option,
-            } => {
-                let Some(w) = view.as_ref().and_then(|v| v.waiting.iter().find(|w| w.id == waiting)).cloned() else {
-                    return;
-                };
-                let other_open = (0..w.questions.len()).any(|q| self.lbterm_view.ui.others.contains(&(w.id.clone(), q)));
-                if w.one_click() && !other_open {
-                    // One question, one pick: it's the answer
-                    let mut picks = vec![vec![]; w.questions.len()];
-                    picks[question] = vec![option as u32 + 1];
-                    self.lbterm_view_answer(&w, picks, vec![None; w.questions.len()], None);
-                } else {
-                    self.lbterm_view.ui.pick(&w, question, option);
-                }
-            }
-            Target::Other { waiting, question } => {
-                let ui = &mut self.lbterm_view.ui;
-                let key = (waiting.clone(), question);
-                if ui.others.remove(&key) {
-                    ui.focus = BoxKey::Main;
-                } else {
-                    ui.others.insert(key);
-                    ui.focus = BoxKey::Answer {
-                        waiting,
-                        question: Some(question),
-                    };
-                }
-            }
             Target::Chip { waiting, code } => {
                 // In its box's words, or out again; an extra's yes replacing its no
-                let key = BoxKey::Answer {
-                    waiting,
-                    question: None,
-                };
+                let key = BoxKey::Answer { waiting };
                 let ui = &mut self.lbterm_view.ui;
                 let input = ui.input(&key);
                 let words = input::toggle_code(input.text(), &code);
@@ -1064,8 +1030,8 @@ impl TermWindow {
                 let Some(w) = view.as_ref().and_then(|v| v.waiting.iter().find(|w| w.id == waiting)).cloned() else {
                     return;
                 };
-                if let Some((picks, other, text)) = self.lbterm_view.ui.answer(&w) {
-                    self.lbterm_view_answer(&w, picks, other, text);
+                if let Some(text) = self.lbterm_view.ui.answer(&w) {
+                    self.lbterm_view_answer(&w, text);
                 }
             }
             Target::Session { session_id, pane } => self.lbterm_view_open_session(&session_id, pane.as_deref()),
@@ -1148,13 +1114,11 @@ impl TermWindow {
         }
     }
 
-    fn lbterm_view_answer(&mut self, w: &Waiting, picks: Vec<Vec<u32>>, other: Vec<Option<String>>, text: Option<String>) {
+    fn lbterm_view_answer(&mut self, w: &Waiting, text: String) {
         let button = Target::Answer { waiting: w.id.clone() }.name();
         self.lbterm_view_send(
             Command::Answer {
                 question: w.id.clone(),
-                picks,
-                other,
                 text,
             },
             &button,

@@ -5,13 +5,13 @@
 //! every animation from the Commit that handed it over (the recorder's `Tree::started`), the
 //! panes' containers and the strips' pictures in their stacks, top to bottom, each showing its
 //! opacity of what the ones over it leave. No tab in flight ever shows more of itself than it did
-//! a moment before, the tab switched back to comes up from what it showed, and at a switch, and
-//! between the strips and the panes, nothing moves further than the flight does in the spread of
-//! the curves' lags: how long before its commit the compositor worked each out (`prepare`'s or
-//! `prepare_sides`' own moment, PITFALLS 298 and 304), which DWM shows and this test measures and
-//! allows, no more. The scripts judged this from captures until feat/dcomp-recorder; they keep
-//! their captures for look and what only a window shows (the strip's words, the outlines, the
-//! mux's switches).
+//! a moment before, the tab switched back to comes up from what it showed, at a switch nothing
+//! moves further than the flight does in the spread of the curves' lags, and the strips are no
+//! further from the panes than their curves reach in it (PITFALLS 354). A curve's lag is how long
+//! before its commit the compositor worked it out (`prepare`'s or `prepare_sides`' own moment,
+//! PITFALLS 298 and 304), which DWM shows and this test measures and allows, no more. The scripts
+//! judged this from captures until feat/dcomp-recorder; they keep their captures for look and
+//! what only a window shows (the strip's words, the outlines, the mux's switches).
 
 use super::*;
 use crate::termwindow::compositor::recorder::{Prop, Tree};
@@ -214,6 +214,49 @@ impl Shot {
         }
         most
     }
+
+    /// The least and the most each tab can show, of its panes at `point` and on the strips, with
+    /// every opacity taken anywhere from `t` to `by` after it. A curve with less lag than another
+    /// shows the flight that much further on, so with `by` the spread of the lags, the flight's
+    /// share at one moment, the one the least lagged curve shows at `t`, is within both: the two
+    /// stacks' reaches meet. What a share moves in the spread (`moves`) doesn't say how far apart
+    /// they can be: an opacity in flight is its share over what the ones above it leave
+    /// (`Flight::opacity`), which falls many times faster than the share it shows while they go,
+    /// so two curves of one stack a few ms apart part it from the other stack by more than the
+    /// share moves in that time (PITFALLS 354)
+    fn reach(&self, point: (i32, i32), t: Instant, by: Duration) -> ([(f64, f64); 5], [(f64, f64); 5]) {
+        // Read every half millisecond or less: nothing says an opacity in flight only falls
+        let steps = (by.as_secs_f64() / 0.0005).ceil().max(1.0) as u32;
+        let within = |alpha: &Alpha| {
+            (0..=steps)
+                .map(|k| alpha.at(t + by * k / steps))
+                .fold((f64::MAX, f64::MIN), |(lo, hi), a| (lo.min(a), hi.max(a)))
+        };
+        // A stack top to bottom: a layer shows least at its least under the ones above it at
+        // their most, and most the other way round
+        let mut panes = [(0.0, 0.0); 5];
+        let mut left = (1.0, 1.0);
+        for c in self.tree.children(self.panes_visual).iter().rev() {
+            let (id, alpha) = &self.panes[c];
+            if !under(rect_of(*id), point) {
+                continue;
+            }
+            let (lo, hi) = within(alpha);
+            let tab = tab_of(*id);
+            panes[tab] = (panes[tab].0 + lo * left.0, panes[tab].1 + hi * left.1);
+            left = (left.0 * (1.0 - hi), left.1 * (1.0 - lo));
+        }
+        let mut sides = [(0.0, 0.0); 5];
+        let mut left = (1.0, 1.0);
+        for c in self.tree.children(self.sides_visual).iter().rev() {
+            let (tab, alpha) = &self.sides[c];
+            let (lo, hi) = within(alpha);
+            sides[*tab] = (sides[*tab].0 + lo * left.0, sides[*tab].1 + hi * left.1);
+            left = (left.0 * (1.0 - hi), left.1 * (1.0 - lo));
+        }
+        sides[self.on] = (sides[self.on].0 + left.0, sides[self.on].1 + left.1);
+        (panes, sides)
+    }
 }
 
 /// How far apart the lags of the shots' animated opacities are: the most the stretches of the
@@ -256,8 +299,8 @@ fn shares(shares: &[f64; 5]) -> String {
 /// steps further than the curve", side-strips.ps1's "one's never jumps"); tab one comes back from
 /// what its fade had got to and only rises, to all of the screen; tab one's two panes show the
 /// same share; and the strips' pictures each tab's share as its panes do, apart by no more than
-/// the flight moves in the spread of the lags (side-strips.ps1's "keeps its panes' to 0.12";
-/// PITFALLS 298)
+/// their curves reach in the spread of the lags (side-strips.ps1's "keeps its panes' to 0.12";
+/// PITFALLS 298 and 354)
 #[test]
 fn tabs_in_flight_never_show_more_of_themselves_than_a_moment_before() {
     let screen = Screen::new();
@@ -336,6 +379,8 @@ fn tabs_in_flight_never_show_more_of_themselves_than_a_moment_before() {
     // From each commit to the next, and after the last until the tabs in flight are done
     let mut read = 0;
     let mut widest = Duration::ZERO;
+    // The widest any tab's reach was, in either stack: what the lags let through on this run
+    let mut reached: f64 = 0.0;
     for k in 1..shots.len() {
         let shot = &shots[k];
         let until = shots.get(k + 1).map_or(shown, |s| s.at);
@@ -349,7 +394,7 @@ fn tabs_in_flight_never_show_more_of_themselves_than_a_moment_before() {
                 shot.panes_share(POINTS[1], t),
                 shot.sides_share(t),
             );
-            let allow = shot.moves(POINTS[1], t, lags);
+            let (panes, sides) = shot.reach(POINTS[1], t, lags);
             let ms = t.saturating_duration_since(shots[1].at).as_millis();
             for tab in 0..5 {
                 assert!(
@@ -359,14 +404,20 @@ fn tabs_in_flight_never_show_more_of_themselves_than_a_moment_before() {
                     shares(&now.0),
                     shares(&now.1)
                 );
+                reached = reached.max(panes[tab].1 - panes[tab].0).max(sides[tab].1 - sides[tab].0);
+                // How far the strips' reach is from the panes': 0 where they meet
+                let apart = (panes[tab].0 - sides[tab].1).max(sides[tab].0 - panes[tab].1).max(0.0);
                 assert!(
-                    (now.2[tab] - now.1[tab]).abs() < allow[tab] + SWITCH,
-                    "{ms} ms: tab {}'s strips and panes apart, [{}] and [{}], {:.3} allowed for lags {} ms apart",
+                    apart < SWITCH,
+                    "{ms} ms: tab {}'s strips and panes apart, [{}] and [{}]: with lags {} ms apart the strips reach {:.3} to {:.3} and the panes {:.3} to {:.3}",
                     tab + 1,
                     shares(&now.2),
                     shares(&now.1),
-                    allow[tab] + SWITCH,
-                    lags.as_millis()
+                    lags.as_millis(),
+                    sides[tab].0,
+                    sides[tab].1,
+                    panes[tab].0,
+                    panes[tab].1
                 );
             }
             if let Some(was) = last {
@@ -401,11 +452,13 @@ fn tabs_in_flight_never_show_more_of_themselves_than_a_moment_before() {
     // The lags allowed for are a frame's own work before its commit, on WARP: well short of the
     // flight, or the allowances above would let anything through
     assert!(widest < Duration::from_millis(100), "lags {} ms apart in one frame", widest.as_millis());
-    // Said for `--nocapture`: what the lags were on this run (COMPOSITOR.md, "What they hold")
+    // Said for `--nocapture`: what the lags were on this run, and the widest reach they gave a
+    // tab's share (COMPOSITOR.md, "What they hold")
     println!(
-        "flight: lags at most {} ms apart in a frame, {:?} ms at the switches",
+        "flight: lags at most {} ms apart in a frame, {:?} ms at the switches; a share's reach at most {:.3} wide",
         widest.as_millis(),
-        switches
+        switches,
+        reached
     );
     let end = shots[back].panes_share(POINTS[1], shown);
     assert!(end[0] > 0.99, "tab one at the end: [{}]", shares(&end));

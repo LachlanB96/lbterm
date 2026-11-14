@@ -943,7 +943,10 @@ impl super::TermWindow {
                     let mut quad = self.poly_quad(
                         &mut layers,
                         1,
-                        element.content_rect.origin,
+                        // LBTerm: on whole pixels, as the sprite is rasterized: at a fraction its
+                        // texels are sampled between pixels and a small poly blurs (the projects
+                        // pad's squares ran together; lbterm/PITFALLS.md, 217)
+                        element.content_rect.origin.round(),
                         poly.poly,
                         *line_width,
                         euclid::size2(poly.width, poly.height),

@@ -139,17 +139,30 @@ pub struct Sample {
     pub presents: u32,
     pub refreshes: u32,
     pub present_time: Qpc,
+    /// When the compositor presented to the screen in this frame (the target's `presentTime`,
+    /// the QPC of the present call), 0 in a frame that made none. Unlike `present_time`, which
+    /// can stay at the vblank before for a few frames after the count has moved (a motion's first
+    /// frame, traced 2026-11-10), it's the time of the present the count moved for
+    pub presented_at: Qpc,
 }
 
 /// The compositor's frames gone through for one episode of motion, in order, from the frame it
-/// opened at (`base`): the first that has a present after it is where the motion went up, and
-/// from there every refresh that came without a present is one missed. Frames that start after
-/// `until` (when the motion settles) aren't its. Refreshes are counted by the screen's vblank
-/// times, a `refresh` apart ([`Sample`]), never its refresh counter
+/// opened at (`base`): the first that has a present after it, and after the paint that started
+/// the motion began (`painted`), is where the motion went up, and from there every refresh that
+/// came without a present is one missed. Frames that start after `until` (when the motion
+/// settles) aren't its. Refreshes are counted by the screen's vblank times, a `refresh` apart
+/// ([`Sample`]), never its refresh counter
 #[derive(Debug, Clone, PartialEq)]
 pub struct Walk {
     base: Sample,
     pub until: Qpc,
+    /// When the paint that started the motion began ([`Walk::painted`]): a present that went up
+    /// before it can't show anything of the motion. The base, the newest frame the compositor
+    /// had completed, is the frame before its newest on a quiet PC, since a frame is named
+    /// completed only once a later one has begun, so the first frame after the base can carry a
+    /// present from before the motion (the rest's, 150 ms or more before): such a frame becomes
+    /// the base instead (lbterm/PITFALLS.md, 301). None: every present after the base counts
+    painted: Option<Qpc>,
     /// One refresh of the screen, in QPC ticks (DCompositionGetTargetStatistics' `vblankDuration`)
     refresh: Qpc,
     first: Option<Sample>,
@@ -188,6 +201,7 @@ impl Walk {
         (refresh > 0).then(|| Self {
             base,
             until,
+            painted: None,
             refresh,
             first: None,
             prev: None,
@@ -201,6 +215,13 @@ impl Walk {
             last_id: base.id,
             done: false,
         })
+    }
+
+    /// The paint that started the motion began at `at`: a present that went up before it isn't
+    /// the motion's, however the base fell ([`Walk::painted`]'s field)
+    pub fn painted(mut self, at: Qpc) -> Self {
+        self.painted = Some(at);
+        self
     }
 
     /// The motion settles later than thought
@@ -226,8 +247,13 @@ impl Walk {
         match self.prev {
             None => {
                 if s.presents != self.base.presents {
-                    self.first = Some(s);
-                    self.prev = Some(s);
+                    if self.painted.map_or(false, |at| s.presented_at != 0 && s.presented_at < at) {
+                        // Up before the motion's paint began: the frame to look for it after
+                        self.base = s;
+                    } else {
+                        self.first = Some(s);
+                        self.prev = Some(s);
+                    }
                 }
             }
             Some(p) => {
@@ -269,8 +295,11 @@ impl Walk {
         self.first.map(|f| f.present_time)
     }
 
-    /// Refreshes between the frame it opened at and the first present: how long the motion's
-    /// first frame took to go up, in refreshes (by the vblank times, as `refreshes`)
+    /// Refreshes between the frame it opened at (or the last frame before its paint with a present
+    /// of its own, [`Walk::painted`]) and the first present: how long the motion's first frame
+    /// took to go up, in refreshes (by the vblank times, as `refreshes`). On a quiet PC the base
+    /// can be far older than the paint, the compositor having made no frame between, so this is
+    /// a frame's count only where the PC composes all along
     pub fn lead(&self) -> Option<u32> {
         self.first.map(|f| refreshes_between(&self.base, &f, self.refresh))
     }
@@ -829,6 +858,7 @@ mod tests {
             presents,
             refreshes,
             present_time: refreshes as Qpc * R,
+            presented_at: 0,
         }
     }
 
@@ -918,7 +948,7 @@ mod tests {
         // as read frame by frame; 60 Hz, 166,666 ticks a refresh): a present after a quiet spell,
         // at which its refresh counter goes back 39 while the vblank times keep a refresh apart
         let refresh = 166_666;
-        let f = |id, start, presents, refreshes, present_time| Sample { id, start, presents, refreshes, present_time };
+        let f = |id, start, presents, refreshes, present_time| Sample { id, start, presents, refreshes, present_time, presented_at: 0 };
         let mut walk = Walk::new(f(2350034, 466401301682, 19751, 8432279, 466401278352), 466404091055, refresh).unwrap();
         for s in [
             f(2350035, 466402538073, 19752, 8432286, 466402445014),
@@ -976,16 +1006,54 @@ mod tests {
     }
 
     #[test]
+    fn a_present_from_before_the_paint_is_not_the_motions_start() {
+        // A quiet PC (PITFALLS 301): the base is the frame before the newest, the newest holding
+        // the rest's present a refresh after it; the compositor makes no frame for the 150 ms of
+        // the rest, then the motion's paint begins at 170 ms and its first frame goes up at the
+        // 11th refresh, the refresh after it misses, and the two after have one each
+        let r = 166_667;
+        let walk = |painted: Option<Qpc>| {
+            let mut walk = Walk::new(Sample { id: 1, start: 0, presents: 10, refreshes: 0, present_time: 0, presented_at: 0 }, 20 * r, r).unwrap();
+            if let Some(at) = painted {
+                walk = walk.painted(at);
+            }
+            // The rest's frame presents at 12 000; the motion's at 1 750 000, after its paint began,
+            // its vblank time still the one before it (the count moves before the time does)
+            let frames = [(2, 10_000, 11, 1, 12_000), (3, 1_740_000, 12, 10, 1_750_000), (4, 11 * r + 5_000, 12, 11, 0), (5, 12 * r + 5_000, 12, 12, 0), (6, 13 * r + 5_000, 13, 13, 13 * r), (7, 14 * r + 5_000, 14, 14, 14 * r)];
+            for (id, start, presents, at, presented_at) in frames {
+                walk.step(Sample { id, start, presents, refreshes: at as u32, present_time: at * r, presented_at });
+            }
+            walk
+        };
+        let right = walk(Some(1_700_000));
+        // Its first frame is the one that presented after the paint, though its vblank time is
+        // the refresh before: the walk's arithmetic from there is as it always was (FLOWS.md, "A
+        // test window's motion", What could go, has what that arithmetic makes of a motion's start)
+        assert_eq!(right.first_present(), Some(10 * r));
+        assert_eq!((right.refreshes, right.presents, right.missed), (4, 2, 2));
+        // Its lead runs from the rest's present, the last frame before the paint
+        assert_eq!(right.lead(), Some(9));
+        // Without the paint's start, the rest's present is taken as the motion's going up and
+        // every refresh of the rest reads as missed
+        let based_wrong = walk(None);
+        assert_eq!(based_wrong.first_present(), Some(r));
+        assert_eq!((based_wrong.refreshes, based_wrong.presents, based_wrong.missed), (13, 3, 10));
+        // A cut by the vblank time would have taken the motion's own first frame (its vblank time
+        // 10 refreshes in, before the paint at 1 700 000) for the rest's, as the first build of
+        // the cut did
+    }
+
+    #[test]
     fn an_episode_counts_its_paints_and_what_it_came_to() {
         // 10 MHz, a 60 Hz screen
         let f = 10_000_000;
         let refresh = 166_667;
         let base = sample(1, 0, 0, 0);
         let mut walk = Walk::new(base, 3_000_000, refresh).unwrap();
-        walk.step(Sample { id: 2, start: 170_000, presents: 0, refreshes: 1, present_time: 166_667 });
-        walk.step(Sample { id: 3, start: 340_000, presents: 1, refreshes: 2, present_time: 333_334 });
-        walk.step(Sample { id: 4, start: 510_000, presents: 2, refreshes: 3, present_time: 500_000 });
-        walk.step(Sample { id: 5, start: 680_000, presents: 2, refreshes: 4, present_time: 666_667 });
+        walk.step(Sample { id: 2, start: 170_000, presents: 0, refreshes: 1, present_time: 166_667, presented_at: 0 });
+        walk.step(Sample { id: 3, start: 340_000, presents: 1, refreshes: 2, present_time: 333_334, presented_at: 0 });
+        walk.step(Sample { id: 4, start: 510_000, presents: 2, refreshes: 3, present_time: 500_000, presented_at: 0 });
+        walk.step(Sample { id: 5, start: 680_000, presents: 2, refreshes: 4, present_time: 666_667, presented_at: 0 });
         let mut ep = Episode::new(vec!["pane.layout"], 0, 2_000_000, refresh, f, Some(walk));
         ep.extend(["outline.move", "pane.layout"], 3_000_000);
         assert_eq!(ep.walk.as_ref().unwrap().until, 3_000_000);

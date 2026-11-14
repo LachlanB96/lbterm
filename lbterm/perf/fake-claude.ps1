@@ -22,13 +22,22 @@ folds into one line ("Read 5 files"), as lbterm-extras' long stand-in transcript
 (conversation/long.rs). W starts and stops Claude Code working: a spinner on the effort line over
 the input box, drawn every 100 ms, which changes nothing of the conversation's rows.
 
+With -Conversation, the conversation is a JSON file's instead of the numbered messages: an array of
+{ kind, text }, each kind one of the above (user, first, text, turn, blank) or a tool call's rows
+as Claude Code draws them: tool ("● " in green, then its header), error ("● " in red) and result
+(dim, after "⎿ "). Rows of kind banner (five) and status (three) replace the banner and the
+status lines under the input box. motion/strips-demo.ps1 writes one with the transcript it
+matches.
+
   pwsh -NoProfile -File fake-claude.ps1 -Sid <session id> [-Messages 12] [-Long <last message>] [-Reads 5]
+  pwsh -NoProfile -File fake-claude.ps1 -Sid <session id> -Conversation <file>
 #>
 param(
   [Parameter(Mandatory)][string]$Sid,
   [int]$Messages = 12,
   [string]$Long,
-  [int]$Reads = 0
+  [int]$Reads = 0,
+  [string]$Conversation
 )
 $ErrorActionPreference = 'Stop'
 $e = [char]27
@@ -40,7 +49,19 @@ function UserVar([string]$name, [string]$value) {
 
 # The conversation: Kind is banner, user, first (an answer's first line), text, turn or blank
 $lines = [Collections.Generic.List[object]]::new()
-foreach ($t in '', ' LOGO   Claude Code (stand-in)', ' LOGO   Haiku', ' LOGO   ~\work\demo', '') { $lines.Add([pscustomobject]@{ Kind = 'banner'; Text = $t }) }
+$banner = @('', ' LOGO   Claude Code (stand-in)', ' LOGO   Haiku', ' LOGO   ~\work\demo', '')
+$status = @("  $([char]0x25b8) a summary of the session", '  haiku | demo | main', '  toggles')
+$rows = if ($Conversation) { @(Get-Content -Raw $Conversation | ConvertFrom-Json) } else { @() }
+# A conversation's own banner (five rows, as the default's) and status (three) take their places
+$given = @($rows | Where-Object kind -eq 'banner' | ForEach-Object { [string]$_.text })
+if ($given.Count) { $banner = $given }
+$given = @($rows | Where-Object kind -eq 'status' | ForEach-Object { [string]$_.text })
+if ($given.Count) { $status = $given }
+foreach ($t in $banner) { $lines.Add([pscustomobject]@{ Kind = 'banner'; Text = $t }) }
+if ($Conversation) {
+  foreach ($row in $rows | Where-Object kind -notin 'banner', 'status') { $lines.Add([pscustomobject]@{ Kind = $row.kind; Text = [string]$row.text }) }
+  $Messages = 0
+}
 for ($m = 1; $m -le $Messages; $m++) {
   $text = if ($m -eq $Messages -and $Long) { $Long } else { "message number $m, about part $m of the work" }
   $lines.Add([pscustomobject]@{ Kind = 'blank'; Text = '' })
@@ -54,7 +75,8 @@ for ($m = 1; $m -le $Messages; $m++) {
   $lines.Add([pscustomobject]@{ Kind = 'blank'; Text = '' })
   $lines.Add([pscustomobject]@{ Kind = 'turn'; Text = "Worked for 12s $([char]0xb7) done 09:00" })
 }
-$last = if ($Long) { $Long } else { "message number $Messages, about part $Messages of the work" }
+$last = if ($Conversation) { @($lines | Where-Object Kind -eq 'user')[-1].Text }
+elseif ($Long) { $Long } else { "message number $Messages, about part $Messages of the work" }
 $bottomRows = 8
 
 # Rows scrolled up from the latest
@@ -98,6 +120,9 @@ function Draw {
       'first' { [void]$sb.Append("$e[38;2;255;255;255m$([char]0x25cf)$e[39m $(& $cut $line.Text ($w - 3))") }
       'text' { [void]$sb.Append("  $(& $cut $line.Text ($w - 3))") }
       'turn' { [void]$sb.Append("$e[38;2;153;153;153m$([char]0x273b) $(& $cut $line.Text ($w - 3))$e[0m") }
+      'tool' { [void]$sb.Append("$e[38;2;78;186;101m$([char]0x25cf)$e[39m $(& $cut $line.Text ($w - 3))") }
+      'error' { [void]$sb.Append("$e[38;2;255;107;128m$([char]0x25cf)$e[39m $(& $cut $line.Text ($w - 3))") }
+      'result' { [void]$sb.Append("$e[38;2;153;153;153m  $([char]0x23bf)  $(& $cut $line.Text ($w - 6))$e[0m") }
       default { [void]$sb.Append((& $cut $line.Text ($w - 1))) }
     }
   }
@@ -107,7 +132,7 @@ function Draw {
   [void]$sb.Append("$e[$row;1H$e[0m$e[2K$e[38;2;136;136;136m$rule$e[0m"); $row++
   [void]$sb.Append("$e[$row;1H$e[0m$e[2K$([char]0x276f) "); $row++
   [void]$sb.Append("$e[$row;1H$e[0m$e[2K$e[38;2;136;136;136m$rule$e[0m"); $row++
-  foreach ($t in "  $([char]0x25b8) a summary of the session", '  haiku | demo | main', '  toggles') { [void]$sb.Append("$e[$row;1H$e[0m$e[2K$e[38;2;153;153;153m$t$e[0m"); $row++ }
+  foreach ($t in $status) { [void]$sb.Append("$e[$row;1H$e[0m$e[2K$e[38;2;153;153;153m$t$e[0m"); $row++ }
   [void]$sb.Append("$e[$row;1H$e[0m$e[2K  accept edits on")
   [Console]::Write($sb.ToString())
 }

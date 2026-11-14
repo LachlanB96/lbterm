@@ -87,7 +87,7 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    fn lbterm_shapes(&self, zindex: i8, shapes: &[Shape]) -> anyhow::Result<()> {
+    pub(crate) fn lbterm_shapes(&self, zindex: i8, shapes: &[Shape]) -> anyhow::Result<()> {
         if shapes.is_empty() {
             return Ok(());
         }

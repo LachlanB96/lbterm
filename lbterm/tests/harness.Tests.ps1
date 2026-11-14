@@ -5,6 +5,10 @@
 BeforeAll {
   Import-Module (Join-Path $PSScriptRoot '..\harness.psm1') -Force -DisableNameChecking
   $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+  # The three tests that can't pass while the workstation is locked (LogonUI.exe) skip then, saying
+  # so, as e2e stops on a lock (Lachlan's E2 of 2026-11-14: a check run on 2026-11-13 failed only
+  # these while the PC was locked, and passed unchanged once it was unlocked)
+  $lockedSkip = 'the workstation is locked (LogonUI.exe): this needs the desktop; rerun the check unlocked to cover it'
 
   # A test script with the header lines given, in $Dir
   function New-FakeScript([string]$Dir, [string]$Name, [string[]]$Header) {
@@ -162,6 +166,8 @@ Describe 'The runner''s entries' {
   }
 
   It 'runs a look''s script on both builds and pairs what both saved' {
+    # Invoke-LookRun refuses while the workstation is locked, by design (its captures would show nothing)
+    if (Test-WorkstationLocked) { Set-ItResult -Skipped -Because $lockedSkip; return }
     $perf = Join-Path $TestDrive 'look-run\perf'
     New-Item -ItemType Directory -Force $perf | Out-Null
     # A stand-in script: saves card.png red on the build named before, blue on the other, and
@@ -320,6 +326,8 @@ $Body
   }
 
   It "refuses a config that doesn't set wsl_domains, before opening anything (wsl.exe's stub opens WSL's installer)" {
+    # Open-TestWindow wakes the displays first, and its mouse move of no pixels is refused while locked
+    if (Test-WorkstationLocked) { Set-ItResult -Skipped -Because $lockedSkip; return }
     $cfg = Join-Path $TestDrive 'nowsl.lua'
     Set-Content $cfg 'return { lbterm_crash_restore = false }'
     $r = Invoke-FakeTest 'nowsl' "Open-TestWindow -ConfigFile '$cfg'`n'not reached'"
@@ -389,6 +397,36 @@ Invoke-Test {
     $printed | Should -Contain 'after'
     $result = Get-Content (Join-Path $out 'result.json') -Raw | ConvertFrom-Json
     @($result.failures)[0] | Should -Match '^the memory guard stopped the test: pwsh \(pid \d+\) held'
+  }
+}
+
+Describe 'A test window on its screen' {
+  BeforeAll {
+    Add-Type -AssemblyName System.Drawing
+    function Rect([int]$Left, [int]$Top, [int]$Right, [int]$Bottom) { [pscustomobject]@{ Left = $Left; Top = $Top; Right = $Right; Bottom = $Bottom } }
+    # The right-most portrait screen of 2026-11-10: x 4920 to 6000, y -177 to 1743
+    $screen = [System.Drawing.Rectangle]::new(4920, -177, 1080, 1920)
+  }
+  It 'leaves a window that is all on its screen where it is' {
+    $to = Get-OnScreenRect -Window (Rect 4940 -57 5940 649) -Screen $screen
+    $to.On | Should -BeTrue
+    $to.Resized | Should -BeFalse
+    @($to.X, $to.Y, $to.Width, $to.Height) | Should -Be @(4940, -57, 1000, 706)
+  }
+  It 'narrows a window wider than its screen, as budgets.ps1''s 110 columns were, and keeps it 20 px in' {
+    $to = Get-OnScreenRect -Window (Rect 4940 -57 6070 649) -Screen $screen
+    $to.On | Should -BeFalse
+    $to.Off.Right | Should -Be 70
+    $to.Off.Left | Should -Be 0
+    @($to.X, $to.Y, $to.Width, $to.Height) | Should -Be @(4940, -57, 1040, 706)
+    $to.Resized | Should -BeTrue
+  }
+  It 'moves a window that fits back in, its size kept' {
+    $to = Get-OnScreenRect -Window (Rect 5100 1500 6050 1900) -Screen $screen
+    @($to.X, $to.Y, $to.Width, $to.Height) | Should -Be @(5030, 1323, 950, 400)
+    $to.Resized | Should -BeFalse
+    $to.Off.Right | Should -Be 50
+    $to.Off.Bottom | Should -Be 157
   }
 }
 
@@ -638,6 +676,8 @@ Describe 'Verdicts and the report' {
   }
 
   It 'reads the displays'' power from Windows, and holds them on for the process (E4)' {
+    # Windows gives no display state to a locked session
+    if (Test-WorkstationLocked) { Set-ItResult -Skipped -Because $lockedSkip; return }
     # This PC's displays are on while the check runs, which is when anyone is there to run it
     Get-DisplayPower | Should -BeIn @('on', 'dimmed', 'off')
     # In a process of its own, so the hold ends with it and the test's process keeps none
@@ -1231,15 +1271,26 @@ Describe 'The state file' {
     & $put 1 $false
     $rec = Start-FrameRecorder -Path $state
     try {
-      # 25 ms apart: a GUI's frames come 8.3 ms apart at the least (max_fps 120), and the
-      # recorder reads a snapshot when its watcher's event is handled, so frames 4 ms apart in
-      # the check, beside cargo, had one overwritten before it was read (frame 5 missed, 6 taken)
-      foreach ($n in 2..6) { & $put $n ($n -lt 5); Start-Sleep -Milliseconds 25 }
+      # Each frame is written once the recorder has kept the one before. It reads a snapshot when
+      # its watcher's event is handled, on a pool thread, so a frame written over before then is
+      # one it never saw, and no sleep between the writes is long enough in the check, beside
+      # cargo: 4 ms apart lost frame 5, and 25 ms apart lost 3 and 4 (2026-11-12). Nothing here
+      # calls Look(), so it's the watcher that has to read each one
+      foreach ($n in 2..6) {
+        & $put $n ($n -lt 5)
+        $kept = [Diagnostics.Stopwatch]::StartNew()
+        while ($rec.Last -lt $n) {
+          if ($kept.Elapsed.TotalSeconds -gt 10) { throw "the recorder's watcher never read frame $n, 10 s after it was renamed into place: its last is frame $($rec.Last)" }
+          Start-Sleep -Milliseconds 2
+        }
+      }
       $queue = [Collections.Generic.List[object]]::new()
       $shown = Wait-Recorded -Recorder $rec { param($w, $s) $w.frame -ge 3 } -Hwnd 5 -AfterFrame 1 -Queue $queue -TimeoutSec 3
       $shown.Frame | Should -Be 3
       $shown.TimeMs | Should -Be 1030
       $shown.Window.hwnd | Should -Be 5
+      $shown.Missed | Should -Be 0
+      $rec.Missed | Should -Be 0
       $settled = Wait-Recorded -Recorder $rec { param($w, $s) -not $w.animating } -Hwnd 5 -Queue $queue -TimeoutSec 3
       $settled.Frame | Should -Be 5
       { Wait-Recorded -Recorder $rec { param($w, $s) $w.frame -gt 99 } -Hwnd 5 -Queue $queue -TimeoutSec 0.3 -What 'frame 100' } | Should -Throw '*waiting for frame 100*frame 6*'
@@ -1247,6 +1298,27 @@ Describe 'The state file' {
       & $put 6 $false
       $rec.Look()
       $rec.Take().Count | Should -Be 0
+    } finally { $rec.Dispose() }
+  }
+
+  It 'says how many frames it never read before the one that shows it, counting none from before -AfterFrame' {
+    $put = { param($n) [IO.File]::WriteAllText("$state.tmp", "{`"version`":1,`"pid`":4242,`"build`":`"x`",`"frame`":$n,`"time_ms`":$(1000 + 10 * $n),`"windows`":[{`"id`":0,`"hwnd`":5,`"frame`":$n,`"animating`":false,`"settled`":true}]}"); Move-Item -LiteralPath "$state.tmp" -Destination $state -Force }
+    & $put 1
+    $rec = Start-FrameRecorder -Path $state
+    try {
+      # Frames 2, 5, 6 and 9, each read before the next is written: 3, 4, 7 and 8 are frames the
+      # process painted that the recorder holds no snapshot of
+      foreach ($n in 2, 5, 6, 9) { & $put $n; $rec.Look() }
+      $rec.Missed | Should -Be 4
+      $queue = [Collections.Generic.List[object]]::new()
+      $shown = Wait-Recorded -Recorder $rec { param($w, $s) $w.frame -ge 3 } -Hwnd 5 -AfterFrame 1 -Queue $queue -TimeoutSec 3
+      $shown.Frame | Should -Be 5
+      $shown.Missed | Should -Be 2
+      (Wait-Recorded -Recorder $rec { param($w, $s) $true } -Hwnd 5 -Queue $queue -TimeoutSec 3).Missed | Should -Be 0
+      # 7 and 8 were never read, but only 8 came after the frame the action was posted on
+      $late = Wait-Recorded -Recorder $rec { param($w, $s) $true } -Hwnd 5 -AfterFrame 7 -Queue $queue -TimeoutSec 3
+      $late.Frame | Should -Be 9
+      $late.Missed | Should -Be 1
     } finally { $rec.Dispose() }
   }
 

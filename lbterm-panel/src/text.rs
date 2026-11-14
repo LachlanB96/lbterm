@@ -96,6 +96,25 @@ pub fn left(seconds: u32) -> String {
     }
 }
 
+/// How long ago Lachlan last sent a session a prompt, worded as [`left`] words what's still to
+/// come, with no `~` since it's known: "just now" for the first minute, then "4 min", "2 h",
+/// "3 d", each counted down to the whole unit, so it says no more time has gone than has. A time
+/// later than now (a clock a moment ahead of this one) is just now, never a negative. It reads
+/// differently at the moments [`ago_changes_in`] gives, as [`ago`] does: a minute, an hour and a
+/// day are where both change unit
+pub fn since(seconds: f64) -> String {
+    let m = seconds.max(0.0) as u64 / 60;
+    if m == 0 {
+        "just now".to_string()
+    } else if m < 60 {
+        format!("{m} min")
+    } else if m < 1440 {
+        format!("{} h", m / 60)
+    } else {
+        format!("{} d", m / 1440)
+    }
+}
+
 /// What a conversation has cost, short enough for a pill on the strip or a row's corner:
 /// cents under $100 ("$0.42", "$12.34"), whole dollars to $10,000 ("$148", "$2304"), then
 /// thousands ("$12.3k", "$140k"). Never rounded up past what it is to the cent: $99.996 is
@@ -213,6 +232,28 @@ mod test {
         assert_eq!(left(89 * 60), "~89 min");
         assert_eq!(left(90 * 60), "~2 h");
         assert_eq!(left(5 * 3600), "~5 h");
+    }
+
+    #[test]
+    fn the_time_since_his_last_prompt_reads_as_the_time_left_does() {
+        assert_eq!(since(0.0), "just now");
+        assert_eq!(since(59.9), "just now");
+        assert_eq!(since(60.0), "1 min");
+        assert_eq!(since(240.0), "4 min");
+        assert_eq!(since(3599.0), "59 min");
+        assert_eq!(since(3600.0), "1 h");
+        assert_eq!(since(2.0 * 3600.0 + 1799.0), "2 h", "counted down, never rounded up");
+        assert_eq!(since(86_399.0), "23 h");
+        assert_eq!(since(86_400.0 * 3.0), "3 d");
+        // A time from a clock a moment ahead: just now, never a negative
+        assert_eq!(since(-5.0), "just now");
+        assert_eq!(since(f64::NEG_INFINITY), "just now");
+        // It changes when ago_changes_in says, and not before
+        for t in [0.0, 30.0, 90.0, 3599.0, 3600.0, 7000.0, 86_399.0, 90_000.0] {
+            let next = ago_changes_in(t);
+            assert_ne!(since(t), since(t + next), "at {t}");
+            assert_eq!(since(t), since(t + next - 0.5), "at {t}");
+        }
     }
 
     #[test]

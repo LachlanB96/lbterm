@@ -562,6 +562,9 @@ pub struct TermWindow {
     lbterm_strip: render::strip::StripState,
     /// LBTerm: the objectives panel down the right (render/objectives.rs)
     lbterm_objectives: render::objectives::ObjectivesState,
+    /// LBTerm: the context bar in the objectives strip's room, which it takes
+    /// (render/context_bar.rs)
+    lbterm_context_bar: render::context_bar::ContextBarState,
     /// LBTerm: the scroll strip, left of the objectives panel (render/scroll_strip.rs)
     lbterm_scroll_strip: render::scroll_strip::ScrollStripState,
     /// LBTerm: what those two strips draw, and how they were as a tab is left (render/sides.rs)
@@ -588,6 +591,10 @@ pub struct TermWindow {
     /// LBTerm: the pill under the InMail button, with the open tab's Claude cost, and its list of
     /// the files in its context (render/context.rs)
     lbterm_context: render::context::ContextState,
+    /// The cost pane the context pill's press opens (render/cost.rs)
+    lbterm_cost: render::cost::CostState,
+    /// LBTerm: the projects pad on the strip's second row and its card (render/projects.rs)
+    lbterm_projects: render::projects::ProjectsState,
     /// LBTerm: what the panes drew of the images they link to (render/thumbnails.rs)
     lbterm_thumbnails: render::thumbnails::ThumbnailsState,
     /// LBTerm: building the GPU state again after the device went (gpu_lost.rs)
@@ -874,6 +881,7 @@ impl TermWindow {
             lbterm_menu: Default::default(),
             lbterm_strip: Default::default(),
             lbterm_objectives: Default::default(),
+            lbterm_context_bar: Default::default(),
             lbterm_scroll_strip: Default::default(),
             lbterm_sides: Default::default(),
             lbterm_tasks: Default::default(),
@@ -886,6 +894,8 @@ impl TermWindow {
             lbterm_new_tab: Default::default(),
             lbterm_agenda: Default::default(),
             lbterm_context: Default::default(),
+            lbterm_cost: Default::default(),
+            lbterm_projects: Default::default(),
             lbterm_thumbnails: Default::default(),
             lbterm_gpu: Default::default(),
             lbterm_state: Default::default(),
@@ -1563,6 +1573,11 @@ impl TermWindow {
                     // turns it amber
                     let light = (name == "claude_status" || name == "claude_quiet")
                         && self.window_contains_pane(pane_id);
+                    if name == "claude_session" {
+                        // LBTerm: its rows are read for the weights, or no longer
+                        // (render/triggers.rs)
+                        self.lbterm_triggers_claude(pane_id, &value);
+                    }
                     if name == "claude_session" || light {
                         if let Some(window) = self.window.as_ref() {
                             window.invalidate();
@@ -2234,6 +2249,8 @@ impl TermWindow {
         lbterm_extras::slow::set_threshold_ms(self.config.lbterm_slow_ms);
         // LBTerm: and where the new-tab picker keeps its recent picks (render/new_tab.rs)
         self.lbterm_new_tab_configure();
+        // LBTerm: and with the cost no longer counted, the counting thread ends (cost.rs)
+        self.lbterm_cost_configure();
         // LBTerm: and the budget's, and the reload timed to the frame that shows it
         self.lbterm_budget_configure();
         self.lbterm_budget_reload();

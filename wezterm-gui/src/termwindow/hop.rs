@@ -1,7 +1,7 @@
 //! LBTerm: the side buttons' hops between tabs, the `LbtermTab` action (Lachlan's 8a and 9a of
 //! 2026-11-01; lbterm/NEW-TAB.md, "Landing 4"). Bound in his lbterm.lua to the Back and Forward
 //! side buttons, plain and with Shift, and performed by the `lbterm-tab-back`, `-forward`,
-//! `-waiting` and `-last` events Earshot fires through the control pipe (lbterm/CONTROL.md).
+//! `-waiting` and `-last` events LyreBird fires through the control pipe (lbterm/CONTROL.md).
 //!
 //! At the press, on the GUI thread: the window's tabs with each one's parked flag, the rail's
 //! rows as last drawn and the tabs it showed (render/tab_panel.rs, `tab_panel_hops`), the choice

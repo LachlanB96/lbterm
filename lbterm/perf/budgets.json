@@ -82,6 +82,8 @@
     { "name": "conductor-view", "domain": "mux", "what": "The Conductor's view open over the tab, against a seat played here sending its view every 250 ms as the real one does while the hub's guesses move (one session's time left counting down, which the view shows as ~4 min): the conversation, an ask, two questions, sessions, events, a suggestion and a note", "bug": "with the view open LBTerm used about 80% of a core (2026-10-29). Main's fix of the view (it lays out only when what it's made from changes, and the panes under it don't repaint) took a frame from 18 to 20 ms of the GUI thread to 7 to 10, but every update the seat sends still bumps its generation and repaints every window (seat_client.rs, changed), and the view lays itself out again for it, though nothing it shows changes: 4 frames a second, 27 to 40 ms a second of the GUI thread, 6 tasks a second since perf/frame-loop where it was 19 to 26 (PERF.md, finding 12)" },
     { "name": "conductor-view-quiet", "domain": "mux", "what": "The same view, the seat sending nothing after it opened: what the view itself costs at rest" },
     { "name": "inbox-list", "domain": "mux", "what": "The InMail button's list open from a click on it, one message waiting in a folder of the test's own" },
+    { "name": "context-bar", "domain": "mux", "what": "The context bar down the window's right (lbterm/CONTEXT.md, 'The context bar') beside a stand-in Claude Code session, its transcript as Claude Code writes one (five files at the start, the skills list, the first request, another project's CLAUDE.md pulled in, a memory file read, 40k in use of a 200k window), the pointer away: twelve sections drawn, and at rest nothing a second. A build without the bar shows the pill and the objectives strip beside the same session" },
+    { "name": "context-bar-pane", "domain": "mux", "what": "The same, the pointer resting on the bar's first section: the bar widened, its drawer of the sections' tokens and its pane of every section out over the terminal, the first row lit, Compact now's look at the screen made: at rest nothing a second while they stay open" },
     { "name": "projects-card", "domain": "mux", "what": "The projects card open, the pointer resting on its pad: two projects of the test's own, one with mail, a stand-in session in each" },
     { "name": "tasks-card", "domain": "mux", "what": "The card of what a tab is running open beside its row: a subagent with its transcript, a command and a Monitor, all minutes old, the pointer resting on the row", "bug": "the card repaints every second to read its subagent's transcript again, changed or not (render/tasks_card.rs: its next look is a frame), though every age on it moves by the minute: each frame about 5 ms of the GUI thread and five task runs since main's fixes (17 to 20 ms and eight runs before them) (PERF.md, finding 15)" },
     { "name": "thumbnail", "domain": "mux", "what": "A thumbnail of a linked picture in view (lbterm://image links), its program holding the mouse as Claude Code does" },
@@ -419,6 +421,38 @@
         "cpu_ms": { "max": 25, "why": "1.5 times the slowest round's median, 15.9 ms (this build's 2 rounds: 15.9, 15.7)" },
         "server_cpu_ms": { "max": 3, "why": "1.5 times the slowest round's median, 0 ms (this build's 2 rounds: 0, 0)" },
         "frames": { "max": 5, "why": "1.5 times the slowest round's median, 3 (this build's 2 rounds: 3, 3)" }
+      } },
+    { "name": "context-bar-widening", "kind": "action", "what": "The pointer posted onto the context bar's ring above its track, where no section is, to the first frame with the bar widened (its widen_delay_ms, 150, in it): the bar itself at the closed rail's width with its sections' tokens on them, sliding out over the terminal on panel_open, and the pane of its thin sections' numbers after it (the drawer beside the bar until the second round's 4b of 2026-11-09)",
+      "budgets": {
+        "ms": { "max": 240, "why": "1.5 times the round's median, 159.6 ms (this build's one round of 15 on 2026-11-08 22:25, 154.1 to 169.1): the rest's 150 ms and the drawer's frame after it" },
+        "p95_ms": { "max": 255, "why": "1.5 times the round's p95, 169.1 ms" },
+        "gui_thread_ms": { "max": 11, "why": "1.5 times the round's median, 6.88 ms (4.86 to 9.11): the ring lit, then the drawer and the pane laid out together (about forty words measured) and drawn" },
+        "cpu_ms": { "max": 15, "why": "1.5 times the round's median, 9.92 ms (7.42 to 12.73)" },
+        "frames": { "max": 3, "why": "what the widening needs and no more: the ring lit as the pointer comes, the drawer when the rest is up, and the state file's frame, a test window's only (3 in every run). Not 1.5 times: a fourth is a frame that draws nothing new, as the slide's end woke one before stage 6 of feat/context-bar" }
+      } },
+    { "name": "context-bar-pane-opening", "kind": "action", "what": "The pointer posted onto the context bar's first section, to the first frame with its pane out (its open_delay_ms, 300, in it, the drawer out 150 ms before it), sliding out from under the drawer on panel_open with the scroll strip riding its left edge",
+      "budgets": {
+        "ms": { "max": 470, "why": "1.5 times the round's median, 310.7 ms (this build's one round of 15 on 2026-11-08 22:25, 302.7 to 321.2): the pane's 300 ms rest and its frame after it" },
+        "p95_ms": { "max": 485, "why": "1.5 times the round's p95, 321.2 ms" },
+        "gui_thread_ms": { "max": 17, "why": "1.5 times the round's median, 10.91 ms (8.52 to 13.30): the ring lit, the drawer and the pane laid out and the drawer drawn, then the pane drawn with Compact now's look at the screen" },
+        "cpu_ms": { "max": 24, "why": "1.5 times the round's median, 15.34 ms (11.48 to 17.35)" },
+        "frames": { "max": 5, "why": "what the opening needs and no more: the ring lit, the drawer, the pane, and the state file's two, a test window's only (5 in every run; 7 before stage 6 of feat/context-bar, when each slide's end woke a frame that drew the same again)" }
+      } },
+    { "name": "cost-pane-opening", "kind": "action", "what": "The pointer posted onto the context pill and pressed there, beside the context bar's stand-in session, to the first frame with the cost pane open and its count in (lbterm/CONTEXT.md, 'The cost pane'), with LBTerm's own count on (lbterm_context.count_cost, off unless asked for): the count made on the lbterm-cost thread in the first round and kept for the rest, the pane laid out and faded in under the strip on pane_enter",
+      "budgets": {
+        "ms": { "max": 10, "why": "the press's own frame: 1.8 ms median over stage 6's 5 rounds (2026-11-09 20:53 to 21:18, against stage 5's 1.65, the same at 99%), the count made on the lbterm-cost thread in the first round and kept after; 10 lets a frame's wait through, not a count made on the GUI thread" },
+        "p95_ms": { "max": 10, "why": "2.72 ms median of the rounds' 95th percentiles, as ms" },
+        "gui_thread_ms": { "max": 6, "why": "twice the median, 3.03 ms (stage 6's 5 rounds), the pane laid out with its dozen measured words and drawn once, and the state file's frame; a layout every frame, or the count read on the GUI thread, would pass it" },
+        "cpu_ms": { "max": 9, "why": "twice the median, 4.38 ms (stage 6's 5 rounds)" },
+        "frames": { "max": 2, "why": "what the opening needs and no more: the press's frame, lighting the pill and drawing the pane, and the state file's, a test window's only (2 in every round of stage 6's)" }
+      } },
+    { "name": "cost-pane-opening-off", "kind": "action", "what": "The same press with LBTerm's own count off, Lachlan's setting (round 5's stage 2 of feat/context-bar), to the first frame with the cost pane open and the Claude project's split in (lbterm/CONTEXT.md, 'The cost pane'): <sid>.cost.json in the summaries folder (lbterm-extras' copy of the fixture's), read on lbterm-cost at the warm-up's opening and asked for again only once its file is written, which no run does, so each opening finds it kept",
+      "budgets": {
+        "ms": { "max": 10, "why": "the press's own frame: 2.08 ms median over round 5's stage 3's 5 rounds (2026-11-14 03:33 to 04:02), the split read off the GUI thread at the warm-up and kept; cost-pane-opening's 10, which lets a frame's wait through" },
+        "p95_ms": { "max": 10, "why": "4.05 ms median of the rounds' 95th percentiles (round 5's stage 3), under cost-pane-opening's 10, as ms" },
+        "gui_thread_ms": { "max": 6, "why": "3.24 ms median (round 5's stage 3; 6.48 on the build before it, which read the split again at every opening), cost-pane-opening's 6: the pane laid out from the kept split and drawn once, and the state file's frame" },
+        "cpu_ms": { "max": 9, "why": "twice the median, 4.5 ms (round 5's stage 3), cost-pane-opening's 9" },
+        "frames": { "max": 2, "why": "what the opening needs and no more: the press's frame, lighting the pill and drawing the pane, and the state file's, a test window's only; a re-read that repaints with what the pane showed is a third" }
       } },
     { "name": "conductor-view-opening", "kind": "action", "gui": "conductor-view", "what": "A click on the Conductor's pad, against a seat played here (an ask, two questions, two sessions, a conversation of four items), to the first frame with the view",
       "budgets": {

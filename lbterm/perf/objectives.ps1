@@ -1,5 +1,5 @@
 #Requires -Version 7
-# Covers: lbterm-extras/src/objectives.rs, lbterm-extras/src/projects.rs, lbterm-extras/src/summaries.rs, wezterm-gui/src/termwindow/render/objectives.rs, wezterm-gui/src/termwindow/render/projects.rs, wezterm-gui/src/termwindow/render/inbox.rs, wezterm-gui/src/termwindow/render/borders.rs, wezterm-gui/src/termwindow/compositor.rs, lbterm/motion/demo-tab.ps1
+# Covers: lbterm-extras/src/objectives.rs, lbterm-extras/src/projects.rs, lbterm-extras/src/summaries.rs, wezterm-gui/src/termwindow/render/objectives.rs, wezterm-gui/src/termwindow/render/projects.rs, wezterm-gui/src/termwindow/render/strip.rs, wezterm-gui/src/termwindow/render/inbox.rs, wezterm-gui/src/termwindow/render/borders.rs, wezterm-gui/src/termwindow/compositor.rs, lbterm/motion/demo-tab.ps1
 <#
 The objectives panel down the right (lbterm/OBJECTIVES.md), end to end. A test window looking like
 Lachlan's LBTerm (New-TestConfig) with the tab panel, lbterm_summaries pointed at a scratch folder
@@ -18,9 +18,11 @@ objectives file Terminal's objectives.ts would have written there, and one plain
 5. The pointer leaves the window: both cards close.
 6. The projects pad (lbterm_projects: two scratch projects, Alpha with a message in its InMail and
    the first two sessions, one in a folder of it, and Beta with the third, and Gamma, a repo in
-   Beta's folder with a message of its own): its card opens with Alpha first, two idle sessions and
-   its mail, then Beta, then Gamma under it with its mail and the blue repo mark
-   (objectives-projects.png).
+   Beta's folder with a message of its own), on the window strip's second row since 2026-11-08,
+   in the context pill's place under the InMail button (the pill is off here; perf/projects.ps1
+   has it beside the pill, with the objectives strip off), never on the objectives strip: its
+   card opens under the strip with Alpha first, two idle sessions and its mail, then Beta, then
+   Gamma under it with its mail and the blue repo mark (objectives-projects.png).
 7. New on Beta's row: with no handler for the event in a test window's config, LBTerm opens a tab
    there itself, in front, and the card closes.
 8. The InMail button's list: Gamma's message first, with the blue repo mark before who it's for,
@@ -74,7 +76,7 @@ New-Item -ItemType Directory -Force (Join-Path $alpha 'InMail'), (Join-Path $alp
 [IO.File]::WriteAllText((Join-Path $summaries "$($sessions[1].sid).cwd.txt"), (Join-Path $alpha 'seat'))
 [IO.File]::WriteAllText((Join-Path $summaries "$($sessions[2].sid).cwd.txt"), $beta)
 $lua = { param($p) "'$(ConvertTo-LuaPath $p)'" }
-$projectsSet = "lbterm_projects={projects={{name='Alpha',dir=$(& $lua $alpha)},{name='Beta',dir=$(& $lua $beta)},{name='Gamma',dir=$(& $lua $gamma),parent='Beta'}}}"
+$projectsSet = "lbterm_projects={open_delay_ms=0,projects={{name='Alpha',dir=$(& $lua $alpha)},{name='Beta',dir=$(& $lua $beta)},{name='Gamma',dir=$(& $lua $gamma),parent='Beta'}}}"
 $inboxSet = "lbterm_inbox={folders={$(& $lua (Join-Path $alpha 'InMail')),$(& $lua (Join-Path $beta 'InMail')),$(& $lua (Join-Path $gamma 'InMail'))}}"
 # The repo mark's blue (lbterm_extras::projects::REPO)
 $repoBlue = 0x4FB3FF
@@ -164,12 +166,21 @@ Invoke-Test {
   $s = Wait-Change { param($s) -not $s.objectives.list -and -not $s.objectives.detail } -What 'the cards closed' -Animating
 
   # 6. The projects card, from its pad
-  $pad = $s.objectives.projects.pad
-  if (-not $pad) { throw 'no projects pad on the strip' }
+  $pad = $s.projects.pad
+  if (-not $pad) { throw "no projects pad on the strip's second row" }
+  # In the pill's place: centred under the InMail button, below it, and off the objectives strip
+  $button = @($s.strip.items | Where-Object name -eq 'inbox')[0].rect
+  $item = @($s.strip.items | Where-Object name -eq 'projects')[0].rect
+  if (-not $item -or $item.x -ne $pad.x -or $item.y -ne $pad.y) { Add-Failure "the strip's items don't name the pad where the state says it is: $($item | ConvertTo-Json -Compress) against $($pad | ConvertTo-Json -Compress)" }
+  if ($button -and [Math]::Abs(($pad.x + $pad.w / 2) - ($button.x + $button.w / 2)) -gt 2) { Add-Failure "the pad isn't centred under the InMail button in the pill's place: its middle $($pad.x + $pad.w / 2), the button's $($button.x + $button.w / 2)" }
+  if ($button -and $pad.y -lt $button.y + $button.h) { Add-Failure "the pad isn't under the InMail button: its top $($pad.y), the button's bottom $($button.y + $button.h)" }
+  if ($pad.x -ge $strip.x - 1) { Add-Failure "the pad is on the objectives strip (x $($pad.x), the strip at $($strip.x))" }
   Set-PointerHold $w ($pad.x + [int]($pad.w / 2)) ($pad.y + [int]($pad.h / 2))
-  $s = Wait-Change { param($s) $s.objectives.projects.open -and @($s.objectives.projects.rows).Count -eq 3 } -What 'the projects card open' -Animating
+  $s = Wait-Change { param($s) $s.projects.open -and @($s.projects.rows).Count -eq 3 } -What 'the projects card open' -Animating
   if ($s.objectives.list) { Add-Failure "the objectives list opened with the projects card" }
-  $rows = @($s.objectives.projects.rows)
+  $card = $s.projects.card
+  if (-not $card -or $card.y -lt $pad.y + $pad.h) { Add-Failure "the card doesn't hang under the pad: its top $($card.y), the pad's bottom $($pad.y + $pad.h)" }
+  $rows = @($s.projects.rows)
   "projects: $(($rows | ForEach-Object { "$($_.name)$(if ($_.parent) { " (in $($_.parent))" }): $($_.idle) idle, $($_.mail) mail, chips $(($_.chips | ForEach-Object action) -join ',')" }) -join ' | ')"
   if ($rows[0].name -ne 'Alpha' -or $rows[0].idle -ne 2 -or $rows[0].mail -ne 1) { Add-Failure "the first row isn't Alpha with two idle sessions and one message" }
   if ($rows[1].name -ne 'Beta' -or $rows[1].idle -ne 1 -or $rows[1].mail -ne 0) { Add-Failure "the second row isn't Beta with one idle session" }
@@ -180,7 +191,7 @@ Invoke-Test {
   if ((@($rows[2].chips) | ForEach-Object action) -join ',' -ne 'new,inmail,resume') { Add-Failure "Gamma's buttons aren't New, InMail, Resume" }
   $r = $rows[1].rect
   Set-PointerHold $w ($r.x + 20) ($r.y + [int]($r.h / 2))
-  $s = Wait-Change { param($s) $s.objectives.projects.hovered -eq 1 } -What "Beta's row under the pointer" -Animating
+  $s = Wait-Change { param($s) $s.projects.hovered -eq 1 } -What "Beta's row under the pointer" -Animating
   $shot = Get-Shot $w -Name 'objectives-projects'
   # The repo mark in its blue at the start of Gamma's row, and none on the projects' rows
   $mark = { param($row) [LbtermE2E.Px]::CountNear($shot, (New-Rect $row.rect.x $row.rect.y ([int]($row.rect.w / 4)) $row.rect.h), $repoBlue, 30) }
@@ -193,13 +204,13 @@ Invoke-Test {
 
   # 7. New on Beta's row: a tab opens there, in front, and the card closes
   $before = @($s.tabs).Count
-  $chip = @(@($s.objectives.projects.rows)[1].chips | Where-Object action -eq 'new')[0]
+  $chip = @(@($s.projects.rows)[1].chips | Where-Object action -eq 'new')[0]
   Clear-PointerHold
   Send-Click $w ($chip.rect.x + [int]($chip.rect.w / 2)) ($chip.rect.y + [int]($chip.rect.h / 2)) -Move
   $s = Wait-Change { param($s) @($s.tabs).Count -eq $before + 1 } -What 'the new tab' -Animating
   if ($s.active_tab -ne $before) { Add-Failure "the new tab isn't the open one (open: $($s.active_tab), tabs: $(@($s.tabs).Count))" }
   Send-Leave $w
-  $s = Wait-Change { param($s) -not $s.objectives.projects.open } -What 'the projects card closed' -Animating
+  $s = Wait-Change { param($s) -not $s.projects.open } -What 'the projects card closed' -Animating
 
   # 8. The InMail button's list: Gamma's message, newest, with the repo mark before who it's for;
   #    Alpha's without it

@@ -47,8 +47,12 @@ pub enum TabBarItem {
     /// (render/agenda.rs)
     LbtermAgenda,
     /// LBTerm: the pill under the InMail button, with what the open tab's Claude conversation has
-    /// cost, which lists the files in its context (render/context.rs)
+    /// cost (render/context.rs). A click on it does nothing (Lachlan's 5a of 2026-11-08: its list
+    /// of the files in the context went, the context bar showing them)
     LbtermContext,
+    /// LBTerm: the projects pad right of it, whose card opens while the pointer rests on it
+    /// (render/projects.rs)
+    LbtermProjects,
 }
 
 #[derive(Clone, Debug, PartialEq)]

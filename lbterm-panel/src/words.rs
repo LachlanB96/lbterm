@@ -1,7 +1,7 @@
 //! Where each row's words go: the number on the pad and the label under it,
 //! which show on the rail, and on the open panel the title and age (or the
-//! subagents at work) on the first line, the project and status (or the
-//! program's message, when it fits) on the second. The panel's font is
+//! subagents at work) on the first line, the time since Lachlan's last prompt,
+//! the project and status (or the program's message, when it fits) on the second. The panel's font is
 //! monospaced, so a word's width is its columns times the cell width.
 
 use crate::claude::{Row, RowState};
@@ -224,6 +224,22 @@ pub fn place(rows: &[Row], layout: &Layout, font: Font, label: Font, width: impl
             }
         }
         let mut x = room.x;
+        // How long ago Lachlan last prompted it (his ask of 2026-11-11), at the second line's
+        // start before the project (his 1c of 2026-11-14, so the titles stay where they were), in
+        // a quiet grey; only while the line keeps at least as much room again, so a narrow panel
+        // drops it before it cuts the project and status to nothing
+        if !row.prompted.is_empty() {
+            let w = span(&row.prompted);
+            if 2.0 * (w + layout.px(8.0)) <= end - x {
+                placed.words.push(Word {
+                    row: i,
+                    text: row.prompted.clone(),
+                    area: Area::new(x, second, w + cell, line),
+                    colour: palette::PROMPTED,
+                });
+                x += w + layout.px(8.0);
+            }
+        }
         if !row.project.is_empty() {
             let inset = layout.px(4.0);
             let project = text::fit(&row.project, columns(end - x - 2.0 * inset), width);
@@ -461,6 +477,7 @@ mod test {
             link: None,
             quiet: false,
             cost: String::new(),
+            prompted: String::new(),
             hidden: false,
             parked: false,
         }
@@ -744,6 +761,49 @@ mod test {
         assert_eq!(placed.words[0].colour, palette::status(RowState::Working));
         // The title makes room for it
         assert!(placed.words[1].area.right() <= placed.words[0].area.x + l.px(8.0) + 1.0);
+    }
+
+    #[test]
+    fn the_time_since_his_last_prompt_starts_the_second_line_before_the_project() {
+        let l = layout(1);
+        let room = l.text(0);
+        let mut r = row(1, "Deploy");
+        r.state = RowState::Working;
+        r.status = "Working".into();
+        r.age.clear();
+        r.left = "~4 min".into();
+        r.prompted = "4 min".into();
+        let placed = place(&[r.clone()], &l, FONT, LABEL, one);
+        let at = |text: &str| placed.words.iter().find(|w| w.text == text).unwrap_or_else(|| panic!("{text}"));
+        let (since, title, project) = (at("4 min"), at("Deploy"), at("Terminal"));
+        // At the second line's start (his 1c of 2026-11-14), in its quiet grey, on the project's
+        // line, the title alone at the first line's start as it always was
+        assert_eq!((since.area.x, since.area.y), (room.x, project.area.y));
+        assert!(since.area.y > title.area.y);
+        assert_eq!(since.colour, palette::PROMPTED);
+        assert_eq!(title.area.x, room.x);
+        // The project's chip after it, a gap between
+        let inset = l.px(4.0);
+        assert_eq!(project.area.x, room.x + 5.0 * 7.0 + l.px(8.0) + inset);
+        assert_eq!(placed.chips[0].x, room.x + 5.0 * 7.0 + l.px(8.0));
+        // None while it isn't known: the project at the line's start, as before, the title where
+        // it was with a time
+        r.prompted.clear();
+        let without = place(&[r.clone()], &l, FONT, LABEL, one);
+        assert!(without.words.iter().all(|w| w.colour != palette::PROMPTED));
+        assert_eq!(without.words.iter().find(|w| w.text == "Terminal").unwrap().area.x, room.x + inset);
+        assert_eq!(without.words.iter().find(|w| w.text == "Deploy").unwrap().area, title.area);
+        // "just now" too, the status after the project
+        r.prompted = "just now".into();
+        let placed = place(&[r.clone()], &l, FONT, LABEL, one);
+        let since = placed.words.iter().find(|w| w.text == "just now").expect("the time");
+        let status = placed.words.iter().find(|w| w.text == "Working").expect("the status");
+        assert_eq!(since.area.y, status.area.y);
+        assert!(status.area.x > since.area.x + 8.0 * 7.0);
+        // A panel too narrow to leave the line as much room again drops it rather than the project
+        let narrow = Layout { width: 150.0, ..l };
+        let placed = place(&[r], &narrow, FONT, LABEL, one);
+        assert!(placed.words.iter().all(|w| w.text != "just now"));
     }
 
     #[test]

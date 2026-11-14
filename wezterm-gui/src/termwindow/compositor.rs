@@ -767,7 +767,9 @@ mod imp {
 
         fn velocity(&self, now: Instant) -> f64 {
             let t = self.elapsed(now);
-            if t >= self.end {
+            // Held where it starts until its delay is up (`drive`): not moving yet, so a retarget
+            // then starts from rest, not with the speed its curve starts with
+            if now < self.start || t >= self.end {
                 0.0
             } else if let Some(s) = &self.sampled {
                 (s.value(t + 0.001) - s.value(t)) / 0.001
@@ -786,6 +788,27 @@ mod imp {
         match tween {
             Some(t) => (t.value(now), t.velocity(now)),
             None => (rest, 0.0),
+        }
+    }
+
+    /// `Tween`'s own test, beside it rather than at the end of `imp`, where other branches add
+    /// their test modules (PITFALLS 307)
+    #[cfg(test)]
+    mod tween_test {
+        use super::*;
+
+        /// A tween started with a delay holds where it starts until the delay is up (`drive`
+        /// plays its start value then): it isn't moving, so the context bar's widened bar, waiting
+        /// for the thin numbers' pane to go in, opens again from rest when the pointer comes back
+        #[test]
+        fn a_tween_waiting_on_its_delay_is_at_rest() {
+            let now = Instant::now();
+            let motion = Motion::new(0.0, 54.0, 0.0, Curve::Timed { duration: 0.15, easing: lbterm_motion::Easing::Linear });
+            let waiting = Tween { motion: motion.clone(), start: now + Duration::from_millis(150), end: 0.15, sampled: None };
+            assert_eq!(at(&Some(waiting), 0.0, now), (0.0, 0.0));
+            let going = Tween { motion, start: now - Duration::from_millis(75), end: 0.15, sampled: None };
+            let (x, v) = at(&Some(going), 0.0, now);
+            assert!((x - 27.0).abs() < 0.5 && (v - 360.0).abs() < 1.0, "{x} at {v} a second");
         }
     }
 
@@ -3996,6 +4019,9 @@ mod imp {
         /// Over the panes: the active pane's outline
         focus: IDCompositionVisual2,
         over: IDCompositionVisual2,
+        /// LBTerm: the tab bar's band of `over` while the questions bar pushes the rest of it left
+        /// (`Push`): `over`'s own swapchain again, clipped to the band, which stays where it is
+        over_top: IDCompositionVisual2,
         panel: IDCompositionVisual2,
         /// Over the panel: the tab menu (render/tab_menu.rs)
         top: IDCompositionVisual2,
@@ -4005,12 +4031,17 @@ mod imp {
         /// Over the hover slots, under the panel: the strip's detail card (render/strip.rs)
         strip_card: IDCompositionVisual2,
         strip_card_layer: RefCell<StripCard>,
-        /// Over the strip's card, under the panel: the objectives panel's four cards, the list of
-        /// each tab's first objective, one session's whole list, the projects card and the scroll
-        /// strip's card
-        /// (render/objectives.rs, render/projects.rs, render/scroll_strip.rs)
+        /// Over the strip's card, under the panel: the objectives panel's five cards, the list of
+        /// each tab's first objective, one session's whole list, the projects card, the scroll
+        /// strip's card and the cost pane
+        /// (render/objectives.rs, render/projects.rs, render/scroll_strip.rs, render/cost.rs)
         objectives: IDCompositionVisual2,
-        objectives_layers: RefCell<[StripCard; 4]>,
+        objectives_layers: RefCell<[StripCard; crate::termwindow::render::objectives::CARDS]>,
+        /// LBTerm: the context bar's moving parts, in the objectives' group over their cards (the
+        /// bar takes the objectives strip's room, so they never show together): its pane, its
+        /// widened bar's drawer and the scroll strip riding on their left edge
+        /// (render/context_bar.rs)
+        context_layers: RefCell<ContextLayers>,
         /// Over the tab menu: the turning arc on a Conductor item that waits (render/conductor.rs)
         menu_spinner: RefCell<MenuSpinner>,
         /// Over a tab link drag's cards: the lights running round its matched blocks
@@ -4029,6 +4060,13 @@ mod imp {
         /// while the window is resized or the font changes (render/lights.rs)
         readout: IDCompositionVisual2,
         readout_layer: RefCell<StripCard>,
+        /// LBTerm: over the readout and the objectives panel's cards, under the tab panel: the
+        /// questions pane down the window's right while a right hold shows the question colours,
+        /// sliding out from under the window's right edge (render/questions_pane.rs)
+        questions_pane: IDCompositionVisual2,
+        questions_pane_slide: RefCell<EdgeSlide>,
+        /// LBTerm: the questions bar's push: everything under the tab bar moving left with it
+        questions_push: RefCell<Push>,
         /// Over the tab panel, under the tab menu: a pad's glint (render/tab_panel.rs)
         panel_lights: IDCompositionVisual2,
         /// Over `over`, under the lights: the strip as it was, fading out over its new words
@@ -4102,6 +4140,7 @@ mod imp {
                 let panes = device.CreateVisual()?;
                 let focus = device.CreateVisual()?;
                 let over = device.CreateVisual()?;
+                let over_top = device.CreateVisual()?;
                 let panel = device.CreateVisual()?;
                 let top = device.CreateVisual()?;
                 let hover = device.CreateVisual()?;
@@ -4109,6 +4148,7 @@ mod imp {
                 let objectives = device.CreateVisual()?;
                 let lights = device.CreateVisual()?;
                 let readout = device.CreateVisual()?;
+                let questions_pane = device.CreateVisual()?;
                 let swap = device.CreateVisual()?;
                 let sides = device.CreateVisual()?;
                 let panel_lights = device.CreateVisual()?;
@@ -4122,7 +4162,8 @@ mod imp {
                 cards.SetClip(&nothing)?;
                 // With no reference visual, FALSE puts each one on top
                 for visual in [
-                    &cards, &under, &panes, &focus, &over, &sides, &swap, &lights, &hover, &strip_card, &objectives, &readout, &panel,
+                    &cards, &under, &panes, &focus, &over, &over_top, &sides, &swap, &lights, &hover, &strip_card, &objectives, &readout,
+                    &questions_pane, &panel,
                     &plus, &picker, &panel_lights, &tasks_card, &menus, &menu_lights, &top,
                 ] {
                     root.AddVisual(visual, false, None::<&IDCompositionVisual>)
@@ -4141,6 +4182,7 @@ mod imp {
                     panes,
                     focus,
                     over,
+                    over_top,
                     panel,
                     top,
                     hover,
@@ -4149,6 +4191,7 @@ mod imp {
                     strip_card_layer: RefCell::new(StripCard::default()),
                     objectives,
                     objectives_layers: RefCell::new(Default::default()),
+                    context_layers: RefCell::new(Default::default()),
                     menu_spinner: RefCell::new(MenuSpinner::default()),
                     link_lamps: RefCell::new(LinkLamps::default()),
                     connection_lamps: RefCell::new(ConnectionLamps::default()),
@@ -4157,6 +4200,9 @@ mod imp {
                     light_layers: RefCell::new(LightLayers::default()),
                     readout,
                     readout_layer: RefCell::new(StripCard::default()),
+                    questions_pane,
+                    questions_pane_slide: RefCell::new(EdgeSlide::default()),
+                    questions_push: RefCell::new(Push::default()),
                     panel_lights,
                     swap,
                     swaps: RefCell::new(SwapStack::default()),
@@ -6062,12 +6108,12 @@ mod imp {
             instance: &wgpu::Instance,
             device: &wgpu::Device,
             base: &wgpu::SurfaceConfiguration,
-            cards: [Option<(PixelRect, bool)>; 4],
+            cards: [Option<(PixelRect, bool)>; crate::termwindow::render::objectives::CARDS],
             motion: &MotionSettings,
         ) -> anyhow::Result<()> {
             let mut layers = self.objectives_layers.borrow_mut();
             for (i, (card, want)) in layers.iter_mut().zip(cards).enumerate() {
-                let name = ["objectives.list", "objectives.detail", "objectives.projects", "scroll.card"][i];
+                let name = ["objectives.list", "objectives.detail", "objectives.projects", "scroll.card", "context.cost"][i];
                 self.prepare_faded_card(&self.objectives, card, name, instance, device, base, want, motion)?;
             }
             Ok(())
@@ -6785,7 +6831,7 @@ mod imp {
 
         /// LBTerm: whether each of the objectives panel's cards still shows anything at `now`:
         /// open, or still fading out; and when the last fade under way is done
-        pub fn objectives_showing(&self, now: Instant) -> ([bool; 4], Option<Instant>) {
+        pub fn objectives_showing(&self, now: Instant) -> ([bool; crate::termwindow::render::objectives::CARDS], Option<Instant>) {
             let layers = self.objectives_layers.borrow();
             let showing = |c: &StripCard| {
                 c.wanted && (c.rest > 0.0 || c.alpha.as_ref().map_or(false, |t| t.finishes() > now))
@@ -6795,6 +6841,239 @@ mod imp {
                 .filter_map(|c| c.alpha.as_ref().map(|t| t.finishes()).filter(|t| *t > now))
                 .max();
             (std::array::from_fn(|i| showing(&layers[i])), settles)
+        }
+
+        /// LBTerm: the context bar's moving parts for this frame (render/context_bar.rs; lbterm/
+        /// CONTEXT.md, "How it's built"). `pane` and `drawer` (the widened bar's labels) are each a
+        /// surface at its place once in (`bounds`), seen through a clip of where it ends (`clip`, in
+        /// the window), its content's offset sliding from under the clip's right edge to nothing on
+        /// `panel_open` as it opens and back on `panel_close` as it closes, from wherever it is with
+        /// its speed: so it comes out from under the bar and never lies over it, and its words move
+        /// flat with it. `ride` is the scroll strip drawn where it rides (`bounds`): its offset
+        /// glides from where it showed (the strip's own place, `from`, when it's new) to nothing,
+        /// on `panel_open` going left and `panel_close` coming back, and again from where it shows
+        /// whenever its place moves. `None` puts one away. Each is made the first time it's wanted;
+        /// call after `prepare`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn prepare_context_bar(
+            &self,
+            instance: &wgpu::Instance,
+            device: &wgpu::Device,
+            base: &wgpu::SurfaceConfiguration,
+            visuals: crate::termwindow::render::context_bar::Visuals,
+            ride: Option<(PixelRect, PixelRect, i32)>,
+            motion: &MotionSettings,
+        ) -> anyhow::Result<()> {
+            let mut layers = self.context_layers.borrow_mut();
+            let now = Instant::now();
+            let mut changed = false;
+            let ContextLayers { pane: p, drawer: d, ride: r, thin: t } = &mut *layers;
+            // All four made together, the first time any is wanted, in their order bottom to top:
+            // the thin numbers' pane under the pane, which slides out over it, then the riding
+            // scroll strip, then the widened bar, which the pane and the thin numbers' pane come
+            // out from under and which covers the strip until the thin pane's slide takes it out.
+            // DComp puts each new child over its siblings, so made one at a time as each was first
+            // wanted, their order would be the order they were first wanted in (lbterm/PITFALLS.md,
+            // 273)
+            let any = [visuals.pane, visuals.bar, visuals.thin].iter().flatten().next().map(|s| s.bounds).or(ride.map(|r| r.0));
+            if let Some(first) = any.filter(|_| d.layer.is_none()) {
+                // The thin numbers' pane's with the visual that rides the bar's slide (`follow`)
+                for (i, slid) in IntoIterator::into_iter([&mut *t, &mut *p, &mut *r, &mut *d]).enumerate() {
+                    if slid.layer.is_none() {
+                        slid.make(self, instance, device, base, first, i == 0)?;
+                    }
+                }
+                changed = true;
+            }
+            // Coming out nothing waits: the bar's slide, the thin numbers' pane's inside the visual
+            // that rides it, and the strip riding the thin pane's left edge all start now, so the
+            // thin pane comes out from under the bar's moving edge and settles with it (Lachlan's
+            // E9 of 2026-11-10). Going back from out, the thin numbers' pane goes first and the
+            // bar's slide waits for what's left of it (lbterm_extras::context_bar::slide_wait), so
+            // the bar is started last, in the same commit
+            let mut thin_left = 0.0;
+            let follow = t.follow.clone();
+            let back = visuals.bar.map_or(true, |s| !s.open);
+            let order = if back {
+                [(t, visuals.thin, "context.thin"), (p, visuals.pane, "context.pane"), (d, visuals.bar, "context.widen")]
+            } else {
+                [(d, visuals.bar, "context.widen"), (t, visuals.thin, "context.thin"), (p, visuals.pane, "context.pane")]
+            };
+            for (slid, want, name) in order {
+                let Some(crate::termwindow::render::context_bar::Slide { bounds, clip, open, home, after_thin }) = want else {
+                    if slid.wanted {
+                        // Read by walk-read.ts beside a test window's walk (FLOWS.md, "The context
+                        // bar's widening"); a level check when the log doesn't ask for it
+                        log::debug!(
+                            target: "lbterm::present",
+                            "context {name} hidden, its slide {:.1} ms from its end",
+                            slid.x.as_ref().map_or(0.0, |x| x.finishes().saturating_duration_since(now).as_secs_f64() * 1000.0)
+                        );
+                        slid.hide()?;
+                        changed = true;
+                    }
+                    slid.open = false;
+                    continue;
+                };
+                if slid.layer.as_ref().map_or(false, |l| l.rect != bounds) {
+                    if let Some(layer) = slid.layer.as_mut() {
+                        layer.place(device, bounds)?;
+                    }
+                    changed = true;
+                }
+                changed |= slid.clip_to(clip)?;
+                // In: by default its content's left at the clip's right edge, so none of it shows;
+                // the widened bar's, its left edge on the bar's
+                let out = home.unwrap_or((clip.x + clip.w as i32 - bounds.x).max(0) as f64);
+                if open != slid.open || !slid.wanted {
+                    let to = if open { 0.0 } else { out };
+                    let (from, speed) = if slid.wanted { at(&slid.x, slid.rest, now) } else { (out, 0.0) };
+                    // Still on its way out: turned round, it goes back at once, from where it is
+                    let moving = slid.wanted && slid.x.as_ref().map_or(false, |x| x.finishes() > now);
+                    let delay = lbterm_extras::context_bar::slide_wait(open, after_thin, moving, thin_left);
+                    log::debug!(
+                        target: "lbterm::present",
+                        "context {name} {} from {from:.1} to {to:.1}, after {:.1} ms",
+                        if open { "opens" } else { "closes" },
+                        delay * 1000.0
+                    );
+                    let slider = slid.slider.clone().context("the slide's visual")?;
+                    // The widened bar's slide is the thin numbers' pane's clip's too: the visual
+                    // its clip is in gets the bar's one animation (`Slid::follow`)
+                    let follow = follow.clone().filter(|_| name == "context.widen");
+                    if motion.enabled {
+                        let curve = if open { motion.panel_open.clone() } else { motion.panel_close.clone() };
+                        self.name(name);
+                        slid.x = self.drive(
+                            Motion::new(from, to, speed, curve),
+                            PIXEL_EPSILON,
+                            delay,
+                            |a| unsafe {
+                                slider.SetOffsetX(a)?;
+                                follow.as_ref().map_or(Ok(()), |f| f.SetOffsetX(a))
+                            },
+                            |v| unsafe {
+                                slider.SetOffsetX2(v)?;
+                                follow.as_ref().map_or(Ok(()), |f| f.SetOffsetX2(v))
+                            },
+                        )?;
+                    } else {
+                        unsafe {
+                            slider.SetOffsetX2(to as f32)?;
+                            if let Some(f) = &follow {
+                                f.SetOffsetX2(to as f32)?;
+                            }
+                        }
+                        slid.x = None;
+                    }
+                    slid.rest = to;
+                    slid.open = open;
+                    changed = true;
+                }
+                slid.wanted = true;
+                if name == "context.thin" && !slid.open {
+                    thin_left = slid.x.as_ref().map_or(0.0, |x| x.finishes().saturating_duration_since(now).as_secs_f64());
+                }
+            }
+            match ride {
+                None => {
+                    if r.wanted {
+                        r.hide()?;
+                        changed = true;
+                    }
+                }
+                Some((bounds, clip, from)) => {
+                    // Where it shows now, in the window
+                    let shown = match (&r.layer, r.wanted) {
+                        (Some(layer), true) => layer.rect.x as f64 + at(&r.x, r.rest, now).0,
+                        _ => from as f64,
+                    };
+                    let speed = if r.wanted { at(&r.x, r.rest, now).1 } else { 0.0 };
+                    let moved = !r.wanted || r.layer.as_ref().map_or(true, |l| l.rect != bounds);
+                    if r.layer.is_none() {
+                        r.make(self, instance, device, base, bounds, false)?;
+                    } else if let Some(layer) = r.layer.as_mut().filter(|l| l.rect != bounds) {
+                        layer.place(device, bounds)?;
+                    }
+                    changed |= r.clip_to(clip)?;
+                    if moved {
+                        let start = shown - bounds.x as f64;
+                        let slider = r.slider.clone().context("the ride's visual")?;
+                        if motion.enabled && start.abs() > PIXEL_EPSILON {
+                            // Out to the pane's edge on its way out, back with it on its way in
+                            let curve = if start > 0.0 { motion.panel_open.clone() } else { motion.panel_close.clone() };
+                            self.name("scroll.ride");
+                            // Riding the thin numbers' pane, it glides with it in the bar's slide,
+                            // waiting for nothing (until round 4's stage 6 it waited for the bar)
+                            log::debug!(target: "lbterm::present", "context scroll.ride glides from {start:.1} to 0.0, after 0.0 ms");
+                            r.x = self.drive(
+                                Motion::new(start, 0.0, speed, curve),
+                                PIXEL_EPSILON,
+                                0.0,
+                                |a| unsafe { slider.SetOffsetX(a) },
+                                |v| unsafe { slider.SetOffsetX2(v) },
+                            )?;
+                        } else {
+                            unsafe { slider.SetOffsetX2(0.0)? };
+                            r.x = None;
+                        }
+                        r.rest = 0.0;
+                        changed = true;
+                    }
+                    r.wanted = true;
+                }
+            }
+            if changed {
+                self.layers.borrow_mut().changed = true;
+            }
+            Ok(())
+        }
+
+        /// LBTerm: this frame's textures for the context bar's pane, its drawer and the riding
+        /// scroll strip, while each shows
+        pub fn acquire_context_bar(&self, content: Content<'_>) -> anyhow::Result<Vec<Frame>> {
+            let layers = self.context_layers.borrow();
+            let mut frames = vec![];
+            for (i, slid) in [&layers.pane, &layers.drawer, &layers.ride, &layers.thin].iter().enumerate() {
+                if let (Some(layer), true) = (&slid.layer, slid.wanted) {
+                    frames.extend(layer.frame(Target::ContextBar(i), content)?);
+                }
+            }
+            if !frames.is_empty() && log::log_enabled!(target: "lbterm::present", log::Level::Debug) {
+                // Which of the four this frame presents, for a test window's walk (walk-read.ts)
+                let names: Vec<&str> = frames
+                    .iter()
+                    .filter_map(|f| match f.target {
+                        Target::ContextBar(i) => ["pane", "bar", "ride", "thin"].get(i).copied(),
+                        _ => None,
+                    })
+                    .collect();
+                log::debug!(target: "lbterm::present", "context presents {}", names.join(", "));
+            }
+            Ok(frames)
+        }
+
+        /// LBTerm: whether the context bar's pane, its widened bar and the pane of thin sections'
+        /// numbers still show anything at `now` (open, or still sliding back), and whether the
+        /// riding scroll strip is still on its way (in `Target::ContextBar`'s order: pane, bar,
+        /// ride, thin); and when the last of their motions is done
+        pub fn context_bar_showing(&self, now: Instant) -> ([bool; 4], Option<Instant>) {
+            let layers = self.context_layers.borrow();
+            let moving = |s: &Slid| s.x.as_ref().map_or(false, |t| t.finishes() > now);
+            let all = [&layers.pane, &layers.drawer, &layers.ride, &layers.thin];
+            let settles = all
+                .iter()
+                .filter_map(|s| s.x.as_ref().map(|t| t.finishes()).filter(|t| *t > now))
+                .max();
+            (
+                [
+                    layers.pane.wanted && (layers.pane.open || moving(&layers.pane)),
+                    layers.drawer.wanted && (layers.drawer.open || moving(&layers.drawer)),
+                    layers.ride.wanted && moving(&layers.ride),
+                    layers.thin.wanted && (layers.thin.open || moving(&layers.thin)),
+                ],
+                settles,
+            )
         }
 
         /// LBTerm: this frame's texture for the card of what a tab is running, while it shows
@@ -6812,6 +7091,204 @@ mod imp {
             let card = self.tasks_card_layer.borrow();
             let settles = card.alpha.as_ref().map(|t| t.finishes()).filter(|t| *t > now);
             (card.wanted && (card.rest > 0.0 || settles.is_some()), settles)
+        }
+
+        /// LBTerm: the questions bar for this frame (render/questions_pane.rs; lbterm/
+        /// QUESTIONS.md, "The questions bar"): `bounds` is its surface at its place at rest,
+        /// `clip` what of the window it may show in, which ends at the window's right edge, `open`
+        /// whether it's coming out (the hold goes on) or going back (let go), and `travel` how
+        /// far it comes out. Its slider's offset along x goes from `travel`, where none of it
+        /// shows, to nothing on `panel_open` as it comes out, and back on `panel_close` as it goes,
+        /// from wherever it is with its speed: a release mid-slide turns it round there. With
+        /// `push` (the tab bar's bottom), everything under the tab bar moves left with it, as far,
+        /// on the same animation (`Push`). With motion off it's out or back at once. `None` puts
+        /// it away. Made the first time it's wanted; call after `prepare`.
+        pub fn prepare_questions_pane(
+            &self,
+            instance: &wgpu::Instance,
+            device: &wgpu::Device,
+            base: &wgpu::SurfaceConfiguration,
+            want: Option<crate::termwindow::render::questions_pane::BarVisual>,
+            motion: &MotionSettings,
+        ) -> anyhow::Result<()> {
+            let mut slide = self.questions_pane_slide.borrow_mut();
+            let mut push = self.questions_push.borrow_mut();
+            let now = Instant::now();
+            let Some(crate::termwindow::render::questions_pane::BarVisual { bounds, clip, open, travel, push: band }) = want else {
+                if slide.wanted {
+                    slide.hide()?;
+                    self.push_off(&mut push, "the bar put away")?;
+                    self.layers.borrow_mut().changed = true;
+                }
+                return Ok(());
+            };
+            let mut changed = false;
+            if slide.layer.is_none() {
+                slide.make(self, &self.questions_pane, instance, device, base, bounds)?;
+                changed = true;
+            } else if let Some(layer) = slide.layer.as_mut().filter(|l| l.rect != bounds) {
+                layer.place(device, bounds)?;
+                changed = true;
+            }
+            changed |= slide.clip_to(clip)?;
+            // Back under the edge: as far as it comes out, so none of it shows
+            let out = travel.max(0.0);
+            match band {
+                Some(band) => changed |= self.push_on(&mut push, band)?,
+                None if push.engaged.is_some() => {
+                    self.push_off(&mut push, "no rail to push")?;
+                    changed = true;
+                }
+                None => {}
+            }
+            if open != slide.open || !slide.wanted {
+                let to = if open { 0.0 } else { out };
+                let (from, speed) = if slide.wanted { at(&slide.x, slide.rest, now) } else { (out, 0.0) };
+                let slider = slide.slider.clone().context("the slide's visual")?;
+                // What the push moves: everything under the tab bar that isn't over the window
+                let pushed = self.pushed();
+                let pushing = push.engaged.is_some();
+                log::info!(
+                    "questions: the bar {} from {from:.1} to {to}, {}",
+                    if open { "out" } else { "back" },
+                    if pushing { "pushing" } else { "pushing nothing" }
+                );
+                if motion.enabled {
+                    let curve = if open { motion.panel_open.clone() } else { motion.panel_close.clone() };
+                    self.name("questions.pane");
+                    slide.x = self.drive(
+                        Motion::new(from, to, speed, curve.clone()),
+                        PIXEL_EPSILON,
+                        0.0,
+                        |a| unsafe { slider.SetOffsetX(a) },
+                        |v| unsafe { slider.SetOffsetX2(v) },
+                    )?;
+                    if pushing {
+                        // The same curve from the same place, `out` to the left of the bar's: one
+                        // animation on every pushed visual, in the bar's commit, so the bar and
+                        // what it pushes stay together (the lbterm-motion skill: edges that meet)
+                        self.name("questions.push");
+                        push.x = self.drive(
+                            Motion::new(from - out, to - out, speed, curve),
+                            PIXEL_EPSILON,
+                            0.0,
+                            |a| {
+                                for visual in pushed {
+                                    unsafe { visual.SetOffsetX(a)? };
+                                }
+                                Ok(())
+                            },
+                            |v| {
+                                for visual in pushed {
+                                    unsafe { visual.SetOffsetX2(v)? };
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                } else {
+                    unsafe { slider.SetOffsetX2(to as f32)? };
+                    slide.x = None;
+                    if pushing {
+                        for visual in pushed {
+                            unsafe { visual.SetOffsetX2((to - out) as f32)? };
+                        }
+                        push.x = None;
+                    }
+                }
+                slide.rest = to;
+                slide.open = open;
+                changed = true;
+            }
+            slide.wanted = true;
+            if changed {
+                self.layers.borrow_mut().changed = true;
+            }
+            Ok(())
+        }
+
+        /// LBTerm: this frame's texture for the questions pane, while it shows
+        pub fn acquire_questions_pane(&self, content: Content<'_>) -> anyhow::Result<Vec<Frame>> {
+            let slide = self.questions_pane_slide.borrow();
+            match (&slide.layer, slide.wanted) {
+                (Some(layer), true) => Ok(layer.frame(Target::QuestionsPane, content)?.into_iter().collect()),
+                _ => Ok(vec![]),
+            }
+        }
+
+        /// LBTerm: whether the questions pane still shows anything at `now`: out, or still on its
+        /// way back under the edge; and when its slide is done, if one is under way
+        pub fn questions_pane_showing(&self, now: Instant) -> (bool, Option<Instant>) {
+            let slide = self.questions_pane_slide.borrow();
+            let settles = slide.x.as_ref().map(|t| t.finishes()).filter(|t| *t > now);
+            (slide.wanted && (slide.open || settles.is_some()), settles)
+        }
+
+        /// LBTerm: what the questions bar's push moves (`Push`): the panes, their outline, `over`
+        /// under the tab bar, the strips' pictures, the objectives' and the context bar's visuals
+        /// (`objectives`) and the tab panel. Not the window strip's swap and hover slots, its card,
+        /// the lights, the readout, the menus and the rest over the window
+        fn pushed(&self) -> [&IDCompositionVisual2; 6] {
+            [&self.panes, &self.focus, &self.over, &self.sides, &self.objectives, &self.panel]
+        }
+
+        /// LBTerm: the push engaged under the tab bar, which ends at `band`: `over` clipped to
+        /// below it, so only that moves, and `over_top` showing `over`'s swapchain above it, which
+        /// stays. Again only when the band or the window's size changed; true when it did
+        fn push_on(&self, push: &mut Push, band: i32) -> anyhow::Result<bool> {
+            let layers = self.layers.borrow();
+            let over = layers.over.as_ref().context("over's layer")?;
+            let (w, h) = (over.rect.w as f32, over.rect.h as f32);
+            if push.engaged == Some((band, over.rect.w, over.rect.h)) {
+                return Ok(false);
+            }
+            let below = match &push.below {
+                Some(clip) => clip.clone(),
+                None => unsafe { self.device.CreateRectangleClip()? },
+            };
+            let above = match &push.above {
+                Some(clip) => clip.clone(),
+                None => unsafe { self.device.CreateRectangleClip()? },
+            };
+            let band = band.clamp(0, over.rect.h as i32) as f32;
+            unsafe {
+                below.SetLeft2(0.0)?;
+                below.SetTop2(band)?;
+                below.SetRight2(w)?;
+                below.SetBottom2(h)?;
+                above.SetLeft2(0.0)?;
+                above.SetTop2(0.0)?;
+                above.SetRight2(w)?;
+                above.SetBottom2(band)?;
+                self.over.SetClip(&below)?;
+                self.over_top.SetContent(&swap_chain(&over.surface)?)?;
+                self.over_top.SetClip(&above)?;
+            }
+            push.below = Some(below);
+            push.above = Some(above);
+            log::info!("questions: the push engaged under the tab bar's band to {band} of a {w}x{h} window");
+            push.engaged = Some((band as i32, over.rect.w, over.rect.h));
+            Ok(true)
+        }
+
+        /// LBTerm: the push let go once the bar is put away: everything it moved back where it
+        /// was, still, `over` whole again and `over_top` showing nothing
+        fn push_off(&self, push: &mut Push, why: &str) -> anyhow::Result<()> {
+            if push.engaged.is_none() {
+                return Ok(());
+            }
+            log::info!("questions: the push let go ({why})");
+            for visual in self.pushed() {
+                unsafe { visual.SetOffsetX2(0.0)? };
+            }
+            unsafe {
+                self.over.SetClip(None::<&IDCompositionClip>)?;
+                self.over_top.SetClip(None::<&IDCompositionClip>)?;
+                self.over_top.SetContent(None::<&IUnknown>)?;
+            }
+            push.engaged = None;
+            push.x = None;
+            Ok(())
         }
 
         /// LBTerm: the container a brief light over `over` goes in
@@ -7907,6 +8384,240 @@ mod imp {
         }
     }
 
+    /// LBTerm: the questions bar's push (Lachlan's 16 of 2026-11-14: "when the question is shown,
+    /// it should push the tab bar off the screen. the conversation would shift left, but never
+    /// change in size"). While the bar comes out from under the window's right edge, everything
+    /// under the tab bar that isn't over the window (`Compositor::pushed`) moves left as far as
+    /// the bar comes out, the rail's strip, on one animation of the bar's curve from the bar's
+    /// commit: the rail goes off the left edge and the conversation comes to rest where it was,
+    /// its size unchanged, no pane resized and nothing drawn again for it. `over`, which holds the
+    /// tab bar too, is cut at the tab bar's bottom while pushed: below moves, and the band above
+    /// shows through `over_top`, `over`'s own swapchain clipped to it, which stays.
+    #[derive(Default)]
+    struct Push {
+        /// Engaged at this band (the tab bar's bottom) and window size
+        engaged: Option<(i32, u32, u32)>,
+        x: Option<Tween>,
+        /// `over`'s clip, below the band, and `over_top`'s, above it
+        below: Option<IDCompositionRectangleClip>,
+        above: Option<IDCompositionRectangleClip>,
+    }
+
+    /// LBTerm: a card that comes out from under an edge it never lies over (the questions pane,
+    /// render/questions_pane.rs): a container at the window's origin holding a clip of where the
+    /// card may show, which ends at the edge, a slider inside it whose offset along x DWM plays,
+    /// and the card's surface inside that at its place at rest. The slider goes from the clip's
+    /// right edge (none of the card shows) to nothing as the card comes out, and back as it goes,
+    /// from wherever it is with its speed, so the card's words move flat with it and nothing
+    /// under it moves. Made the first time it's wanted. (`Slid` is the same three
+    /// visuals for the context bar's parts; the two can be one.)
+    #[derive(Default)]
+    struct EdgeSlide {
+        container: Option<IDCompositionVisual2>,
+        clip: Option<IDCompositionRectangleClip>,
+        /// What the clip lets show, as last set
+        clipped: Option<PixelRect>,
+        slider: Option<IDCompositionVisual2>,
+        layer: Option<Layer>,
+        x: Option<Tween>,
+        /// Where the slider's offset ends up once the slide is done
+        rest: f64,
+        /// Which way it's going: out from under the edge (open), or back under it
+        open: bool,
+        /// It shows a frame this time
+        wanted: bool,
+    }
+
+    impl EdgeSlide {
+        fn make(
+            &mut self,
+            dcomp: &Compositor,
+            parent: &IDCompositionVisual2,
+            instance: &wgpu::Instance,
+            device: &wgpu::Device,
+            base: &wgpu::SurfaceConfiguration,
+            bounds: PixelRect,
+        ) -> anyhow::Result<()> {
+            let container = unsafe { dcomp.device.CreateVisual()? };
+            let clip = unsafe { dcomp.device.CreateRectangleClip()? };
+            let slider = unsafe { dcomp.device.CreateVisual()? };
+            let visual = unsafe { dcomp.device.CreateVisual()? };
+            unsafe {
+                // Nothing shows until its clip is set
+                clip.SetLeft2(0.0)?;
+                clip.SetTop2(0.0)?;
+                clip.SetRight2(0.0)?;
+                clip.SetBottom2(0.0)?;
+                container.SetClip(&clip)?;
+                container.AddVisual(&slider, false, None::<&IDCompositionVisual>)?;
+                slider.AddVisual(&visual, false, None::<&IDCompositionVisual>)?;
+                parent.AddVisual(&container, false, None::<&IDCompositionVisual>)?;
+            }
+            let layer = Layer::new(instance, device, visual, base, wgpu::CompositeAlphaMode::PreMultiplied, bounds)?;
+            self.container = Some(container);
+            self.clip = Some(clip);
+            self.clipped = None;
+            self.slider = Some(slider);
+            self.layer = Some(layer);
+            self.x = None;
+            self.open = false;
+            Ok(())
+        }
+
+        /// Let `rect` of the window show, true when that's new
+        fn clip_to(&mut self, rect: PixelRect) -> anyhow::Result<bool> {
+            if self.clipped == Some(rect) {
+                return Ok(false);
+            }
+            if let Some(clip) = &self.clip {
+                unsafe {
+                    clip.SetLeft2(rect.x as f32)?;
+                    clip.SetTop2(rect.y as f32)?;
+                    clip.SetRight2(rect.x as f32 + rect.w as f32)?;
+                    clip.SetBottom2(rect.y as f32 + rect.h as f32)?;
+                }
+            }
+            self.clipped = Some(rect);
+            Ok(true)
+        }
+
+        /// Put away: nothing of it shows, and the next time it's wanted it comes out from under
+        /// the edge again
+        fn hide(&mut self) -> anyhow::Result<()> {
+            if let Some(clip) = &self.clip {
+                unsafe {
+                    clip.SetLeft2(0.0)?;
+                    clip.SetTop2(0.0)?;
+                    clip.SetRight2(0.0)?;
+                    clip.SetBottom2(0.0)?;
+                }
+            }
+            self.clipped = None;
+            self.x = None;
+            self.wanted = false;
+            self.open = false;
+            Ok(())
+        }
+    }
+
+    /// LBTerm: one of the context bar's moving parts (render/context_bar.rs): a container at the
+    /// window's origin holding the clip, a visual inside it whose offset along x slides, and the
+    /// surface inside that at its place in the window. Made the first time it's wanted.
+    ///
+    /// The thin numbers' pane's has one more visual over its container, `follow`, whose offset
+    /// along x DWM plays from the widened bar's own animation (`prepare_context_bar` hands the
+    /// bar's slider and it the one animation, in one commit), so its clip, which ends on the
+    /// widened bar's left ring, is where the bar's moving left edge is at every frame, and the
+    /// thin pane comes out from under that edge in the bar's slide, sliding its own way inside
+    /// (Lachlan's E9 of 2026-11-10). A clip of its own animated on a second curve sampled from
+    /// the same spring would end apart from the bar's by their epsilons; the one animation can't
+    #[derive(Default)]
+    struct Slid {
+        follow: Option<IDCompositionVisual2>,
+        container: Option<IDCompositionVisual2>,
+        clip: Option<IDCompositionRectangleClip>,
+        /// What the clip lets show, as last set
+        clipped: Option<PixelRect>,
+        slider: Option<IDCompositionVisual2>,
+        layer: Option<Layer>,
+        x: Option<Tween>,
+        /// Where its offset ends up once the slide is done
+        rest: f64,
+        /// Which way it's going: in, or out
+        open: bool,
+        /// It shows a frame this time
+        wanted: bool,
+    }
+
+    impl Slid {
+        fn make(
+            &mut self,
+            dcomp: &Compositor,
+            instance: &wgpu::Instance,
+            device: &wgpu::Device,
+            base: &wgpu::SurfaceConfiguration,
+            bounds: PixelRect,
+            follows: bool,
+        ) -> anyhow::Result<()> {
+            let follow = if follows { Some(unsafe { dcomp.device.CreateVisual()? }) } else { None };
+            let container = unsafe { dcomp.device.CreateVisual()? };
+            let clip = unsafe { dcomp.device.CreateRectangleClip()? };
+            let slider = unsafe { dcomp.device.CreateVisual()? };
+            let visual = unsafe { dcomp.device.CreateVisual()? };
+            unsafe {
+                // Nothing shows until its clip is set
+                clip.SetLeft2(0.0)?;
+                clip.SetTop2(0.0)?;
+                clip.SetRight2(0.0)?;
+                clip.SetBottom2(0.0)?;
+                container.SetClip(&clip)?;
+                container.AddVisual(&slider, false, None::<&IDCompositionVisual>)?;
+                slider.AddVisual(&visual, false, None::<&IDCompositionVisual>)?;
+                match &follow {
+                    Some(follow) => {
+                        follow.AddVisual(&container, false, None::<&IDCompositionVisual>)?;
+                        dcomp.objectives.AddVisual(follow, false, None::<&IDCompositionVisual>)?;
+                    }
+                    None => dcomp.objectives.AddVisual(&container, false, None::<&IDCompositionVisual>)?,
+                }
+            }
+            let layer = Layer::new(instance, device, visual, base, wgpu::CompositeAlphaMode::PreMultiplied, bounds)?;
+            self.follow = follow;
+            self.container = Some(container);
+            self.clip = Some(clip);
+            self.clipped = None;
+            self.slider = Some(slider);
+            self.layer = Some(layer);
+            self.x = None;
+            self.open = false;
+            Ok(())
+        }
+
+        /// Let `rect` of the window show, true when that's new
+        fn clip_to(&mut self, rect: PixelRect) -> anyhow::Result<bool> {
+            if self.clipped == Some(rect) {
+                return Ok(false);
+            }
+            if let Some(clip) = &self.clip {
+                unsafe {
+                    clip.SetLeft2(rect.x as f32)?;
+                    clip.SetTop2(rect.y as f32)?;
+                    clip.SetRight2(rect.x as f32 + rect.w as f32)?;
+                    clip.SetBottom2(rect.y as f32 + rect.h as f32)?;
+                }
+            }
+            self.clipped = Some(rect);
+            Ok(true)
+        }
+
+        /// Put away: nothing of it shows, and the next time it's wanted it starts again from out
+        fn hide(&mut self) -> anyhow::Result<()> {
+            if let Some(clip) = &self.clip {
+                unsafe {
+                    clip.SetLeft2(0.0)?;
+                    clip.SetTop2(0.0)?;
+                    clip.SetRight2(0.0)?;
+                    clip.SetBottom2(0.0)?;
+                }
+            }
+            self.clipped = None;
+            self.x = None;
+            self.wanted = false;
+            self.open = false;
+            Ok(())
+        }
+    }
+
+    /// LBTerm: the context bar's four moving parts (`Target::ContextBar(0..4)`): its pane, the
+    /// widened bar, the riding scroll strip and the pane of thin sections' numbers
+    #[derive(Default)]
+    struct ContextLayers {
+        pane: Slid,
+        drawer: Slid,
+        ride: Slid,
+        thin: Slid,
+    }
+
     /// LBTerm: each menu slot's names for the state file's motion: its fade, its highlight's
     /// glide and its highlight's light (render/menu_fade.rs, `Slot`)
     const MENU_NAMES: [(&str, &str, &str, &str); MENU_SLOTS] = [
@@ -8295,7 +9006,7 @@ mod imp {
             _instance: &wgpu::Instance,
             _device: &wgpu::Device,
             _base: &wgpu::SurfaceConfiguration,
-            _cards: [Option<(PixelRect, bool)>; 4],
+            _cards: [Option<(PixelRect, bool)>; crate::termwindow::render::objectives::CARDS],
             _motion: &MotionSettings,
         ) -> anyhow::Result<()> {
             match *self {}
@@ -8306,6 +9017,30 @@ mod imp {
         }
 
         pub fn objectives_showing(
+            &self,
+            _now: std::time::Instant,
+        ) -> ([bool; crate::termwindow::render::objectives::CARDS], Option<std::time::Instant>) {
+            match *self {}
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn prepare_context_bar(
+            &self,
+            _instance: &wgpu::Instance,
+            _device: &wgpu::Device,
+            _base: &wgpu::SurfaceConfiguration,
+            _visuals: crate::termwindow::render::context_bar::Visuals,
+            _ride: Option<(PixelRect, PixelRect, i32)>,
+            _motion: &MotionSettings,
+        ) -> anyhow::Result<()> {
+            match *self {}
+        }
+
+        pub fn acquire_context_bar(&self, _content: Content<'_>) -> anyhow::Result<Vec<Frame>> {
+            match *self {}
+        }
+
+        pub fn context_bar_showing(
             &self,
             _now: std::time::Instant,
         ) -> ([bool; 4], Option<std::time::Instant>) {
@@ -8375,6 +9110,28 @@ mod imp {
         }
 
         pub fn tasks_card_showing(
+            &self,
+            _now: std::time::Instant,
+        ) -> (bool, Option<std::time::Instant>) {
+            match *self {}
+        }
+
+        pub fn prepare_questions_pane(
+            &self,
+            _instance: &wgpu::Instance,
+            _device: &wgpu::Device,
+            _base: &wgpu::SurfaceConfiguration,
+            _want: Option<crate::termwindow::render::questions_pane::BarVisual>,
+            _motion: &MotionSettings,
+        ) -> anyhow::Result<()> {
+            match *self {}
+        }
+
+        pub fn acquire_questions_pane(&self, _content: Content<'_>) -> anyhow::Result<Vec<Frame>> {
+            match *self {}
+        }
+
+        pub fn questions_pane_showing(
             &self,
             _now: std::time::Instant,
         ) -> (bool, Option<std::time::Instant>) {

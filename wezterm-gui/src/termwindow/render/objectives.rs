@@ -35,16 +35,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use window::color::LinearRgba;
 
-/// The closed strip: the panes' colour, its ring, the marks and the projects pad, in `over`, and
-/// the scroll strip beside it (render/sides.rs draws them all)
+/// The closed strip: the panes' colour, its ring and the marks, in `over`, and the scroll strip
+/// beside it (render/sides.rs draws them all). The projects pad was on it until 2026-11-08 (it's
+/// on the window strip's second row now, render/projects.rs)
 pub(crate) const STRIP_Z: i8 = 38;
 /// Each card's shadow, card and words: the list's, the detail's, the projects card's
-/// (render/projects.rs). With the compositor each card's are its visual's alone
-/// (`Target::Objectives`)
-pub(crate) const CARD: [[i8; 3]; 4] = [[39, 40, 41], [42, 43, 44], [27, 28, 29], [16, 17, 18]];
+/// (render/projects.rs, whose pad is on the window strip but whose card is still one of these, the
+/// objectives strip on or not), the scroll strip's and the cost pane's (render/cost.rs). With the
+/// compositor each card's are its visual's alone (`Target::Objectives`), so a number in a row is
+/// claimed for that card: a row added takes numbers no other owner has (render/composited.rs's
+/// `every_z_layer_has_one_owner_at_most` holds it; the cost pane's were the tasks card's 80 to 82
+/// until 2026-11-09, which sent the rail's tasks card into the cost pane's visual and so drew it
+/// nowhere, lbterm/PITFALLS.md 300). The cost pane's 5 to 7 are below every floating card's, as
+/// the other cards' are below the tab panel's, so drawn frame by frame (the compositor off) the
+/// open rail, the Conductor's view and a hover card cover it
+pub(crate) const CARD: [[i8; 3]; CARDS] = [[39, 40, 41], [42, 43, 44], [27, 28, 29], [16, 17, 18], [5, 6, 7]];
+/// How many cards there are, each a visual of the compositor's objectives group
+pub(crate) const CARDS: usize = 5;
 
 /// Which card a z-layer is: 0 the list, 1 the detail, 2 the projects card, 3 the scroll strip's
-/// (render/scroll_strip.rs)
+/// (render/scroll_strip.rs), 4 the cost pane (render/cost.rs)
 pub fn card_of(zindex: i8) -> Option<usize> {
     CARD.iter().position(|c| c.contains(&zindex))
 }
@@ -62,9 +72,17 @@ pub(crate) const ROW_HOVER_ALPHA: f32 = 0.06;
 /// The strip's ring under the pointer or open: its grey this far to white
 const STRIP_LIT: f64 = 0.35;
 
-/// Whether the panel is on: asked for, with the tab panel to line up with and summaries to read
+/// Whether the panel is on: asked for, with the tab panel to line up with and summaries to read,
+/// and the context bar not taking its room (render/context_bar.rs; lbterm/CONTEXT.md, "Turning it
+/// on"), which the log says once
 fn on(config: &ConfigHandle) -> bool {
-    config.lbterm_objectives.is_some() && config.lbterm_tab_panel.enabled && config.lbterm_summaries.is_some()
+    let asked = config.lbterm_objectives.is_some() && config.lbterm_tab_panel.enabled && config.lbterm_summaries.is_some();
+    if asked && super::context_bar::on(config) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| log::info!("objectives: lbterm_context_bar takes the objectives strip's room, so the strip isn't drawn"));
+        return false;
+    }
+    asked
 }
 
 /// The strip's own width, its ring included, in pixels
@@ -111,10 +129,8 @@ pub struct ObjectivesState {
     wake: Option<Instant>,
     /// A button went down on the panel: its release is the panel's too
     pressed: bool,
-    /// The projects pad at the top of the strip, and its card (render/projects.rs)
-    pub(crate) projects: super::projects::ProjectsState,
     /// Each card's words as its last frame laid them out, in `CARD`'s order (render/words.rs)
-    pub(crate) words: [std::cell::RefCell<super::words::Words>; 4],
+    pub(crate) words: [std::cell::RefCell<super::words::Words>; CARDS],
 }
 
 impl Default for ObjectivesState {
@@ -131,7 +147,6 @@ impl Default for ObjectivesState {
             visuals: [None, None],
             wake: None,
             pressed: false,
-            projects: Default::default(),
             words: Default::default(),
         }
     }
@@ -200,7 +215,6 @@ impl crate::TermWindow {
                 (state.strip, state.list, state.detail, state.row) = (None, None, None, None);
                 state.marks.clear();
                 state.visuals = [None, None];
-                state.projects.reset();
                 return Ok(());
             }
         };
@@ -253,12 +267,10 @@ impl crate::TermWindow {
             self.webgpu
                 .as_ref()
                 .and_then(|w| w.compositor.as_ref())
-                .map_or(([false; 4], None), |c| c.objectives_showing(Instant::now()))
+                .map_or(([false; CARDS], None), |c| c.objectives_showing(Instant::now()))
         } else {
-            ([false; 4], None)
+            ([false; CARDS], None)
         };
-        // The projects pad on the strip, and its card (render/projects.rs)
-        self.paint_lbterm_projects(&layout, strip, surface, fading[2], scale)?;
         if !open {
             self.lbterm_objectives.row = None;
         }
@@ -308,11 +320,7 @@ impl crate::TermWindow {
         }
         // A card closing is drawn until it has faded, then not
         self.lbterm_objectives_wake(settles);
-        let due = [self.lbterm_objectives.hover.deadline(), self.lbterm_objectives.projects.deadline()]
-            .iter()
-            .flatten()
-            .min()
-            .copied();
+        let due = self.lbterm_objectives.hover.deadline();
         self.lbterm_objectives_wake(due);
         Ok(())
     }
@@ -572,9 +580,9 @@ impl crate::TermWindow {
 
     /// Where each card's visual goes this frame and whether it's opening, for the compositor: the
     /// list, the detail, the projects card, the scroll strip's card (render/scroll_strip.rs)
-    pub(crate) fn lbterm_objectives_visuals(&self) -> [Option<(PixelRect, bool)>; 4] {
+    pub(crate) fn lbterm_objectives_visuals(&self) -> [Option<(PixelRect, bool)>; CARDS] {
         let [list, detail] = self.lbterm_objectives.visuals;
-        [list, detail, self.lbterm_objectives.projects.visual(), self.lbterm_scroll_strip_visual()]
+        [list, detail, self.lbterm_projects.visual(), self.lbterm_scroll_strip_visual(), self.lbterm_cost.visual()]
     }
 
     /// The pointer moved, pressed or released: the list opens once it has rested on the strip
@@ -586,24 +594,13 @@ impl crate::TermWindow {
         };
         // A drag that began elsewhere carries on over the panel without opening it
         let busy = self.current_mouse_capture.is_some() || self.window_drag_position.is_some() || self.dragging.is_some();
-        // The projects pad at the top of the strip, and its card, first (render/projects.rs): the
-        // objectives' cards close while the pointer's there
-        if self.lbterm_projects_mouse(event, context, busy) {
-            if self.lbterm_objectives.hover.pointer(false, Instant::now()) {
-                context.lbterm_invalidate();
-            }
-            let due = self.lbterm_objectives.hover.deadline();
-            self.lbterm_objectives_wake(due);
-            return true;
-        }
         if let WMEK::Release(_) = event.kind {
             if std::mem::take(&mut self.lbterm_objectives.pressed) {
                 return true;
             }
         }
         let (x, y) = (event.coords.x as f64, event.coords.y as f64);
-        // The strip and the gutters either side of it, to the window's edge, but the pad's zone;
-        // while the list is open, the scroll strip too, which the pointer crosses on its way to
+        // The strip and the gutters either side of it, to the window's edge; while the list is open, the scroll strip too, which the pointer crosses on its way to
         // the list (render/scroll_strip.rs)
         let gutter = self.lbterm_shape().gutter() as f64;
         let bridge = if self.lbterm_objectives.hover.is_open() {
@@ -611,11 +608,22 @@ impl crate::TermWindow {
         } else {
             0.0
         };
-        let on_pad = self.lbterm_objectives.projects.zone().map_or(false, |z| y >= z.y && y < z.y + z.h);
-        let on_strip = !on_pad && x >= strip.x - gutter - bridge && y >= strip.y && y < strip.y + strip.h;
+        let on_strip = x >= strip.x - gutter - bridge && y >= strip.y && y < strip.y + strip.h;
         let on_list = self.lbterm_objectives.list.as_ref().map_or(false, |l| l.rect.contains(x, y));
         let on_detail = self.lbterm_objectives.detail.as_ref().map_or(false, |d| d.rect.contains(x, y));
         let inside = !busy && (on_strip || on_list || on_detail);
+        // A press on the bridge is the scroll strip's (Lachlan's E2 of 2026-11-10): the bridge
+        // carries a pointer crossing the scroll strip to the list, but a click there was taken
+        // here and did nothing. The cards shut at once and the press goes on to
+        // render/scroll_strip.rs, which goes to the mark or the place under it as it would with
+        // the cards shut; its release finds the bridge gone with them
+        let on_bridge = on_strip && x < strip.x - gutter && !on_list && !on_detail;
+        if !busy && on_bridge && matches!(event.kind, WMEK::Press(_)) {
+            if self.lbterm_objectives.hover.close() {
+                context.lbterm_invalidate();
+            }
+            return false;
+        }
         let now = Instant::now();
         let mut changed = self.lbterm_objectives.hover.pointer(inside, now);
         let open = self.lbterm_objectives.hover.is_open();
@@ -673,11 +681,9 @@ impl crate::TermWindow {
         }
         let due = self.lbterm_objectives.hover.deadline();
         self.lbterm_objectives_wake(due);
-        self.lbterm_projects_mouse_leave();
     }
 
-    /// Repaint at `at`: when a hover's wait is up (the objectives' or the projects card's), or a
-    /// card has faded
+    /// Repaint at `at`: when the hover's wait is up, or a card has faded
     pub(crate) fn lbterm_objectives_wake(&mut self, at: Option<Instant>) {
         let Some(at) = at else {
             return;
@@ -695,9 +701,7 @@ impl crate::TermWindow {
                 if tw.lbterm_objectives.wake == Some(at) {
                     tw.lbterm_objectives.wake = None;
                 }
-                let now = Instant::now();
-                tw.lbterm_objectives.hover.tick(now);
-                tw.lbterm_objectives.projects.tick(now);
+                tw.lbterm_objectives.hover.tick(Instant::now());
                 if let Some(window) = tw.window.as_ref() {
                     window.invalidate();
                 }
@@ -743,16 +747,12 @@ impl crate::TermWindow {
                 lines: d.lines.iter().map(|l| l.text.clone()).collect(),
             }),
             hovered: state.row,
-            projects: self.lbterm_state_projects(),
         })
     }
 
-    /// What of the panel is at `x`, `y`, for the state file's pointer: the projects card or pad, a
-    /// card (with the list's row) or the strip
+    /// What of the panel is at `x`, `y`, for the state file's pointer: a card (with the list's row)
+    /// or the strip
     pub(crate) fn lbterm_objectives_under(&self, x: f64, y: f64) -> Option<(&'static str, Option<usize>)> {
-        if let Some(under) = self.lbterm_projects_under(x, y) {
-            return Some(under);
-        }
         let state = &self.lbterm_objectives;
         if state.detail.as_ref().map_or(false, |d| d.rect.contains(x, y)) {
             return Some(("objectives.detail", state.row));
@@ -775,15 +775,12 @@ impl crate::TermWindow {
             lbterm_panel::Phase::Closing => Some("objectives.close"),
             _ => None,
         };
-        let mut waits: Vec<_> = name
-            .zip(hover.deadline())
+        name.zip(hover.deadline())
             .map(|(name, due)| lbterm_extras::state::Wait {
                 name: name.to_string(),
                 left_ms: lbterm_extras::state::millis(due.saturating_duration_since(now)),
             })
             .into_iter()
-            .collect();
-        waits.extend(self.lbterm_projects_waits(now));
-        waits
+            .collect()
     }
 }

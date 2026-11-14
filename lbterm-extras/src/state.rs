@@ -144,6 +144,16 @@ pub struct Window {
     pub objectives: Option<Objectives>,
     /// The scroll strip left of it, with `lbterm_scroll_strip` on (lbterm/SCROLL-STRIP.md)
     pub scroll_strip: Option<ScrollStrip>,
+    /// The context bar in the objectives strip's room, with `lbterm_context_bar` on
+    /// (lbterm/CONTEXT.md, "The context bar")
+    pub context_bar: Option<ContextBar>,
+    /// The projects pad on the strip's second row and its card, with `lbterm_projects` set
+    /// (lbterm/OBJECTIVES.md, "The projects card"); `objectives.projects` until the pad left the
+    /// objectives strip (2026-11-08)
+    pub projects: Option<ProjectsCard>,
+    /// The cost pane the context pill's press opens, while the pill shows (lbterm/CONTEXT.md, "The
+    /// cost pane")
+    pub cost: Option<CostPane>,
     /// The menu that's open: the tab menu, the list of prompts or the Conductor's
     pub menu: Option<Menu>,
     /// An upstream overlay or modal over the panes: "launcher", "search", "copy_mode", ...
@@ -154,6 +164,10 @@ pub struct Window {
     pub landed: Option<Landed>,
     /// The pane whose question colours are shown
     pub questions: Option<u64>,
+    /// The questions pane down the window's right while a hold shows the colours
+    /// (lbterm/QUESTIONS.md, "The questions pane")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub questions_pane: Option<QuestionsPane>,
     /// Hearts in the air (the triggers' easter egg)
     pub hearts: usize,
     /// The Conductor's view, while it's open in this window (lbterm/TAB-PANEL.md, "The
@@ -221,6 +235,33 @@ pub struct Visuals {
     pub stale: Option<usize>,
 }
 
+/// The questions pane, as its frame drew it (lbterm/QUESTIONS.md, "The questions pane")
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuestionsPane {
+    /// The card, its ring included
+    pub rect: Rect,
+    /// Each row shown, top to bottom
+    pub rows: Vec<QuestionsPaneRow>,
+    /// The rows that didn't fit, which its last line counts ("+3")
+    pub more: usize,
+}
+
+/// One question in the questions pane
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuestionsPaneRow {
+    /// As its chip says it: "Q1", "2", "E4"
+    pub label: String,
+    /// Its colour's place in lbterm_extras::questions::COLOURS, its bands' too
+    pub colour: usize,
+    /// A tick (true) or the open mark
+    pub answered: bool,
+    /// How many asking replies came after its own: 0 for the newest
+    pub age: usize,
+    /// "up" or "down" while its own words are above or below the screen, as the bar's arrow
+    /// says (Lachlan's E15 of 2026-11-14); none while they're on it or which way isn't known
+    pub arrow: Option<&'static str>,
+}
+
 /// The ring round the next question a voice draft should answer (lbterm/QUESTIONS.md)
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NextQuestion {
@@ -237,8 +278,6 @@ pub struct NextQuestion {
 pub struct DraftCard {
     /// The pane, by the mux server's id
     pub pane: u64,
-    /// "text" or "picker"
-    pub kind: String,
     /// What it says, new lines and all
     pub text: String,
     pub rect: Rect,
@@ -509,6 +548,20 @@ pub struct Pane {
     pub session: Option<String>,
     /// What it reports with OSC 9;4: "42%", "error 42%", "indeterminate", "paused 42%"
     pub progress: Option<String>,
+    /// The weights its last frame drew (lbterm/QUESTIONS.md, "The weights"): each option's share
+    /// of 100 coloured in it, top first; none in a pane with no Claude session
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<Weight>,
+}
+
+/// An option's share of 100 drawn in its colour in a Claude pane
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Weight {
+    /// Its row, from the pane's top as drawn
+    pub row: i64,
+    /// Its digits' first column
+    pub col: usize,
+    pub share: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -569,6 +622,137 @@ pub struct ScrollCard {
     pub lines: Vec<String>,
 }
 
+/// The context bar: the open tab's Claude Code conversation's whole context window, top to
+/// bottom, a section for each file in it, then Claude Code's own parts, the conversation and free
+/// space (lbterm/CONTEXT.md, "The context bar").
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextBar {
+    /// The bar at rest, its ring included
+    pub rect: Rect,
+    /// Inside its ring, where the sections go: the whole window, top to bottom
+    pub track: Rect,
+    /// The conversation it stands for, the open tab's; none while the tab has none
+    pub session: Option<String>,
+    /// What it waits for before it can say anything, in the pane's words, while it draws only its
+    /// track (lbterm_extras::context_bar::Waiting)
+    pub waiting: Option<String>,
+    /// What's in use and the window's size, in tokens, once known
+    pub in_use: Option<u64>,
+    pub window: Option<u64>,
+    /// Whether what's in use is an estimate: after a compaction, until the next reply
+    pub estimate: bool,
+    /// The conversation's scale: the first request's real size over its characters over four
+    pub scale: Option<f64>,
+    /// How far down the track the filled part ends, in pixels: what's in use of the window
+    pub filled: u32,
+    /// Every section in the bar's order, free last
+    pub sections: Vec<ContextSection>,
+    /// How many times the window has laid the bar's sections out: only when they or the track
+    /// change, never for a frame painted for anything else
+    pub layouts: u64,
+    /// The widened bar's drawer of labels, while it's out (or sliding back in)
+    pub widened: Option<ContextDrawer>,
+    /// The pane, while it's out (or sliding back in)
+    pub pane: Option<ContextPane>,
+    /// The section under the pointer, on the bar, the drawer or the pane: its row is lit
+    pub lit: Option<usize>,
+    /// How far left of its own place the scroll strip rides, in pixels: to the drawer's or the
+    /// pane's left edge while they're out, 0 at rest
+    pub ride: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextDrawer {
+    /// The bar widened to the closed rail's width (Lachlan's 4b of 2026-11-09), its ring included
+    pub rect: Rect,
+    /// Each section's tokens, top first: on its own section where it has a line's room, else in
+    /// the pane beside the bar (`thin`); the smallest of those left out when they don't all fit
+    pub labels: Vec<ContextLabel>,
+    /// The pane as wide as the bar, left of it, with the numbers of sections too thin for theirs:
+    /// none while every number is on its section
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thin: Option<Rect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextLabel {
+    /// Its section, in `sections`
+    pub section: usize,
+    pub text: String,
+    pub rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextPane {
+    pub rect: Rect,
+    /// What's in use of the window (`312k of 1M in use · 31%`), or what the bar waits for
+    pub heading: String,
+    /// A row for every section in the bar's order, as many as fit
+    pub rows: Vec<ContextRow>,
+    /// Sections scrolled out above by the wheel: the first row is section `above`
+    pub above: usize,
+    /// Sections left out below for want of room
+    pub left_out: usize,
+    /// Whether the totals (Claude Code's parts, the conversation, free) are pinned at the foot under
+    /// a rule while only the files scroll, which they are when the rows don't all fit (Lachlan's
+    /// 3a of 2026-11-09); `above` and `left_out` then count files
+    pub pinned: bool,
+    /// Compact now, at its foot
+    pub compact: Option<ContextCompact>,
+}
+
+/// The pane's Compact now (lbterm/CONTEXT.md, "The buttons")
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextCompact {
+    pub rect: Rect,
+    /// Whether a press types `/compact` into the tab now
+    pub enabled: bool,
+    /// Why not, or what happened, in the pane's words: "Claude is working", "Sent /compact" ...
+    pub why: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextRow {
+    /// Its section, in `sections`
+    pub section: usize,
+    /// The pane's word for its kind: "user", "memory index", "pulled in", "system prompt" ...
+    pub kind: String,
+    /// Its path as shown, the home folder as `~`
+    pub path: Option<String>,
+    /// Its tokens as shown: `≈9.8k`
+    pub tokens: String,
+    /// Its button's words, "Remove", or "Undo" once its line is out; none for a section that
+    /// has none
+    pub button: Option<String>,
+    pub note: Option<String>,
+    pub rect: Rect,
+    /// Under the pointer, on the bar or the pane
+    pub lit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ContextSection {
+    /// "user", "project", "import", "local", "managed", "memory_index", "memory", "pulled_in",
+    /// "elsewhere" (another project's pulled-in CLAUDE.md), "system", "tools", "skills",
+    /// "conversation" or "free"
+    pub kind: String,
+    /// A file's path as Claude Code wrote it; none for the rest
+    pub path: Option<String>,
+    /// Its tokens: an estimate, but for what's in use, which the conversation's makes up
+    pub tokens: u64,
+    /// Where it's drawn at rest: its run's, shared with the neighbours of its colour it's drawn
+    /// with when the least heights don't fit; none for free space and an empty section
+    pub rect: Option<Rect>,
+    /// Its colour, `#RRGGBB`
+    pub colour: String,
+    /// "remove" for a memory file Claude read or an imported file; none for the rest
+    pub button: Option<String>,
+    /// Its line taken off the file that loads it, by its Remove button
+    pub removed: bool,
+    /// The pane's second line for it: a pulled-in file's "Leaves at the next compaction"
+    pub note: Option<String>,
+}
+
 /// The objectives panel: its strip and the marks on it, and its cards while they're open.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Objectives {
@@ -582,16 +766,65 @@ pub struct Objectives {
     pub detail: Option<ObjectivesDetail>,
     /// The rail row under the pointer, whose detail shows
     pub hovered: Option<usize>,
-    /// The projects pad on the strip and its card, with `lbterm_projects` set
-    pub projects: Option<ProjectsCard>,
+}
+
+/// The cost pane (lbterm/CONTEXT.md, "The cost pane"): the context pill, and the pane while it's
+/// open or fading out
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CostPane {
+    /// The pill's bounds, what a press opens it from
+    pub pill: Rect,
+    /// LBTerm counts the cost itself (`lbterm_context.count_cost`): the pane shows its count.
+    /// False (the default) it shows the Claude project's split (`@Claude:cost`), and nothing of
+    /// the count runs
+    pub count: bool,
+    /// Whose split the open pane shows: `count` LBTerm's own, `claude` the Claude project's
+    /// `<sid>.cost.json`; `None` while it shows neither (being counted or read, or none to show,
+    /// its `note` saying why)
+    pub source: Option<&'static str>,
+    pub open: bool,
+    pub rect: Option<Rect>,
+    /// What it says in place of a split: counting or reading, or why there's none (with the count
+    /// off, the pill's dollars and window above it)
+    pub note: Option<String>,
+    /// The split's total: the own count's to the millionth, the Claude project's to the cent
+    pub total: Option<f64>,
+    /// His turns, subagents, workflows, then the compactions (no dollars: none are recorded)
+    pub rows: Vec<CostRow>,
+    pub compactions: usize,
+    /// Each compaction's name on the graph, its sizes (`545k → 55k`, `545k → …` until the request
+    /// after it), whether or not it found room there; `None` for one with no size recorded
+    pub compacted: Vec<Option<String>>,
+    /// The graph's plot, and how many steps and marks are on it
+    pub graph: Option<Rect>,
+    pub steps: usize,
+    pub marks: Vec<String>,
+    /// The words drawn, in order, for a test to read them
+    pub words: Vec<String>,
+}
+
+/// A row of the cost pane: what spent it, its runs, its dollars and its tokens by type
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CostRow {
+    pub spender: String,
+    pub runs: usize,
+    pub usd: f64,
+    pub input: u64,
+    pub writes: u64,
+    pub reads: u64,
+    pub output: u64,
+    pub rect: Rect,
 }
 
 /// The projects card (lbterm/OBJECTIVES.md, "The projects card").
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProjectsCard {
-    /// The pad's zone across the strip: what the pointer rests on to open the card
+    /// The pad on the strip's second row, its pill's bounds: what the pointer rests on to open
+    /// the card
     pub pad: Rect,
     pub open: bool,
+    /// The card while it's open, hanging under the strip from the pad
+    pub card: Option<Rect>,
     /// The card's rows while it's open, busiest first
     pub rows: Vec<ProjectRow>,
     /// "15 more, quieter", when they don't all fit
@@ -814,6 +1047,10 @@ pub struct RailRow {
     /// What its Claude conversation has cost, "$12.34", at its second line's end on the open
     /// panel; empty until the statusline has said
     pub cost: String,
+    /// How long ago Lachlan last prompted its Claude session, "4 min", at the start of its open
+    /// row's first line (lbterm/TAB-PANEL.md, "What a row says"); empty while it isn't known, as
+    /// for a tab without Claude
+    pub prompted: String,
     pub active: bool,
     pub hovered: bool,
     /// The tab menu's colour round its pad, "#rrggbb"
@@ -1345,11 +1582,15 @@ mod test {
             strip: None,
             objectives: None,
             scroll_strip: None,
+            context_bar: None,
+            projects: None,
+            cost: None,
             menu: None,
             overlay: None,
             readout: None,
             landed: None,
             questions: None,
+            questions_pane: None,
             hearts: 0,
             conductor_view: None,
             tasks: None,

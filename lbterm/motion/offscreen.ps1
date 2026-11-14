@@ -61,6 +61,9 @@ function Get-LookalikeConfig {
 # lbterm.lua would reload the window mid-run, re-running his whole config and putting "Config
 # reloaded" in the strip. A test of reloading turns it back on and gives its config a folder of
 # its own (perf/strip-feedback.ps1).
+# His lbterm_scroll_strip stays as he has it ({}), so the conversations' reader is on and reads his
+# real ~/.claude/projects: a script that sets a claude_session on a pane gives
+# lbterm_scroll_strip a transcripts folder of its own (perf/questions.ps1, PITFALLS 362).
 # -Lua adds lines after it, as `config.x = y`, with `wezterm` in scope. Pass the file with
 # `--config-file`, which also keeps ~\.lbterm.lua from loading.
 function New-TestConfig {

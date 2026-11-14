@@ -95,7 +95,6 @@ impl super::TermWindow {
             || self.lbterm_conductor_menu_mouse(&event, context)
             || self.lbterm_inbox_list_mouse(&event, context)
             || self.lbterm_agenda_list_mouse(&event, context)
-            || self.lbterm_context_list_mouse(&event, context)
             || self.lbterm_new_tab_mouse(&event, context)
             || self.lbterm_tab_drag_mouse(&event, context)
             || self.lbterm_link_drag_mouse(&event, context)
@@ -117,9 +116,40 @@ impl super::TermWindow {
             return;
         }
 
+        // LBTerm: the context pill on the strip's second row, whose press opens the cost pane,
+        // and the pane while it's open (render/cost.rs): before the projects pad and the strip's
+        // own items, so nothing under the pane gets a click
+        if self.lbterm_cost_mouse(&event, context) {
+            if let Some(prior) = self.last_ui_item.take() {
+                self.leave_ui_item(&prior);
+                context.lbterm_invalidate();
+            }
+            return;
+        }
+
+        // LBTerm: the projects pad on the strip's second row, and its card while it's open
+        // (render/projects.rs): before the strip's own items, the objectives strip and the tab
+        // panel, so a rest on the pad opens it and nothing under the card gets a click
+        if self.lbterm_projects_mouse(&event, context) {
+            if let Some(prior) = self.last_ui_item.take() {
+                self.leave_ui_item(&prior);
+                context.lbterm_invalidate();
+            }
+            return;
+        }
+
         // LBTerm: the objectives panel down the right, and its cards while they're open
         // (render/objectives.rs)
         if self.lbterm_objectives_mouse(&event, context) {
+            if let Some(prior) = self.last_ui_item.take() {
+                self.leave_ui_item(&prior);
+                context.lbterm_invalidate();
+            }
+            return;
+        }
+        // LBTerm: the context bar in the objectives strip's room, when it's on
+        // (render/context_bar.rs)
+        if self.lbterm_context_bar_mouse(&event, context) {
             if let Some(prior) = self.last_ui_item.take() {
                 self.leave_ui_item(&prior);
                 context.lbterm_invalidate();
@@ -239,10 +269,14 @@ impl super::TermWindow {
                     y_pixel_offset,
                 };
 
-                let click = match self.last_mouse_click.take() {
-                    None => LastMouseClick::new(button, click_position),
-                    Some(click) => click.add(button, click_position),
-                };
+                // LBTerm: the streak held at the longest the bindings name for the button, so
+                // a binding for streaks 1 to 3 takes every quick press (config/src/lbterm.rs)
+                let click = config::lbterm::count_click(
+                    self.last_mouse_click.take(),
+                    button,
+                    click_position,
+                    self.input_map.mouse.keys().map(|(trigger, _)| trigger),
+                );
                 self.last_mouse_click = Some(click);
                 self.current_mouse_buttons.retain(|p| p != press);
                 self.current_mouse_buttons.push(*press);
@@ -340,6 +374,9 @@ impl super::TermWindow {
         self.lbterm_strip_mouse_leave();
         self.lbterm_view_mouse_leave();
         self.lbterm_objectives_mouse_leave();
+        self.lbterm_projects_mouse_leave();
+        self.lbterm_cost_mouse_leave();
+        self.lbterm_context_bar_mouse_leave();
         self.lbterm_scroll_strip_mouse_leave();
         self.current_mouse_event = None;
         self.update_title();
@@ -576,9 +613,10 @@ impl super::TermWindow {
                     self.lbterm_budget_agenda();
                     self.lbterm_agenda_toggle()
                 }
-                // LBTerm: the pill under the InMail button lists the files in the open tab's
-                // Claude context (render/context.rs)
-                TabBarItem::LbtermContext => self.lbterm_context_toggle(),
+                // LBTerm: the pill under the InMail button does nothing when pressed (Lachlan's
+                // 5a of 2026-11-08: the context bar shows what fills the context); the projects
+                // pad beside it takes its own events first (render/projects.rs)
+                TabBarItem::LbtermContext | TabBarItem::LbtermProjects => {}
                 // LBTerm: the strip's words are the strip's (render/strip.rs)
                 TabBarItem::None
                 | TabBarItem::LeftStatus
@@ -645,7 +683,8 @@ impl super::TermWindow {
                 | TabBarItem::LbtermPromptList
                 | TabBarItem::LbtermInbox
                 | TabBarItem::LbtermAgenda
-                | TabBarItem::LbtermContext => {}
+                | TabBarItem::LbtermContext
+                | TabBarItem::LbtermProjects => {}
             },
             WMEK::Press(MousePress::Right) => match item {
                 TabBarItem::Tab { tab_idx, .. } => {
@@ -670,7 +709,8 @@ impl super::TermWindow {
                 | TabBarItem::LbtermPromptList
                 | TabBarItem::LbtermInbox
                 | TabBarItem::LbtermAgenda
-                | TabBarItem::LbtermContext => {}
+                | TabBarItem::LbtermContext
+                | TabBarItem::LbtermProjects => {}
             },
             WMEK::Move => match item {
                 // LBTerm: the strip's words drag the window too (render/strip.rs)
@@ -690,16 +730,19 @@ impl super::TermWindow {
                     );
                     context.set_maximize_button_position(bounds);
                 }
+                // LBTerm: and the context pill, which nothing comes of pressing, and the projects
+                // pad, whose cursor is its own (render/projects.rs)
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
                 | TabBarItem::NewTabButton { .. }
-                | TabBarItem::LbtermRestart => {}
+                | TabBarItem::LbtermRestart
+                | TabBarItem::LbtermContext
+                | TabBarItem::LbtermProjects => {}
                 // LBTerm: things to click, not to drag the window by
                 TabBarItem::LbtermPrompt
                 | TabBarItem::LbtermPromptList
                 | TabBarItem::LbtermInbox
-                | TabBarItem::LbtermAgenda
-                | TabBarItem::LbtermContext => {
+                | TabBarItem::LbtermAgenda => {
                     context.set_cursor(Some(CursorIcon::Pointer));
                     return;
                 }
@@ -1187,6 +1230,20 @@ impl super::TermWindow {
                     return;
                 }
             }
+        }
+
+        // LBTerm: a right press in a pane that takes the mouse which no binding took goes to its
+        // program, and the question colours don't show: a fourth quick press (Terminal's
+        // lbterm.lua binds streaks 1 to 3), a modifier held, or the window without the keyboard
+        // (lbterm/FLOWS.md, "A right hold, to the question colours")
+        if matches!(event.kind, WMEK::Press(MousePress::Right)) && pane.is_mouse_grabbed() {
+            log::info!(
+                "questions: a right press no binding took went to pane {} (streak {:?}, mods {:?}, allowed {})",
+                pane.pane_id(),
+                self.last_mouse_click.as_ref().map(|c| c.streak),
+                event.modifiers,
+                allow_action
+            );
         }
 
         let mouse_event = wezterm_term::MouseEvent {

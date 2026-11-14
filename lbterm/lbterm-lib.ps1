@@ -117,7 +117,7 @@ function Get-JobRefusal {
   $why = if (-not $Value) { "$($job.env) isn't set" } else { "$($job.env) is set but this process isn't in a job" }
   $line = ([string]$job.run).Replace('{command}', $Command).Replace('{script}', $Script.Replace('\', '/')).Replace('{args}', $Arguments)
   # A test-window run is a GPU job that only draws (--gpu-draw, since 2026-11-07: LBTerm has no
-  # compute pipeline and puts no model on the GPU, so it runs beside Earshot's listener), so the
+  # compute pipeline and puts no model on the GPU, so it runs beside LyreBird's listener), so the
   # GPU's other rules hold for it (the warden's GPU jobs at once, a game open, the GPU's
   # temperature); a measuring run (budgets) also takes the lock lbterm-measure, so no other LBTerm
   # measurement runs beside it and skews its numbers (the warden runs up to 3 GPU jobs at once

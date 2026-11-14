@@ -72,6 +72,7 @@ fn item_name(item: &UIItemType) -> (&'static str, Option<String>) {
         UIItemType::TabBar(TabBarItem::LbtermInbox) => ("strip.inbox", Some("inbox".to_string())),
         UIItemType::TabBar(TabBarItem::LbtermAgenda) => ("strip.agenda", Some("agenda".to_string())),
         UIItemType::TabBar(TabBarItem::LbtermContext) => ("strip.context", Some("context".to_string())),
+        UIItemType::TabBar(TabBarItem::LbtermProjects) => ("strip.projects", Some("projects".to_string())),
         UIItemType::TabBar(TabBarItem::Tab { .. }) => ("tab", None),
         UIItemType::TabBar(_) => ("strip", None),
         UIItemType::CloseTab(_) => ("tab.close", None),
@@ -224,7 +225,10 @@ impl TermWindow {
         waits.extend(self.tab_panel_waits(now));
         waits.extend(self.lbterm_strip_waits(now));
         waits.extend(self.lbterm_objectives_waits(now));
+        waits.extend(self.lbterm_projects_waits(now));
+        waits.extend(self.lbterm_cost_waits(now));
         waits.extend(self.lbterm_scroll_strip_waits(now));
+        waits.extend(self.lbterm_context_bar_waits(now));
         waits.extend(self.lbterm_tasks_waits(now));
         waits.extend(self.lbterm_prompt_note_wait(now));
         waits.extend(self.lbterm_readout_wait(now));
@@ -354,6 +358,7 @@ impl TermWindow {
                     scroll_top: self.get_viewport(id).map(|top| top as i64),
                     session: pane.copy_user_vars().get("claude_session").cloned(),
                     progress: progress(pane.get_progress()),
+                    weights: self.lbterm_state_weights(id),
                 }
             })
             .collect();
@@ -409,7 +414,6 @@ impl TermWindow {
             .or_else(|| self.lbterm_state_conductor_menu())
             .or_else(|| self.lbterm_state_inbox_list())
             .or_else(|| self.lbterm_state_agenda_list())
-            .or_else(|| self.lbterm_state_context_list())
             .or_else(|| self.lbterm_state_plus_menu());
 
         let animating = !animations.is_empty();
@@ -451,11 +455,15 @@ impl TermWindow {
             strip: self.lbterm_state_strip(lit, items),
             objectives: self.lbterm_state_objectives(),
             scroll_strip: self.lbterm_state_scroll_strip(),
+            context_bar: self.lbterm_state_context_bar(),
+            projects: self.lbterm_state_projects(),
+            cost: self.lbterm_state_cost(),
             menu,
             overlay,
             readout: self.lbterm_state_readout(),
             landed,
             questions: self.lbterm_state_questions(),
+            questions_pane: self.lbterm_state_questions_pane(),
             thumbnails: self.lbterm_state_thumbnails(),
             hearts,
             conductor_view: self.lbterm_state_view(),
@@ -526,7 +534,6 @@ impl TermWindow {
             self.lbterm_conductor_menu_under(fx, fy),
             self.lbterm_inbox_list_under(fx, fy),
             self.lbterm_agenda_list_under(fx, fy),
-            self.lbterm_context_list_under(fx, fy),
         ] {
             if let Some(item) = under {
                 pointer.over = if item.is_some() { "menu.item" } else { "menu" }.to_string();
@@ -569,9 +576,24 @@ impl TermWindow {
             pointer.over = "strip.card".to_string();
             return pointer;
         }
+        // The cost pane under the strip (render/cost.rs)
+        if let Some(over) = self.lbterm_cost_under(fx, fy) {
+            pointer.over = over.to_string();
+            return pointer;
+        }
+        // The projects pad on the strip's second row and its card (render/projects.rs)
+        if let Some((over, row)) = self.lbterm_projects_under(fx, fy) {
+            pointer.over = over.to_string();
+            pointer.row = row;
+            return pointer;
+        }
         if let Some((over, row)) = self.lbterm_objectives_under(fx, fy) {
             pointer.over = over.to_string();
             pointer.row = row;
+            return pointer;
+        }
+        if let Some(over) = self.lbterm_context_bar_under(fx, fy) {
+            pointer.over = over.to_string();
             return pointer;
         }
         if let Some(over) = self.lbterm_scroll_strip_under(fx, fy) {

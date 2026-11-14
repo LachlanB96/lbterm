@@ -534,6 +534,14 @@ pub(crate) fn panel_tab(tab: &mux::tab::Tab, idx: usize, active: bool) -> Tab {
         // What its conversation has cost, as the statusline last wrote it, for the open row
         // (Lachlan's E6, 2026-11-07)
         usd: summary.as_ref().and_then(|s| s.usage).map(|u| u.usd),
+        // When Lachlan last prompted it, for the open row's first line (his ask of 2026-11-11):
+        // from the summary already in hand, by the one call a harness session's time will come
+        // through too, so the strip's every paint and the menus pay no second lookup for it
+        prompted: summary
+            .as_ref()
+            .and_then(|s| s.last_prompt())
+            .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64()),
         label: summary.and_then(|s| s.label.clone()),
         estimate,
         link: None,
@@ -1456,6 +1464,7 @@ impl crate::TermWindow {
                         vec![]
                     },
                     cost: row.cost.clone(),
+                    prompted: row.prompted.clone(),
                     active: row.active,
                     hovered: self.lbterm_panel.hovered == Some(i),
                     colour: tab
@@ -1507,6 +1516,7 @@ impl crate::TermWindow {
                 age: String::new(),
                 bars: vec![],
                 cost: String::new(),
+                prompted: String::new(),
                 active: false,
                 hovered: false,
                 colour: None,

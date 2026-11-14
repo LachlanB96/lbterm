@@ -147,23 +147,10 @@ pub struct Session {
     pub hidden: bool,
 }
 
-/// One option of a picker's question
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Choice {
-    pub label: String,
-    pub description: String,
-}
-
-/// One of a picker's questions
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Question {
-    pub question: String,
-    pub header: String,
-    pub multi_select: bool,
-    pub options: Vec<Choice>,
-}
-
-/// A question a session waits on him for: a picker (`questions`) or a question in text (`text`)
+/// A question a session waits on him for, asked in text (`text`). The seat also listed
+/// AskUserQuestion's pickers, with their questions and options, until Lachlan retired the picker
+/// (2026-11-12) and had its code taken out (2026-11-14, his 2a): the view's picker cards went
+/// with it
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Waiting {
     pub id: String,
@@ -178,18 +165,10 @@ pub struct Waiting {
     pub extras: bool,
     pub gist: String,
     pub at: u64,
-    pub questions: Vec<Question>,
     pub text: Option<String>,
     /// False when no LBTerm pane is known to type into, and `why`
     pub answerable: bool,
     pub why: Option<String>,
-}
-
-impl Waiting {
-    /// Whether one click answers it: a picker of one question, not multi-select
-    pub fn one_click(&self) -> bool {
-        self.questions.len() == 1 && !self.questions[0].multi_select
-    }
 }
 
 /// One of the hub's events
@@ -342,21 +321,6 @@ impl View {
                         extras: flag(w, "extras", false),
                         gist: text(w, "gist"),
                         at: number(w, "at").unwrap_or(0),
-                        questions: list(w, "questions")
-                            .iter()
-                            .map(|q| Question {
-                                question: text(q, "question"),
-                                header: text(q, "header"),
-                                multi_select: flag(q, "multiSelect", false),
-                                options: list(q, "options")
-                                    .iter()
-                                    .map(|o| Choice {
-                                        label: text(o, "label"),
-                                        description: text(o, "description"),
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
                         text: some_text(w, "text"),
                         answerable: flag(w, "answerable", true),
                         why: some_text(w, "why"),
@@ -689,14 +653,8 @@ pub enum Command {
     /// `on`, `off`, `restart`, `mode read|most|all`, `listen off`, `listen catch up`,
     /// `listen fresh`
     Control { action: String },
-    /// A waiting session's question: `picks` one list per picker question, counting from 1,
-    /// `other` his own words per question, `text` for a question in text
-    Answer {
-        question: String,
-        picks: Vec<Vec<u32>>,
-        other: Vec<Option<String>>,
-        text: Option<String>,
-    },
+    /// A waiting session's question, answered with his words (Conductor's SEAT.md, `seat.answer`)
+    Answer { question: String, text: String },
     /// `send`, `dismiss` or `rate` (`rating` `useful` or `not`)
     Rsi {
         action: String,
@@ -735,14 +693,8 @@ impl Command {
             Command::Control { action } => {
                 json!({ "type": "seat.control", "id": id, "action": action, "by": BY })
             }
-            Command::Answer {
-                question,
-                picks,
-                other,
-                text,
-            } => json!({
-                "type": "seat.answer", "id": id, "question": question, "picks": picks,
-                "other": other, "text": text, "by": BY,
+            Command::Answer { question, text } => json!({
+                "type": "seat.answer", "id": id, "question": question, "text": text, "by": BY,
             }),
             Command::Rsi {
                 action,
@@ -781,11 +733,9 @@ mod test {
         { "sessionId": "s2", "name": "x", "pane": 9, "hidden": true }
       ],
       "waiting": [
-        { "id": "s1:toolu_1", "sessionId": "s1", "session": "website-a6", "label": "Publishing the résumé", "project": "Website",
-          "kind": "picker", "extras": false, "gist": "Which layout?", "at": 1792828000000,
-          "questions": [{ "question": "Which layout?", "header": "Layout", "multiSelect": false,
-                          "options": [{ "label": "Two columns", "description": "Side by side" }, { "label": "One" }] }],
-          "text": null, "answerable": true, "why": null },
+        { "id": "s1:1792828000000", "sessionId": "s1", "session": "website-a6", "label": "Publishing the résumé", "project": "Website",
+          "kind": "text", "extras": false, "gist": "Which layout?", "at": 1792828000000,
+          "questions": null, "text": "Q1. Which layout?\n  1a. Two columns\n  1b. One", "answerable": true, "why": null },
         { "id": "s2:1792828000000", "sessionId": "s2", "kind": "text", "text": "1a or 1b?", "answerable": false, "why": "no pane" }
       ],
       "events": [ { "seq": 812, "at": 1792828000000, "kind": "waiting", "session": "website-a6", "label": null, "project": "Website", "text": "…", "wake": true } ],
@@ -817,9 +767,8 @@ mod test {
         // Hidden from the Conductor where the seat says so, not where it doesn't
         assert!(!v.sessions[0].hidden && v.sessions[1].hidden);
         let w = &v.waiting[0];
-        assert!(w.one_click() && w.answerable);
-        assert_eq!(w.questions[0].options[0].description, "Side by side");
-        assert_eq!(w.questions[0].options[1].description, "");
+        assert!(w.answerable);
+        assert_eq!(w.text.as_deref(), Some("Q1. Which layout?\n  1a. Two columns\n  1b. One"));
         assert_eq!(v.waiting[1].text.as_deref(), Some("1a or 1b?"));
         assert!(!v.waiting[1].answerable);
         assert_eq!(v.waiting[1].why.as_deref(), Some("no pane"));
@@ -982,16 +931,14 @@ mod test {
         assert_eq!((v["action"].as_str(), v["by"].as_str()), (Some("mode most"), Some("lbterm")));
         let v = json(
             &Command::Answer {
-                question: "s1:toolu_1".into(),
-                picks: vec![vec![2], vec![]],
-                other: vec![None, Some("my own".into())],
-                text: None,
+                question: "s1:1792828000000".into(),
+                text: "1b".into(),
             }
             .line("5"),
         );
-        assert_eq!(v["picks"], serde_json::json!([[2], []]));
-        assert_eq!(v["other"], serde_json::json!([null, "my own"]));
-        assert!(v["text"].is_null());
+        assert_eq!((v["type"].as_str(), v["question"].as_str()), (Some("seat.answer"), Some("s1:1792828000000")));
+        assert_eq!((v["text"].as_str(), v["by"].as_str()), (Some("1b"), Some("lbterm")));
+        assert!(v.get("picks").is_none() && v.get("other").is_none(), "the picker's fields went with it");
         let v = json(
             &Command::Rsi {
                 action: "rate".into(),

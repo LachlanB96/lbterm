@@ -1,6 +1,6 @@
-//! The mic mark (lbterm/CONTROL.md, "The mic mark"). Lachlan's yes (2026-10-25): while Earshot
+//! The mic mark (lbterm/CONTROL.md, "The mic mark"). Lachlan's yes (2026-10-25): while LyreBird
 //! listens for LBTerm, a mic on the window strip says so, left of its buttons: dim while it
-//! listens, lit while it hears him speak, struck through while it's paused. Earshot tells LBTerm
+//! listens, lit while it hears him speak, struck through while it's paused. LyreBird tells LBTerm
 //! its state over the control pipe (`mic`) as it changes, and again every so often while it
 //! listens; each state holds for its `ttl` and then goes, so a listener that stopped without
 //! saying so doesn't leave a mic behind.
@@ -92,7 +92,7 @@ impl Mic {
     }
 }
 
-/// What Earshot heard, for the strip: one line, cut to [`MAX_HEARD`] characters
+/// What LyreBird heard, for the strip: one line, cut to [`MAX_HEARD`] characters
 pub fn heard(text: &str) -> Option<String> {
     let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.is_empty() {

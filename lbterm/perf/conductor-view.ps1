@@ -21,7 +21,7 @@ asked).
    sends `seat.interrupt` (said.png). A refusal puts the words back and says why under the box
    (refused.png).
 6. "Accept most" in the header sends `seat.control` `mode most`.
-7. A picker's option answers it at once (`seat.answer`, picks [[2]]); a question in text's `1b`
+7. A question in text's `1b`
    chip goes in its box, each on a line of its own, a second press takes one out, and Send
    answers it with the lines (answered.png).
 8. "Useful" on the suggestion sends `seat.rsi` rate useful.
@@ -202,9 +202,8 @@ $viewWith = {
   param([bool]$ask, [string]$mode = 'read', [bool]$waiting = $true, [long]$At = $now, [long]$Asked = $now - 30000)
   $asks = if ($ask) { '[{"id":"ask-3","at":' + ($At - 90000) + ',"tool":"SendMessage","title":"Message Publishing the résumé in Website","detail":"Push the site now: the résumé is ready.\nThen tell me when it is live.","session":"website-a6","label":"Publishing the résumé","project":"Website"}]' } else { '[]' }
   $wait = if ($waiting) { @"
-[{"id":"$($sidA):toolu_1","sessionId":"$sidA","session":"website-a6","label":"Publishing the résumé","project":"Website","kind":"picker","extras":false,"gist":"Which layout?","at":$($At - 60000),
-  "questions":[{"question":"Which layout for the résumé page?","header":"Layout","multiSelect":false,
-  "options":[{"label":"Two columns","description":"Side by side, like the printed one"},{"label":"One column","description":"Easier on a phone"}]}],"text":null,"answerable":true,"why":null},
+[{"id":"$($sidA):toolu_1","sessionId":"$sidA","session":"website-a6","label":"Publishing the résumé","project":"Website","kind":"text","extras":false,"gist":"Which layout?","at":$($At - 60000),
+  "questions":null,"text":"Which layout for the résumé page, two columns like the printed one or one column?","answerable":true,"why":null},
  {"id":"$($sidB):$now","sessionId":"$sidB","session":"terminal-b1","label":"Pad colours","project":"Terminal","kind":"text","extras":false,"gist":"Q1","at":$Asked,
   "questions":[],"text":"Q1. Which colour for the pad?\n  1a. Orange\n  1b. Blue","answerable":true,"why":null}]
 "@ } else { '[]' }
@@ -364,7 +363,7 @@ Invoke-Test {
   if ($kinds -ne 'ask,waiting,waiting,session,session,events,suggestion,notes') { Add-Failure "the side's cards: $kinds" } else { "view: open, its cards $kinds" }
   if ($v.state -ne 'on' -or $v.mode -ne 'read') { Add-Failure "the view says $($v.state), $($v.mode)" }
   if ($v.focus -ne 'main') { Add-Failure "typing goes to $($v.focus), not the box" }
-  foreach ($name in 'allow:ask-3', 'deny:ask-3', 'control:mode most', 'send', 'rsi:g1:useful', "pick:$($sidA):toolu_1:0:1", "chip:$($sidB):$($now):1b") { [void](Button $v $name) }
+  foreach ($name in 'allow:ask-3', 'deny:ask-3', 'control:mode most', 'send', 'rsi:g1:useful', "chip:$($sidB):$($now):1b") { [void](Button $v $name) }
   # Its words are drawn, not only its fills: the Conductor's reply, his words, a header button,
   # a card's button and the ask's card
   Test-Words $view (@($v.items | Where-Object id -eq 'r1')[0].rect) 'the Conductor''s reply'
@@ -497,14 +496,10 @@ Invoke-Test {
   $control = Next-Sent 'seat.control' $before
   if (-not $control -or $control.action -ne 'mode most') { Add-Failure "Accept most sent: $($control | ConvertTo-Json -Compress)" } else { 'control: seat.control mode most' }
 
-  # 7. The waiting cards: a picker's option answers it at once; a chip into the text question's box, then Send
+  # 7. The waiting cards: a chip into the text question's box, then Send
   [IO.File]::WriteAllText($state, '{ "state": "on", "mode": "most", "listening": true, "busy": false, "asks": 0 }')
   Push (& $viewWith $false 'most')
   Wait-State { param($s) $s.conductor_view.mode -eq 'most' } -What 'accept most' | Out-Null
-  $before = (Sent 'seat.answer').Count
-  Press "pick:$($sidA):toolu_1:0:1"
-  $answer = Next-Sent 'seat.answer' $before
-  if (-not $answer -or $answer.question -ne "$($sidA):toolu_1" -or ((ConvertTo-Json -InputObject $answer.picks -Compress) -ne '[[2]]')) { Add-Failure "the picker's answer: $($answer | ConvertTo-Json -Compress -Depth 5)" } else { 'answer: the picker''s second option, picks [[2]]' }
   # Each chip's code on a line of its own, as Relay's phone puts them, and out again with its line
   $box = "answer:$($sidB):$now"
   foreach ($step in @(@('1b', '1b'), @('1a', "1b`n1a"), @('1b', '1a'), @('1b', "1a`n1b"))) {

@@ -2950,6 +2950,48 @@ namespace LbtermE2E {
 '@
 }
 
+# Where a window of rectangle $Window (Left, Top, Right, Bottom) goes so all of it is on $Screen
+# (X, Y, Right, Bottom), $Margin in from its edges where it can be: where it is when it's on it
+# already, else moved in, and narrowed or shortened to the screen less two margins when it's bigger
+# than that. Off is how many of its pixels were off the screen on each side. A window wider than its
+# screen opens so: Get-OffscreenPosition puts its left 20 px in from the right-most screen's and
+# its width is its columns', so a 110-column window on the 1080-wide portrait screen hung 70 px
+# past the screen's right edge, where the context bar and the scroll strip are. Nothing there
+# reaches any screen, so DWM presents nothing for motion there, and the walk counts its refreshes
+# missed (lbterm/PITFALLS.md, 306; FLOWS.md, "The context bar's widening", round 4's stage 5)
+function Get-OnScreenRect([Parameter(Mandatory)]$Window, [Parameter(Mandatory)]$Screen, [int]$Margin = 20) {
+  $w = $Window.Right - $Window.Left; $h = $Window.Bottom - $Window.Top
+  $off = [pscustomobject]@{
+    Left = [Math]::Max(0, $Screen.X - $Window.Left); Right = [Math]::Max(0, $Window.Right - $Screen.Right)
+    Top = [Math]::Max(0, $Screen.Y - $Window.Top); Bottom = [Math]::Max(0, $Window.Bottom - $Screen.Bottom)
+  }
+  $on = ($off.Left + $off.Right + $off.Top + $off.Bottom) -eq 0
+  $fit = {
+    param([int]$at, [int]$size, [int]$from, [int]$to)
+    $size = [Math]::Min($size, $to - $from - 2 * $Margin)
+    $at = [Math]::Min([Math]::Max($at, $from + $Margin), $to - $Margin - $size)
+    $at, $size
+  }
+  $x, $w2 = if ($on) { $Window.Left, $w } else { & $fit $Window.Left $w $Screen.X $Screen.Right }
+  $y, $h2 = if ($on) { $Window.Top, $h } else { & $fit $Window.Top $h $Screen.Y $Screen.Bottom }
+  [pscustomobject]@{ X = $x; Y = $y; Width = $w2; Height = $h2; On = $on; Off = $off; Resized = ($w2 -ne $w -or $h2 -ne $h) }
+}
+
+# Puts a test window all on its screen (Get-OnScreenRect), without activating it or raising it,
+# and says what it did: $null when it was on it already
+function Move-TestWindowOnScreen([object]$Window) {
+  Add-Type -AssemblyName System.Windows.Forms
+  $h = [IntPtr](Resolve-Handle $Window)
+  $s = [System.Windows.Forms.Screen]::FromHandle($h)
+  $r = Get-WindowRect $Window
+  $to = Get-OnScreenRect -Window $r -Screen $s.Bounds
+  if ($to.On) { return $null }
+  # SWP_NOZORDER | SWP_NOACTIVATE
+  [void][LbtermE2E.Win]::SetWindowPos($h, [IntPtr]::Zero, $to.X, $to.Y, $to.Width, $to.Height, 0x0004 -bor 0x0010)
+  $sides = @('Left', 'Right', 'Top', 'Bottom') | Where-Object { $to.Off.$_ -gt 0 } | ForEach-Object { "$($to.Off.$_) px past its $($_.ToLower())" }
+  "$($r.Right - $r.Left) by $($r.Bottom - $r.Top) px, $($sides -join ' and ') edge of $($s.DeviceName) ($($s.Bounds.Width) by $($s.Bounds.Height)), $(if ($to.Resized) { "made $($to.Width) by $($to.Height) and " })moved all onto it"
+}
+
 # Moves a test window on its screen to where nothing over it in the z-order overlaps it, so what it
 # draws reaches the screen, without activating it or raising it over anything. Its size and z-order
 # stay as they are. True when it was moved or nothing covered it
@@ -3159,18 +3201,25 @@ function Get-UnixMs { ([DateTime]::UtcNow - [DateTime]::UnixEpoch).TotalMillisec
 # folder) and keeps every frame's snapshot, in order, with its process frame and time_ms, for
 # Wait-Recorded to go through. The writer itself only drops a snapshot when a newer one is handed
 # over while it's still writing the last (lbterm/STATE.md), which at 8 ms a frame it rarely is.
+# The recorder can lose one too: it reads the file when the watcher's event is handled, on a pool
+# thread, and a frame the GUI has written over by then was never kept. On a PC busy enough to hold
+# that thread up for a frame or more (two frames 25 ms apart were lost in a check beside cargo,
+# 2026-11-12), the first frame kept that shows something can be a later one than the first that
+# showed it (lbterm/PITFALLS.md, 355). It says when: the snapshot's top frame counts every frame
+# the process has painted, so each frame kept carries how many came between it and the one kept
+# before it (Missed), the recorder their sum, and Wait-Recorded hands the found frame's on.
 function Start-FrameRecorder {
   param([Parameter(Mandatory, ParameterSetName = 'Window')]$Window, [Parameter(Mandatory, ParameterSetName = 'Path')][string]$Path)
   if (-not ('LbtermE2E.FrameRecorder' -as [type])) {
     Add-Type -TypeDefinition @'
 using System; using System.IO; using System.Text; using System.Text.RegularExpressions; using System.Collections.Generic;
 namespace LbtermE2E {
-  public class RecordedFrame { public long Frame; public long TimeMs; public string Text; }
+  public class RecordedFrame { public long Frame; public long TimeMs; public string Text; public long Missed; }
   public class FrameRecorder : IDisposable {
     static readonly Regex Top = new Regex("\"frame\":\\s*(\\d+),\\s*\"time_ms\":\\s*(\\d+)");
     readonly string path; readonly FileSystemWatcher watch;
     readonly List<RecordedFrame> frames = new List<RecordedFrame>();
-    long last = -1;
+    long last = -1, missed = 0;
     public FrameRecorder(string path) {
       this.path = path;
       watch = new FileSystemWatcher(Path.GetDirectoryName(path)) { NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite, InternalBufferSize = 65536 };
@@ -3180,6 +3229,9 @@ namespace LbtermE2E {
     }
     public int Count { get { lock (frames) return frames.Count; } }
     public long Last { get { lock (frames) return last; } }
+    // Frames painted since the first one read that were never read: written over before the
+    // read, or dropped by the writer
+    public long Missed { get { lock (frames) return missed; } }
     // The file now, kept when it's a frame later than the last kept
     public void Look() {
       lock (frames) {
@@ -3192,8 +3244,10 @@ namespace LbtermE2E {
         if (!m.Success) return;
         long f = long.Parse(m.Groups[1].Value);
         if (f <= last) return;
+        long gap = last >= 0 ? f - last - 1 : 0;
+        missed += gap;
         last = f;
-        frames.Add(new RecordedFrame { Frame = f, TimeMs = long.Parse(m.Groups[2].Value), Text = text });
+        frames.Add(new RecordedFrame { Frame = f, TimeMs = long.Parse(m.Groups[2].Value), Text = text, Missed = gap });
       }
     }
     // What's been kept since the last take, oldest first
@@ -3209,9 +3263,12 @@ namespace LbtermE2E {
 
 # The first frame a recorder kept, after process frame -AfterFrame, whose snapshot -Until
 # (param($w, $s): the window's entry, found by -Hwnd, else the first, and the whole snapshot) is
-# true of: {Window, State, Frame, TimeMs}, the frames before it taken and gone. -Queue (a
-# List[object]) holds frames taken but not yet gone through, so a second wait carries on from the
-# frame after the first's. Throws after -TimeoutSec with what the last frame said.
+# true of: {Window, State, Frame, TimeMs, Missed}, the frames before it taken and gone. Missed is
+# how many frames the process painted straight before that one, after -AfterFrame, that the
+# recorder never read: 0 says it is the first frame that showed it, more that one of those may
+# have been, and a time taken from it can be that many frames long. -Queue (a List[object]) holds
+# frames taken but not yet gone through, so a second wait carries on from the frame after the
+# first's. Throws after -TimeoutSec with what the last frame said.
 function Wait-Recorded {
   param([Parameter(Mandatory)]$Recorder, [Parameter(Mandatory, Position = 0)][scriptblock]$Until, [long]$Hwnd = 0,
     [long]$AfterFrame = -1, [Collections.Generic.List[object]]$Queue, [double]$TimeoutSec = 15, [string]$What = 'the frame asked for')
@@ -3232,7 +3289,8 @@ function Wait-Recorded {
       $last = $w
       if ($w -and (& $Until $w $s)) {
         if ($script:Test) { $script:Test.LastState = $s }
-        return [pscustomobject]@{ Window = $w; State = $s; Frame = $f.Frame; TimeMs = $f.TimeMs }
+        $missed = if ($AfterFrame -ge 0) { [Math]::Min([long]$f.Missed, [Math]::Max(0L, [long]$f.Frame - $AfterFrame - 1)) } else { [long]$f.Missed }
+        return [pscustomobject]@{ Window = $w; State = $s; Frame = $f.Frame; TimeMs = $f.TimeMs; Missed = $missed }
       }
     }
     if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { break }

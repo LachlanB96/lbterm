@@ -56,6 +56,7 @@ $script:ActionMetrics = [ordered]@{
   after_present_ms = @{ unit = 'ms'; field = 'after_present_ms'; stat = 'median'; what = 'from the frame''s presents to that refresh: what DWM adds' }
   settled_ms    = @{ unit = 'ms'; field = 'settled_ms'; stat = 'median'; what = 'to the first frame with nothing animating: its motion over' }
   shown_frame   = @{ unit = ''; field = 'shown_frame'; stat = 'p95'; what = 'which frame after it showed it, 1 the first (its 95th percentile, the slowest of 15 runs): a count of frames, which a loaded PC doesn''t move the way it moves milliseconds' }
+  unread_frames = @{ unit = ''; field = 'unread_frames'; stat = 'p95'; what = 'frames the GUI painted straight before the one that showed it whose snapshots the runner never read (its 95th percentile): above 0, one of those may have shown it first, and ms and shown_frame can be that many frames long' }
   missed        = @{ unit = ''; field = 'missed'; stat = 'median'; what = 'refreshes of the window''s screen while its motion played that came without a new frame, by the compositor clock''s statistics (metrics'' present.motion), the refreshes counted by the screen''s vblank times' }
   refreshes     = @{ unit = ''; field = 'refreshes'; stat = 'median'; what = 'the refreshes its motion played over, from its first frame up to its settling, by the screen''s vblank times a refresh apart' }
   refreshes_counted = @{ unit = ''; field = 'refreshes_counted'; stat = 'median'; what = 'the same span by the screen''s own refresh counter, which jumps at a present on some screens (PITFALLS 166): beside refreshes to show when they disagree, never a budget' }
@@ -874,7 +875,18 @@ function Format-BudgetTable($Report) {
     'budgets nothing measured (not judged):'
     foreach ($s in $partly) { "  $($s.name): $(@($s.unmeasured) -join ', ')" }
   }
-  $moved = @($Report.scenarios | Where-Object { @($_.drift | Where-Object { $_ }).Count })
+  # Actions whose time may be a frame or more long: the runner's recorder never read a frame
+  # straight before the one that showed it (unread_frames; lbterm/PITFALLS.md, 355)
+  $unread = @($Report.scenarios | Where-Object { $_.result -ne 'error' -and $_.metrics.unread_frames -and [double]$_.metrics.unread_frames.max -gt 0 })
+  if ($unread) {
+    ''
+    'frames the runner never read straight before the one that showed it (its ms can be that many frames long):'
+    foreach ($s in $unread) {
+      $v = @($s.metrics.unread_frames.values)
+      "  $($s.name): $(@($v | Where-Object { [double]$_ -gt 0 }).Count) of $($v.Count) runs, up to $([long]$s.metrics.unread_frames.max)"
+    }
+  }
+  $moved =@($Report.scenarios | Where-Object { @($_.drift | Where-Object { $_ }).Count })
   if ($moved) {
     ''
     "moved since the last run of each (over $($script:DriftShare * 100)% and $($script:DriftFloor) of its unit):"

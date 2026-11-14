@@ -1476,8 +1476,7 @@ impl TermWindow {
                 || self.lbterm_prompt_list_is_open()
                 || self.lbterm_conductor_menu_is_open()
                 || self.lbterm_inbox_list_is_open()
-                || self.lbterm_agenda_list_is_open()
-                || self.lbterm_context_list_is_open();
+                || self.lbterm_agenda_list_is_open();
             if self.lbterm_new_tab.picker.as_ref().map_or(false, |o| o.tab != tab || menu) {
                 self.lbterm_new_tab.picker = None;
             }
@@ -2195,6 +2194,7 @@ mod test {
                 crate::termwindow::render::link_drag::owns_zindex(z),
                 crate::termwindow::render::conductor_view::owns_zindex(z),
                 crate::termwindow::render::tasks_card::owns_zindex(z),
+                crate::termwindow::render::questions_pane::owns_zindex(z),
                 crate::termwindow::render::strip::owns_zindex(z),
                 crate::termwindow::render::strip_swap::owns_zindex(z),
                 crate::termwindow::render::sides::owns_zindex(z),

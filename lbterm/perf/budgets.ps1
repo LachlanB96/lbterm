@@ -67,8 +67,9 @@ the lbterm::budget lines the window logged, and notes; result.json fails on what
 -GuiMs gives an action's window that time for the GUI's own action in place of the scenario's
 gui_ms budget, so every run over it has the GUI say in its log what its time went on (-GuiMs 1:
 every run), kept in measure.json's action_lines: a way to see where a slow action's time goes.
-Each run's sample also says which frame after it showed it (shown_frame, 1 the first) and when
-the first frame after it ended (first_frame_ms).
+Each run's sample also says which frame after it showed it (shown_frame, 1 the first), when
+the first frame after it ended (first_frame_ms), and how many frames straight before the one
+that showed it the recorder never read (unread_frames: above 0, ms can be that many frames long).
 #>
 param([string]$Bin, [string]$Scenario, [int]$Runs = 0, [double]$Seconds = 0, [double]$GuiMs = 0, [switch]$List, [switch]$SlowEvery, [string]$Log)
 $ErrorActionPreference = 'Stop'
@@ -220,6 +221,14 @@ config.unix_domains = { {
   }
   if ($Mux -and -not (Wait-Until { (Get-Panes -Server).Count -ge 1 } -TimeoutSec 20)) { throw "the test's mux server at $($T.Sock) didn't answer" }
   Wait-State { param($s) @($s.panes).Count -ge 1 -and $s.rail } -What 'the first pane and the rail' -TimeoutSec 30 | Out-Null
+  # All of it on its screen: a 110-column window is wider than the right-most portrait screen, and
+  # what moves in the part past its edge (the context bar and the scroll strip, at the window's
+  # right) reaches no screen, so DWM presents nothing for it and the walk counts its refreshes
+  # missed (FLOWS.md, "The context bar's widening", round 4's stage 5; PITFALLS 306)
+  # Once it has its pane and its rail: it opens at its columns' size only after its first layout,
+  # so a look before that finds it on its screen
+  $fitted = Move-TestWindowOnScreen $w
+  if ($fitted) { $Notes.Add("the window was $fitted") }
   $script:FirstPane = (Get-Panes -Server:$Mux)[0].pane_id
   if ($Mux -and $Program) {
     $own = New-Tab -From $script:FirstPane -Program $Program -Server
@@ -501,7 +510,7 @@ $Setups['conductor-pad-minimized'] = {
 }
 
 # The view open over the tab against a seat played here. Its view is what the real seat's would be
-# with two sessions: an ask, a picker and a question in text waiting, an event, a suggestion, a
+# with two sessions: an ask, two questions in text waiting, an event, a suggestion, a
 # note. With -Live the seat sends it again every 250 ms, as the real one does whenever any of it
 # changes (Conductor's SEAT.md: at most every 250 ms) while the hub's guesses move: the first
 # session's time left counting down a second a push, which changes nothing the view shows ("~4
@@ -522,8 +531,8 @@ function Open-ConductorView([switch]$Live, [switch]$NoOpen) {
  "asks":[{"id":"ask-3","at":$($now - 90000),"tool":"SendMessage","title":"Message Publishing the page in Website","detail":"Push the site now.","session":"website-a6","label":"Publishing the page","project":"Website"}],
  "sessions":[{"sessionId":"$sidA","name":"website-a6","project":"Website","status":"waiting","label":"Publishing the page","summary":"","question":"Which layout?","pane":null,"percent":40,"left":@left@,"agents":[],"conductor":"thinking"},
              {"sessionId":"$sidB","name":"terminal-b1","project":"Terminal","status":"working","label":"Pad colours","summary":"","question":null,"pane":null,"agents":[],"conductor":null}],
- "waiting":[{"id":"$($sidA):toolu_1","sessionId":"$sidA","session":"website-a6","label":"Publishing the page","project":"Website","kind":"picker","extras":false,"gist":"Which layout?","at":$($now - 60000),
-   "questions":[{"question":"Which layout for the page?","header":"Layout","multiSelect":false,"options":[{"label":"Two columns","description":"Side by side"},{"label":"One column","description":"Easier on a phone"}]}],"text":null,"answerable":true,"why":null},
+ "waiting":[{"id":"$($sidA):toolu_1","sessionId":"$sidA","session":"website-a6","label":"Publishing the page","project":"Website","kind":"text","extras":false,"gist":"Which layout?","at":$($now - 60000),
+   "questions":null,"text":"Which layout for the page, two columns side by side or one column?","answerable":true,"why":null},
   {"id":"$($sidB):$now","sessionId":"$sidB","session":"terminal-b1","label":"Pad colours","project":"Terminal","kind":"text","extras":false,"gist":"Q1","at":$($now - 30000),"questions":[],"text":"Q1. Which colour for the pad?\n  1a. Orange\n  1b. Blue","answerable":true,"why":null}],
  "events":[{"seq":811,"at":$($now - 120000),"kind":"finished","session":"terminal-b1","label":"Pad colours","project":"Terminal","text":"Built the pad","wake":false}],
  "suggestions":[{"id":"g1","day":"2026-10-23","project":"Terminal","kind":"tooling","title":"Keep the worktree's target warm","change":"Build each new worktree once.","evidence":"Six builds waited.","saves":"Ten minutes a branch","status":"open","rating":null}],
@@ -582,14 +591,101 @@ rawset(config, 'lbterm_projects', { projects = { { name = 'Alpha', dir = [[$alph
 rawset(config, 'lbterm_inbox', { folders = { [[$alpha\InMail]], [[$beta\InMail]] } })
 "@
   Add-BudgetTab (New-DemoProgram two idle 5 (Get-Sid 62)) | Out-Null
-  $s = Wait-State { param($s) @($s.tabs).Count -eq 2 -and $s.objectives.projects.pad } -What 'two tabs and the projects pad'
+  $s = Wait-State { param($s) @($s.tabs).Count -eq 2 -and $s.projects.pad } -What 'two tabs and the projects pad'
   if (-not $Open) { return @{ Window = $w; Holds = { param($s, $w) $true } } }
-  $x, $y = Get-RectCenter $s.objectives.projects.pad
+  $x, $y = Get-RectCenter $s.projects.pad
   Set-RestingPointer $w $x $y
-  Wait-Shown { param($s) $s.objectives.projects.open -and @($s.objectives.projects.rows).Count -eq 2 } 'the projects card open with two projects'
-  @{ Window = $w; Holds = { param($s, $w) $s.objectives.projects.open } }
+  Wait-Shown { param($s) $s.projects.open -and @($s.projects.rows).Count -eq 2 } 'the projects card open with two projects'
+  @{ Window = $w; Holds = { param($s, $w) $s.projects.open } }
 }
 $Setups['projects-card'] = { Open-ProjectsCard -Open }
+
+# The context bar (lbterm/CONTEXT.md, "The context bar") beside a stand-in Claude Code session
+# whose transcript is written as Claude Code writes one, as perf/context-bar.ps1's is: the files
+# loaded at the start (a user CLAUDE.md importing a rule, two project CLAUDE.md files, the memory
+# index), the skills list, the first request (its shape and blob) and its reply, another project's
+# CLAUDE.md pulled in, a memory file read and the reply after them, 40k in use; its usage file a
+# 200k window and the dollars, as Terminal's statusline writes it. The bar only for a build that
+# has the key (asked as for lbterm_budget): main's build before it shows the pill and the
+# objectives strip beside the same session, Lachlan's window as it is. -Pane rests the pointer on
+# the bar's first section until the pane is out, the drawer with it
+function Open-ContextBar([switch]$Pane, [switch]$CountCost, [switch]$Split) {
+  $sid = Get-Sid 71
+  $own = 'C:/work/Harbor'
+  $memory = 'C:/Users/someone/.claude/projects/C--work-Harbor/memory'
+  $folder = Join-Path $Transcripts 'C--work-Harbor'
+  New-Item -ItemType Directory -Force $folder | Out-Null
+  $start = [DateTime]::new(2026, 11, 8, 9, 0, 0, [DateTimeKind]::Utc)
+  $script:ContextAt = 0
+  $rec = { param([hashtable]$r)
+    $script:ContextAt += 5
+    $r.timestamp = $start.AddSeconds($script:ContextAt).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $r.isSidechain = $false; $r.cwd = $own; $r.sessionId = $sid
+    $r | ConvertTo-Json -Compress -Depth 10
+  }
+  $raw = { param($r) $r | ConvertTo-Json -Compress -Depth 10 }
+  $reply = { param([int]$n) @{ type = 'assistant'; message = @{ role = 'assistant'; model = 'm'; content = @(@{ type = 'text'; text = 'Done.' })
+    usage = @{ input_tokens = 2; cache_read_input_tokens = $n - 1002; cache_creation_input_tokens = 1000; output_tokens = 50 } } } }
+  $ledger = 'C:/work/Ledger/CLAUDE.md'
+  $lines = @(
+    (& $rec @{ type = 'user'; message = @{ role = 'user'; content = 'go' } })
+    (& $rec @{ type = 'attachment'; attachment = @{ type = 'instructions'; files = @(
+      @{ path = 'C:/Users/someone/.claude/CLAUDE.md'; type = 'User'; content = ('u' * 4000) + "`n@C:/work/rules/asking.md`n" }
+      @{ path = 'C:/work/rules/asking.md'; type = 'User'; content = 'a' * 1200 }
+      @{ path = 'C:/work/CLAUDE.md'; type = 'Project'; content = 'p' * 8000 }
+      @{ path = "$own/CLAUDE.md"; type = 'Project'; content = 'h' * 2000 }
+      @{ path = "$memory/MEMORY.md"; type = 'AutoMem'; content = 'm' * 800 }
+    ) } })
+    (& $rec @{ type = 'attachment'; attachment = @{ type = 'skill_listing'; isInitial = $true; content = 'x' }; rendered = @(@{ content = 'k' * 800 }) })
+    (& $raw @{ type = 'api-request-shape'; shapeHash = 's1'; shape = @{ system = @(@{ type = 'text'; text = 's' * 4000 }); tools = @(@{ name = 'Read'; description = 'd' * 3990 }) } })
+    (& $raw @{ type = 'api-request-blob'; hash = 'm1'; message = @{ role = 'user'; content = @(@{ type = 'text'; text = 'b' * 16000 }) } })
+    (& $raw @{ type = 'api-request'; querySource = 'repl_main_thread'; shapeHash = 's1'; keep = 0; tail = @('m1') })
+    (& $rec (& $reply 9000))
+    (& $rec @{ type = 'attachment'; attachment = @{ type = 'nested_memory'; path = $ledger; displayPath = 'CLAUDE.md'; content = @{ path = $ledger; type = 'Project'; content = 'n' * 20000 } } })
+    (& $rec @{ type = 'assistant'; message = @{ role = 'assistant'; content = @(@{ type = 'tool_use'; id = 'r1'; name = 'Read'; input = @{ file_path = "$memory/feedback_x.md" } }) } })
+    (& $rec @{ type = 'user'; message = @{ role = 'user'; content = @(@{ type = 'tool_result'; tool_use_id = 'r1'; content = 'r' * 1200 }) } })
+    (& $rec (& $reply 40000))
+  )
+  [IO.File]::WriteAllText((Join-Path $folder "$sid.jsonl"), ($lines -join "`n") + "`n")
+  New-Item -ItemType Directory -Force $Sums | Out-Null
+  [IO.File]::WriteAllText((Join-Path $Sums "$sid.usage.json"), '{"usd":1.25,"window":200000}')
+  # -Split: the Claude project's split of the session beside it, lbterm-extras' copy of the
+  # fixture's (@Claude:cost v 1, its total 0.67), which the cost pane shows with the count off
+  if ($Split) {
+    Copy-Item (Join-Path $PSScriptRoot '..\..\lbterm-extras\src\cost\published\5d2c8e17-3a41-4b6f-9c0e-2f7a1b8d4e60.cost.json') (Join-Path $Sums "$sid.cost.json")
+  }
+  # -CountCost: count_cost only to a build that takes it under strict mode, and where it takes it:
+  # lbterm_context's since the context bar's round 4 (the pane hangs from the pill, Lachlan's 2b
+  # of 2026-11-10), lbterm_context_bar's in round 3's builds (0ffd7619b, the slot's
+  # target/before-round4), so a -Against of the two counts in both. A build from before either
+  # (635aef66b) always counts, and a field it doesn't know is a warning that opens its
+  # Configuration Error window beside the test's (PITFALLS 177), which a -Against's before rounds
+  # would measure; strict mode refuses the one unknown field without a warning
+  $w = Open-BudgetWindow -PostedPointer -Program (New-ClaudeSessionProgram -Sid $sid) -Lua @"
+local function takes(key, value) return pcall(function() local probe = wezterm.config_builder(); probe:set_strict_mode(true); probe[key] = value end) end
+local count = $(if ($CountCost) { 'true' } else { 'false' })
+local context = { transcripts = [[$Transcripts]] }
+if count and takes('lbterm_context', { count_cost = true }) then context.count_cost = true; count = false end
+rawset(config, 'lbterm_context', context)
+if takes('lbterm_context_bar', {}) then
+  local bar = {}
+  if count and takes('lbterm_context_bar', { count_cost = true }) then bar.count_cost = true end
+  rawset(config, 'lbterm_context_bar', bar)
+end
+"@
+  # The bar with its sections, or on a build without it the pill with the session's dollars
+  $s = Wait-State { param($s) $s.context_bar.in_use -eq 40000 -or ($null -eq $s.context_bar -and $s.strip.context) } -What 'the context bar with its sections, or the pill on a build without it' -TimeoutSec 30
+  $script:ContextBar = [bool]$s.context_bar
+  $Notes.Add($(if ($script:ContextBar) { "the context bar with $(@($s.context_bar.sections).Count) sections" } else { 'no context bar (a build without it): the pill and the objectives strip' }))
+  if (-not $Pane) { return @{ Window = $w; Holds = { param($s, $w) if ($script:ContextBar) { $s.context_bar.in_use -eq 40000 -and -not $s.context_bar.widened } else { [bool]$s.strip.context } } } }
+  if (-not $script:ContextBar) { throw "the context bar isn't on in this build" }
+  $x, $y = Get-RectCenter (@($s.context_bar.sections)[0].rect)
+  Set-RestingPointer $w $x $y
+  Wait-Shown { param($s) $s.context_bar.pane -and $s.context_bar.widened } 'the context bar widened and its pane out'
+  @{ Window = $w; Holds = { param($s, $w) [bool]$s.context_bar.pane } }
+}
+$Setups['context-bar'] = { Open-ContextBar }
+$Setups['context-bar-pane'] = { Open-ContextBar -Pane }
 
 $Setups['tasks-card'] = {
   $sid = Get-Sid 71
@@ -773,10 +869,10 @@ $Setups['busy-tabs'] = {
 }
 $Setups['busy-projects-card'] = {
   $w = Open-BusyTabs
-  $x, $y = Get-RectCenter (Get-Win).objectives.projects.pad
+  $x, $y = Get-RectCenter (Get-Win).projects.pad
   Set-RestingPointer $w $x $y
-  Wait-Shown { param($s) $s.objectives.projects.open -and @($s.objectives.projects.rows).Count -ge 10 } 'the projects card open'
-  @{ Window = $w; Holds = { param($s, $w) $s.objectives.projects.open } }
+  Wait-Shown { param($s) $s.projects.open -and @($s.projects.rows).Count -ge 10 } 'the projects card open'
+  @{ Window = $w; Holds = { param($s, $w) $s.projects.open } }
 }
 $Setups['busy-inbox-list'] = {
   $w = Open-BusyTabs
@@ -1251,10 +1347,78 @@ $Actions['prompts-opening'] = @{
 # The projects card opening as the pointer rests on its pad, the pointer gone after
 $Actions['projects-opening'] = @{
   Setup = { Open-ProjectsCard }
-  Mark = { param($r, $i) $r.X, $r.Y = Get-RectCenter (Get-Win).objectives.projects.pad }
+  Mark = { param($r, $i) $r.X, $r.Y = Get-RectCenter (Get-Win).projects.pad }
   Do = { param($r, $i) Send-Mouse $r.Window Move $r.X $r.Y }
-  Shown = { param($w, $s, $r) [bool]$w.objectives.projects.open }
-  After = { param($r, $i) Send-Leave $r.Window; Wait-Shown { param($s) -not $s.objectives.projects.open -and $s.settled } 'the card shut' }
+  Shown = { param($w, $s, $r) [bool]$w.projects.open }
+  After = { param($r, $i) Send-Leave $r.Window; Wait-Shown { param($s) -not $s.projects.open -and $s.settled } 'the card shut' }
+}
+# The context bar widening as the pointer comes to rest on its ring above the track, where no
+# section is and so no pane opens (lbterm/CONTEXT.md, "The pane"): to the first frame with the
+# drawer of its sections' tokens (its widen_delay_ms, 150, in it), the drawer sliding out over the
+# terminal on panel_open; the pointer gone after, the drawer in again
+$Actions['context-bar-widening'] = @{
+  Setup = { $r = Open-ContextBar; if (-not $script:ContextBar) { throw "the context bar isn't on in this build" }; $r }
+  Mark = { param($r, $i)
+    $cb = (Get-Win).context_bar
+    if ($cb.track.y - $cb.rect.y -lt 2) { throw "the bar's track starts $($cb.track.y - $cb.rect.y) px into it, with no ring above it to rest on" }
+    $r.X = [int]($cb.rect.x + $cb.rect.w / 2)
+    $r.Y = [int]($cb.rect.y + 1)
+  }
+  Do = { param($r, $i) Send-Mouse $r.Window Move $r.X $r.Y }
+  Shown = { param($w, $s, $r) [bool]$w.context_bar.widened }
+  After = { param($r, $i)
+    if ((Get-Win).context_bar.pane) { throw 'the pane opened under a pointer resting on no section' }
+    Send-Leave $r.Window
+    Wait-Shown { param($s) -not $s.context_bar.widened -and $s.settled } 'the bar at rest'
+  }
+}
+# The context bar's pane opening as the pointer comes to rest on its first section: to the first
+# frame with the pane out (its open_delay_ms, 300, in it; the drawer slid out 150 ms before it),
+# the pane sliding out from under the drawer on panel_open with the scroll strip riding its edge;
+# the pointer gone after, the pane and the drawer in again
+$Actions['context-bar-pane-opening'] = @{
+  Setup = { $r = Open-ContextBar; if (-not $script:ContextBar) { throw "the context bar isn't on in this build" }; $r }
+  Mark = { param($r, $i) $r.X, $r.Y = Get-RectCenter (@((Get-Win).context_bar.sections)[0].rect) }
+  Do = { param($r, $i) Send-Mouse $r.Window Move $r.X $r.Y }
+  Shown = { param($w, $s, $r) [bool]$w.context_bar.pane }
+  After = { param($r, $i)
+    Send-Leave $r.Window
+    Wait-Shown { param($s) -not $s.context_bar.pane -and -not $s.context_bar.widened -and $s.settled } 'the pane and the drawer in'
+  }
+}
+# The cost pane opening from a press on the context pill (lbterm/CONTEXT.md, "The cost pane"):
+# the pointer posted onto the pill and pressed there, to the first frame with the pane open and
+# its count in, fading in on pane_enter under the strip. The first round's opening counts the
+# session's transcript on the lbterm-cost thread; the rest find the count kept, as a press does
+# once a conversation's been counted. A second press shuts it after, the pointer staying on the pill
+$Actions['cost-pane-opening'] = @{
+  # LBTerm's own count on (lbterm_context.count_cost, off unless asked for): what the press
+  # costs with the count, the heavier way; off, the pane is laid out from usage.json alone
+  Setup = { $r = Open-ContextBar -CountCost; if (-not $script:ContextBar) { throw "the context bar isn't on in this build" }; $r }
+  Mark = { param($r, $i)
+    $s = Get-Win
+    if (-not $s.cost.pill) { throw "no cost pane in this build: the state file has no cost.pill" }
+    $r.X, $r.Y = Get-RectCenter $s.cost.pill
+  }
+  Do = { param($r, $i) Send-Click $r.Window $r.X $r.Y -Move }
+  Shown = { param($w, $s, $r) $w.cost.open -and $null -ne $w.cost.total }
+  After = { param($r, $i)
+    Send-Click $r.Window $r.X $r.Y
+    Wait-Shown { param($s) -not $s.cost.open -and $s.settled } 'the cost pane shut'
+  }
+}
+# The same with LBTerm's own count off, Lachlan's setting (round 5's stage 2 of feat/context-bar):
+# the pane shows the Claude project's split, <sid>.cost.json in the summaries folder, read on
+# lbterm-cost at the warm-up's opening and asked for again only once the summaries thread hears
+# the file written, which no run does: each opening finds it kept, so the press's frame is the
+# opening's only one of its own. A build from round 4's stage 3 to round 5's stage 1 reads the
+# file again at every opening and repaints with what it already showed
+$Actions['cost-pane-opening-off'] = @{
+  Setup = { $r = Open-ContextBar -Split; if (-not $script:ContextBar) { throw "the context bar isn't on in this build" }; $r }
+  Mark = $Actions['cost-pane-opening'].Mark
+  Do = $Actions['cost-pane-opening'].Do
+  Shown = { param($w, $s, $r) $w.cost.open -and $w.cost.source -eq 'claude' -and $null -ne $w.cost.total }
+  After = $Actions['cost-pane-opening'].After
 }
 # The tab menu opening from a right click on the first tab's pad (lbterm/TAB-MOUSE.md; NEW-TAB.md,
 # section 7), to the first frame that draws it, Esc shutting it after. Twelve tabs, eleven of them
@@ -1891,6 +2055,8 @@ function Invoke-ActionRun($A, $R, [int]$I, [bool]$Warmup) {
   # Which frame after it showed it (1, the first) and when the first ended: said, not judged
   if ($shown) {
     $sample.shown_frame = [long]$shown.Frame - $p0
+    # Frames straight before it that the recorder never read: any of them may have shown it first
+    $sample.unread_frames = [long]$shown.Missed
     $sample.first_frame_ms = [Math]::Round($first.Ms - $t0, 3)
   }
   if ($A.After) { & $A.After $R $I }

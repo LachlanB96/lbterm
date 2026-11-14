@@ -83,26 +83,11 @@ enum DraftCmd {
         #[arg(long)]
         fresh: bool,
     },
-    /// Picks for an AskUserQuestion picker, in place of what's there
-    Picker {
-        /// What they read as: "1a 2b"
-        #[arg(long)]
-        label: String,
-        /// The keys that make them, in order: --key 1 --key 2
-        #[arg(long = "key")]
-        keys: Vec<String>,
-        /// The picker's questions, the first by which it's known on screen
-        #[arg(long = "question")]
-        questions: Vec<String>,
-        /// Questions without a pick yet
-        #[arg(long)]
-        missing: Vec<String>,
-    },
     /// Take the newest piece back
     Scratch,
     /// Let the draft go
     Clear,
-    /// Type it and send it (only into Claude Code's prompt, or the picker it's for)
+    /// Type it and send it (only into Claude Code's prompt)
     Send,
     /// Type it into the prompt without sending it, to finish by hand
     Edit,
@@ -131,18 +116,6 @@ impl ControlCommand {
                         "op": "draft.add",
                         "text": text.replace("\\n", "\n"),
                         "fresh": fresh,
-                    }),
-                    DraftCmd::Picker {
-                        label,
-                        keys,
-                        questions,
-                        missing,
-                    } => json!({
-                        "op": "draft.picker",
-                        "label": label,
-                        "keys": keys,
-                        "questions": questions,
-                        "missing": missing,
                     }),
                     DraftCmd::Scratch => json!({ "op": "draft.scratch" }),
                     DraftCmd::Clear => json!({ "op": "draft.clear" }),

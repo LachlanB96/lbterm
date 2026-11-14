@@ -68,6 +68,34 @@ struct Watch {
     actions: Vec<(Action, Instant)>,
 }
 
+/// A probe of one swapchain a window's frames presented, read through each episode of motion in
+/// that window (lbterm/FLOWS.md, "The context bar's widening", round 4's trace): when DWM put
+/// which visual's present on screen, by the swapchain's own statistics, beside the walk's frames.
+/// An action's watch reads one chain (its pane's, else the frame's last, the riding strip's on the
+/// context bar's widening), so the bar's own was read nowhere. Only while the window's log asks
+/// for `lbterm::present::stats` at trace ([`probing`]); off, nothing is kept or read
+struct Probed {
+    target: Target<PaneId>,
+    chain: IDXGISwapChain,
+    /// The answer last logged: present count, its refresh, the sync refresh and its QPC time, or
+    /// the HRESULT it said instead (DXGI_ERROR_FRAME_STATISTICS_DISJOINT at first); none yet
+    last: Option<Result<(u32, u32, u32, i64), u32>>,
+    /// When it was last read
+    looked: Qpc,
+}
+
+/// How often the probed swapchains are read while an episode plays: a few reads a refresh, so a
+/// present's going up is bounded to a few ms by the reads beside the refresh its own counts give.
+/// The probe's resolution, not a design figure; the timer it's armed on (async-io's) ends on
+/// Windows' tick unless something on the PC has raised its rate, and the log says when each read
+/// was
+const PROBE_EVERY: Duration = Duration::from_millis(4);
+
+/// Whether the probe is on: the log asks for the swapchains' statistics at trace
+fn probing() -> bool {
+    log::log_enabled!(target: "lbterm::present::stats", log::Level::Trace)
+}
+
 /// An episode of motion in a window
 struct Playing {
     target: Option<COMPOSITION_TARGET_ID>,
@@ -162,6 +190,7 @@ impl Clock {
                 presents: t.presentedStats.presentCount,
                 refreshes: t.presentedStats.refreshCount,
                 present_time: t.presentedStats.time as Qpc,
+                presented_at: t.presentTime as Qpc,
             },
             t.vblankDuration as Qpc,
         ))
@@ -176,6 +205,8 @@ struct Present {
     frames: HashMap<usize, FrameSeen>,
     watches: Vec<Watch>,
     playing: HashMap<usize, Playing>,
+    /// Every swapchain each window's frames have presented, one a visual, while the probe is on
+    probed: HashMap<usize, Vec<Probed>>,
     /// Each screen's compositor target and one refresh of it, by monitor
     targets: HashMap<isize, Option<(COMPOSITION_TARGET_ID, Qpc)>>,
     /// Whether each window was hidden, and when that was looked at
@@ -278,6 +309,7 @@ pub fn frame_start(window: usize, now: Instant) {
             },
         );
         p.poll();
+        p.probe();
     });
 }
 
@@ -285,10 +317,11 @@ pub fn frame_start(window: usize, now: Instant) {
 pub fn off() {
     let _ = PRESENT.try_with(|p| {
         if let Ok(mut p) = p.try_borrow_mut() {
-            if !p.watches.is_empty() || !p.playing.is_empty() || !p.frames.is_empty() {
+            if !p.watches.is_empty() || !p.playing.is_empty() || !p.frames.is_empty() || !p.probed.is_empty() {
                 p.watches.clear();
                 p.playing.clear();
                 p.frames.clear();
+                p.probed.clear();
                 p.hidden.clear();
                 p.wake_at = None;
                 p.timer += 1;
@@ -305,6 +338,9 @@ pub fn presented(window: usize, chains: Vec<(Target<PaneId>, IDXGISwapChain3)>) 
     }
     let now = Instant::now();
     with(|p| {
+        if probing() {
+            p.probe_presented(window, &chains);
+        }
         if let Some(f) = p.frames.get_mut(&window) {
             f.presented = Some(now);
             f.chains = chains;
@@ -339,6 +375,7 @@ pub fn forget(window: usize) {
     }
     with(|p| {
         p.frames.remove(&window);
+        p.probed.remove(&window);
         if let Some(playing) = p.playing.remove(&window) {
             p.finish(playing);
         }
@@ -357,6 +394,7 @@ fn wake(timer: u64) {
         }
         p.wake_at = None;
         p.poll();
+        p.probe();
         p.walk_all(now);
         p.arm(now);
     });
@@ -551,6 +589,77 @@ impl Present {
         });
     }
 
+    /// The probe (`Probed`): each swapchain this frame of `window` presented, with its present's
+    /// count and when the frame's presents and commit were done, kept to be read through the
+    /// window's episodes. A visual whose swapchain was made again is read from its new one
+    fn probe_presented(&mut self, window: usize, chains: &[(Target<PaneId>, IDXGISwapChain3)]) {
+        let at = qpc();
+        let probed = self.probed.entry(window).or_default();
+        for (target, chain) in chains {
+            let Ok(base) = chain.cast::<IDXGISwapChain>() else {
+                continue;
+            };
+            let id = unsafe { base.GetLastPresentCount() }.unwrap_or(0);
+            log::trace!(target: "lbterm::present::stats", "probe chain [{target:?}] presented {id} at {at}");
+            match probed.iter_mut().find(|x| x.target == *target) {
+                Some(x) if x.chain.as_raw() == base.as_raw() => {}
+                Some(x) => {
+                    x.chain = base;
+                    x.last = None;
+                }
+                None => probed.push(Probed {
+                    target: *target,
+                    chain: base,
+                    last: None,
+                    looked: at,
+                }),
+            }
+        }
+    }
+
+    /// Read every probed swapchain of each window an episode plays in, and log each answer that
+    /// differs from the last one logged, with when it was read and when it was read before (the
+    /// span a change came in): which present DWM last put on screen (`PresentCount`), the
+    /// refresh it went up at (`PresentRefreshCount`) and a refresh's count and QPC time read
+    /// together (`SyncRefreshCount`, `SyncQPCTime`), from which walk-read.ts puts the present's
+    /// refresh among the walk's. Nothing while the probe is off or no episode plays
+    fn probe(&mut self) {
+        if self.probed.is_empty() || !probing() {
+            return;
+        }
+        let now = qpc();
+        for (window, chains) in self.probed.iter_mut() {
+            if !self.playing.contains_key(window) {
+                continue;
+            }
+            for x in chains.iter_mut() {
+                let mut stats = DXGI_FRAME_STATISTICS::default();
+                let read = match unsafe { x.chain.GetFrameStatistics(&mut stats) } {
+                    Ok(()) => Ok((stats.PresentCount, stats.PresentRefreshCount, stats.SyncRefreshCount, stats.SyncQPCTime)),
+                    Err(err) => Err(err.code().0 as u32),
+                };
+                if x.last != Some(read) {
+                    match read {
+                        Ok((count, refresh, sync, sync_qpc)) => log::trace!(
+                            target: "lbterm::present::stats",
+                            "probe chain [{:?}] at {now} (looked {}): present {count} at refresh {refresh}, sync refresh {sync} at {sync_qpc}",
+                            x.target,
+                            x.looked
+                        ),
+                        Err(code) => log::trace!(
+                            target: "lbterm::present::stats",
+                            "probe chain [{:?}] at {now} (looked {}): {code:#010x}",
+                            x.target,
+                            x.looked
+                        ),
+                    }
+                    x.last = Some(read);
+                }
+                x.looked = now;
+            }
+        }
+    }
+
     /// The compositor target of the screen `hwnd` is on and one refresh of it: its display
     /// adapter and source, as D3DKMTOpenAdapterFromGdiDisplayName gives them for the monitor's
     /// device name, looked up once a monitor
@@ -641,13 +750,20 @@ impl Present {
         let refresh = base.map_or(0, |(_, r)| r);
         // Its refreshes counted by the screen's vblank times, a refresh apart (lbterm-extras'
         // Walk, PITFALLS 166): no walk where the refresh isn't known
-        let walk = base.and_then(|(s, refresh)| Walk::new(s, settles_qpc, refresh));
+        // From the paint that started it: a present that went up before that isn't its, however
+        // old the base (PITFALLS 301). A frame whose start wasn't seen (the timing turned on
+        // during it) has no paint to walk from, and isn't walked
+        let painted = paint.map(|p| clock_now.qpc_of(p));
+        let walk = base
+            .zip(painted)
+            .and_then(|((s, refresh), at)| Walk::new(s, settles_qpc, refresh).map(|w| w.painted(at)));
         log::trace!(
             target: "lbterm::present::walk",
-            "episode {names:?} opened at {} settling at {}, base frame {:?}, covered {covered}",
+            "episode {names:?} opened at {} settling at {}, base frame {:?}, covered {covered}, painted at {}",
             clock_now.qpc,
             settles_qpc,
-            base.map(|(s, _)| s.id)
+            base.map(|(s, _)| s.id),
+            painted.map_or("unseen".to_string(), |q| q.to_string())
         );
         let mut episode = Episode::new(names, clock_now.qpc, settles_qpc, refresh, self.frequency, walk);
         episode.covered = covered;
@@ -700,6 +816,11 @@ impl Present {
         let mut soonest = |t: Instant| due = Some(due.map_or(t, |d| d.min(t)));
         if !self.watches.is_empty() {
             soonest(now + Duration::from_millis(20));
+        }
+        // The probe reads its swapchains a few times a refresh while an episode plays where it
+        // has any (`probe`)
+        if !self.probed.is_empty() && probing() && self.probed.keys().any(|w| self.playing.contains_key(w)) {
+            soonest(now + PROBE_EVERY);
         }
         let frequency = self.frequency.max(1);
         let clock_now = Now::read(frequency);

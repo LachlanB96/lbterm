@@ -22,7 +22,8 @@
 use crate::quad::VERTICES_PER_CELL;
 use crate::termwindow::compositor::{Frame, Keyboard};
 use crate::termwindow::render::{
-    card, hover_fade, lights, menu_fade, new_tab, objectives, sides, strip, strip_swap, tab_panel, tasks_card,
+    card, hover_fade, lights, menu_fade, new_tab, objectives, questions_pane, sides, strip, strip_swap, tab_panel,
+    tasks_card,
 };
 use crate::termwindow::webgpu::ShaderUniform;
 use anyhow::Context;
@@ -161,12 +162,26 @@ impl crate::TermWindow {
             self.lbterm_objectives_visuals(),
             &motion,
         )?;
+        // LBTerm: the context bar widening, the pane of its thin sections' numbers and its pane
+        // sliding out from under it, and the scroll strip riding on their edge
+        // (render/context_bar.rs)
+        let (visuals, ride) = self.lbterm_context_bar_visuals();
+        compositor.prepare_context_bar(&webgpu.instance, &webgpu.device, &webgpu.config.borrow(), visuals, ride, &motion)?;
         // LBTerm: the card of what a tab is running, beside its row (render/tasks_card.rs)
         compositor.prepare_tasks_card(
             &webgpu.instance,
             &webgpu.device,
             &webgpu.config.borrow(),
             self.lbterm_tasks_card_visual(),
+            &motion,
+        )?;
+        // LBTerm: the questions pane down the window's right while a right hold shows the
+        // question colours, sliding out from under the window's edge (render/questions_pane.rs)
+        compositor.prepare_questions_pane(
+            &webgpu.instance,
+            &webgpu.device,
+            &webgpu.config.borrow(),
+            self.lbterm_questions_pane_visual(),
             &motion,
         )?;
         // LBTerm: the new-tab pad's look under the pointer, faded on `button_hover`, and its
@@ -284,7 +299,9 @@ impl crate::TermWindow {
         frames.extend(compositor.acquire_hover(&content)?);
         frames.extend(compositor.acquire_strip_card(&content)?);
         frames.extend(compositor.acquire_objectives(&content)?);
+        frames.extend(compositor.acquire_context_bar(&content)?);
         frames.extend(compositor.acquire_tasks_card(&content)?);
+        frames.extend(compositor.acquire_questions_pane(&content)?);
         frames.extend(compositor.acquire_new_tab(&content)?);
         frames.extend(compositor.acquire_menus(&content)?);
         frames.extend(compositor.acquire_menu_spinner(&content)?);
@@ -582,9 +599,26 @@ impl crate::TermWindow {
                     vec![]
                 }
             }
+            // LBTerm: the context bar's pane's, drawer's and riding scroll strip's z-layers are
+            // their visuals' alone (render/context_bar.rs)
+            _ if crate::termwindow::render::context_bar::target_of(zindex).is_some() => {
+                if Some(target) == crate::termwindow::render::context_bar::target_of(zindex) {
+                    vec![0..quads]
+                } else {
+                    vec![]
+                }
+            }
             // LBTerm: the tasks card's z-layers are its visual's alone (render/tasks_card.rs)
             _ if tasks_card::owns_zindex(zindex) => {
                 if target == Target::TasksCard {
+                    vec![0..quads]
+                } else {
+                    vec![]
+                }
+            }
+            // LBTerm: the questions pane's z-layers are its visual's alone (render/questions_pane.rs)
+            _ if questions_pane::owns_zindex(zindex) => {
+                if target == Target::QuestionsPane {
                     vec![0..quads]
                 } else {
                     vec![]
@@ -798,12 +832,14 @@ impl FrameDump {
                     Target::Hover(slot) => format!("hover{slot}"),
                     Target::StripCard => "strip-card".to_string(),
                     Target::Objectives(card) => format!("objectives{card}"),
+                    Target::ContextBar(part) => format!("context{part}"),
                     Target::MenuSpinner => "menu-spinner".to_string(),
                     Target::Swatch => "swatch".to_string(),
                     Target::Readout => "readout".to_string(),
                     Target::Swap => "swap".to_string(),
                     Target::Sides => "sides".to_string(),
                     Target::TasksCard => "tasks-card".to_string(),
+                    Target::QuestionsPane => "questions-pane".to_string(),
                     Target::LinkLamp => "link-lamp".to_string(),
                     Target::ConnectionLamp => "connection-lamp".to_string(),
                     Target::Hearts => "hearts".to_string(),
@@ -874,6 +910,63 @@ fn begin_pass<'e>(
         occlusion_query_set: None,
         timestamp_writes: None,
     })
+}
+
+/// LBTerm: every owner `lbterm_ranges` asks before the plain under, spans and over, in its order,
+/// each with whether it claims `zindex`. `lbterm_ranges` gives a z-layer to the first arm that
+/// claims it, so a second owner of a number has its quads sent into the first one's visual, where
+/// they show only while that visual does (lbterm/PITFALLS.md 207, 220 and 300). The tests below
+/// hold every number to one owner at most, and this list to `lbterm_ranges`'s arms
+#[cfg(test)]
+pub(crate) fn owners_of(zindex: i8) -> Vec<&'static str> {
+    use crate::termwindow::render::{conductor, conductor_view, connections, context_bar, link_drag, triggers};
+    let owners: [(&str, bool); 19] = [
+        ("the Conductor's view", conductor_view::owns_zindex(zindex)),
+        ("the menus", menu_fade::target_of(zindex).is_some()),
+        ("a link's drag", link_drag::owns_zindex(zindex)),
+        ("the card templates", card::part_of_zindex(zindex).is_some()),
+        ("the strip's card", strip::owns_zindex(zindex)),
+        ("the objectives' cards", objectives::card_of(zindex).is_some()),
+        ("the context bar", context_bar::target_of(zindex).is_some()),
+        ("the questions bar", questions_pane::owns_zindex(zindex)),
+        ("the tasks card", tasks_card::owns_zindex(zindex)),
+        ("the sides", sides::owns_zindex(zindex)),
+        ("the strip's swap", strip_swap::owns_zindex(zindex)),
+        ("the lights' readout", lights::owns_zindex(zindex)),
+        ("the new-tab picker", new_tab::target_of(zindex).is_some()),
+        ("the hover slots", hover_fade::owns_zindex(zindex)),
+        ("a link's lamp", zindex == link_drag::LAMP_Z),
+        ("a connection's lamp", zindex == connections::LAMP_Z),
+        ("the hearts", zindex == triggers::HEARTS_Z),
+        ("the menu's spinner", zindex == conductor::MENU_SPIN_Z),
+        ("the tab panel", tab_panel::owns_zindex(zindex)),
+    ];
+    owners.iter().filter(|(_, owns)| *owns).map(|(who, _)| *who).collect()
+}
+
+#[cfg(test)]
+mod lbterm_z_tests {
+    /// One owner a z-layer at most, every number walked: a value added to an existing table (a
+    /// fifth row of the objectives' CARD) isn't a new `_Z` constant a grep would find, and a test
+    /// per feature checks only that feature's own numbers (lbterm/PITFALLS.md 300)
+    #[test]
+    fn every_z_layer_has_one_owner_at_most() {
+        for z in i8::MIN..=i8::MAX {
+            let owners = super::owners_of(z);
+            assert!(owners.len() <= 1, "z-layer {} is claimed by {:?}", z, owners);
+        }
+    }
+
+    /// `owners_of` names every arm of `lbterm_ranges` that gives z-layers to one visual, so an
+    /// owner added there and not here fails
+    #[test]
+    fn owners_of_lists_every_arm_of_lbterm_ranges() {
+        let source = include_str!("composited.rs");
+        let start = source.find("fn lbterm_ranges(").expect("lbterm_ranges");
+        let end = start + source[start..].find("Ordering::Equal =>").expect("its plain arms");
+        let arms = source[start..end].matches("_ if ").count();
+        assert_eq!(arms, 19, "lbterm_ranges has {} owner arms, owners_of names 19", arms);
+    }
 }
 
 /// LBTerm: the visuals cleared to white and never drawn into, which only show through a clip:

@@ -55,15 +55,16 @@ impl Area {
 
 /// How far the glow reaches past the ring
 const GLOW: f32 = 26.0;
-/// From the ring's inside to the first row
-const LIST_PAD: f32 = 8.0;
+/// From the ring's inside to the first row (the questions bar's list too, wezterm-gui's
+/// render/questions_pane.rs, which mirrors the closed rail on the window's right)
+pub const LIST_PAD: f32 = 8.0;
 /// A row's height when there's room, and the least it shrinks to
-const ROW_MAX: f32 = 46.0;
-const ROW_MIN: f32 = 28.0;
+pub const ROW_MAX: f32 = 46.0;
+pub const ROW_MIN: f32 = 28.0;
 /// Between one row's highlight and the next
-const ROW_GAP: f32 = 2.0;
-const PAD_W: f32 = 22.0;
-const PAD_H: f32 = 20.0;
+pub const ROW_GAP: f32 = 2.0;
+pub const PAD_W: f32 = 22.0;
+pub const PAD_H: f32 = 20.0;
 /// The idle timer's bars, stacked above the pad as on the APC and in
 /// TabPanel.exe: as wide as the pad, this tall, this far apart
 const BAR_H: f32 = 3.0;
@@ -75,7 +76,7 @@ const PILL_HALF: f32 = 15.0;
 const PILL_RADIUS: f32 = 14.0;
 const LABEL_PILL_RADIUS: f32 = 10.0;
 /// Between a pad and its label, and the label in from the pill's sides
-const LABEL_GAP: f32 = 3.0;
+pub const LABEL_GAP: f32 = 3.0;
 const LABEL_INSET: f32 = 2.0;
 /// The turning arc's square, on a pad's top right corner
 const SPINNER: f32 = 12.0;
@@ -98,7 +99,7 @@ const SPOT: f32 = 64.0;
 const SPOT_CORE: f32 = 10.0;
 /// Between the Conductor's slot and the first tab's, more than between two tabs: room for the
 /// hairline rule that keeps them apart
-const HEAD_GAP: f32 = 7.0;
+pub const HEAD_GAP: f32 = 7.0;
 /// Tab links' lines down the rail's left edge (lbterm_extras::links): at most this many side by
 /// side, between the open tab's bar and the pills, a link finding none free sharing the last
 pub const LINK_LANES: usize = 3;

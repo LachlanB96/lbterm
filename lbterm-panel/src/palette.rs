@@ -30,6 +30,10 @@ pub const TITLE: u32 = 0xECECF4;
 pub const PROJECT: u32 = 0xB4B4CC;
 /// A label under a pad, but the open tab's, which is the title's colour
 pub const LABEL: u32 = 0xA8A8BC;
+/// How long ago Lachlan last prompted a tab's session, at the start of its open row's second line:
+/// quieter than the project's grey and the label's, as a time read in passing beside the title,
+/// and never a status colour (lbterm/TAB-PANEL.md, "What a row says")
+pub const PROMPTED: u32 = 0x8A8A9E;
 /// Behind the project's name
 pub const CHIP: u32 = 0x262634;
 /// A tab hidden from the Conductor (lbterm/NEW-TAB.md, section 8): the eye-off mark on its pad's

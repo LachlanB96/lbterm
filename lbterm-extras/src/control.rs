@@ -2,7 +2,7 @@
 //! one JSON object a line each way, on `config::lbterm::control_pipe(<window class>)`. A request
 //! is `{"id": <anything>, "op": "<op>", ...}`; its reply carries the same `id` and `"ok": true`
 //! with what was asked for, or `"ok": false` and `error`, saying why. A connection carries as
-//! many requests as it likes, one at a time. Earshot drives LBTerm by voice through it, and
+//! many requests as it likes, one at a time. LyreBird drives LBTerm by voice through it, and
 //! `lbterm control` is the same from a shell.
 //!
 //! - `focus`: where he is. The window he was last in (it had the keyboard, or was clicked in),
@@ -10,15 +10,15 @@
 //!   session in it, its title, and whether LBTerm has the keyboard now.
 //! - `emit`, with `event`: runs a Lua event in that window with its active pane, as a key bound
 //!   to `EmitEvent` would: `lbterm-tab-forward` is the mouse's Forward button.
-//! - `draft.get`, `draft.add`, `draft.picker`, `draft.scratch`, `draft.clear`, `draft.send` and
-//!   `draft.edit`: a voice draft over a pane (lbterm_extras::drafts), the open pane's unless the
+//! - `draft.get`, `draft.add`, `draft.scratch`, `draft.clear`, `draft.send` and `draft.edit`: a
+//!   voice draft over a pane (lbterm_extras::drafts), the open pane's unless the
 //!   request names one with `pane` (the mux server's id). Each reply carries the draft as it is
 //!   after it, or null.
 //! - `metrics`: the counters (counters.rs) and the process's CPU, memory and handles, since the
 //!   process started or the last request with `"reset": true`, which starts them again after
 //!   its reply (lbterm/PERF.md).
 
-use crate::drafts::{Body, Draft};
+use crate::drafts::Draft;
 use crate::mic::MicState;
 use serde_json::{json, Map, Value};
 use std::time::Duration;
@@ -51,10 +51,6 @@ pub const BUILT_IN_EVENTS: &[&str] = &[
     "window-resized",
 ];
 
-/// The most keys a picker's picks are typed with, and the longest one
-pub const MAX_KEYS: usize = 64;
-pub const MAX_KEY: usize = 256;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     Focus,
@@ -81,13 +77,6 @@ pub enum DraftAct {
     Get,
     /// A piece of an answer added; `fresh` starts the draft again
     Add { text: String, fresh: bool },
-    /// Picks for a picker, in place of what's there
-    Picker {
-        label: String,
-        keys: Vec<String>,
-        questions: Vec<String>,
-        missing: Vec<String>,
-    },
     /// The newest piece taken back
     Scratch,
     /// Let go
@@ -106,7 +95,6 @@ impl Op {
             Op::Draft { act, .. } => match act {
                 DraftAct::Get => "draft.get",
                 DraftAct::Add { .. } => "draft.add",
-                DraftAct::Picker { .. } => "draft.picker",
                 DraftAct::Scratch => "draft.scratch",
                 DraftAct::Clear => "draft.clear",
                 DraftAct::Send => "draft.send",
@@ -217,41 +205,12 @@ fn draft_op(name: &str, obj: &Map<String, Value>) -> Result<Op, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("{name} needs {key}"))
     };
-    let texts = |key: &str, max: usize, longest: usize| -> Result<Vec<String>, String> {
-        let list = match obj.get(key) {
-            None | Some(Value::Null) => return Ok(vec![]),
-            Some(Value::Array(list)) => list,
-            Some(_) => return Err(format!("{key} is a list of text")),
-        };
-        if list.len() > max {
-            return Err(format!("{key} holds {max} at most"));
-        }
-        list.iter()
-            .map(|v| match v.as_str() {
-                Some(s) if s.chars().count() <= longest => Ok(s.to_string()),
-                Some(_) => Err(format!("an item of {key} is longer than {longest}")),
-                None => Err(format!("{key} is a list of text")),
-            })
-            .collect()
-    };
     let act = match name {
         "draft.get" => DraftAct::Get,
         "draft.add" => DraftAct::Add {
             text: text("text")?,
             fresh: obj.get("fresh").and_then(Value::as_bool).unwrap_or(false),
         },
-        "draft.picker" => {
-            let keys = texts("keys", MAX_KEYS, MAX_KEY)?;
-            if keys.iter().any(String::is_empty) {
-                return Err("a key can't be empty".to_string());
-            }
-            DraftAct::Picker {
-                label: text("label")?,
-                keys,
-                questions: texts("questions", MAX_KEYS, crate::drafts::MAX_CHARS)?,
-                missing: texts("missing", MAX_KEYS, MAX_KEY)?,
-            }
-        }
         "draft.scratch" => DraftAct::Scratch,
         "draft.clear" => DraftAct::Clear,
         "draft.send" => DraftAct::Send,
@@ -308,18 +267,17 @@ pub fn draft_json(draft: Option<&Draft>) -> Value {
     let Some(d) = draft else {
         return Value::Null;
     };
-    let (kind, pieces, missing) = match &d.body {
-        Body::Text { pieces } => ("text", pieces.len(), vec![]),
-        Body::Picker { keys, missing, .. } => ("picker", keys.len(), missing.clone()),
-    };
+    // `kind` was "picker" for a picker's picks and `missing` their questions without a pick, until
+    // the picker went on 2026-11-14: both stay in the reply's shape, always "text" and empty, for
+    // the callers that read them (lbterm/CONTROL.md)
     json!({
         "pane": d.pane,
         "session": d.session,
-        "kind": kind,
+        "kind": "text",
         "text": d.text(),
-        "pieces": pieces,
+        "pieces": d.pieces.len(),
         "answered": d.answered(),
-        "missing": missing,
+        "missing": Vec::<String>::new(),
     })
 }
 
@@ -432,18 +390,6 @@ mod test {
             op(r#"{"op":"draft.add","text":"1a","fresh":true}"#),
             Op::Draft { pane: None, act: DraftAct::Add { text: "1a".into(), fresh: true } }
         );
-        assert_eq!(
-            op(r#"{"op":"draft.picker","label":"1b 2a","keys":["2","1","1"],"questions":["Which?","And?"]}"#),
-            Op::Draft {
-                pane: None,
-                act: DraftAct::Picker {
-                    label: "1b 2a".into(),
-                    keys: vec!["2".into(), "1".into(), "1".into()],
-                    questions: vec!["Which?".into(), "And?".into()],
-                    missing: vec![],
-                }
-            }
-        );
         for (name, act) in [
             ("draft.scratch", DraftAct::Scratch),
             ("draft.clear", DraftAct::Clear),
@@ -461,12 +407,8 @@ mod test {
         let error = |line: &str| reply(&parse(line).unwrap_err())["error"].as_str().unwrap().to_string();
         assert_eq!(error(r#"{"op":"draft.add"}"#), "draft.add needs text");
         assert_eq!(error(r#"{"op":"draft.get","pane":"x"}"#), "pane is a pane's id, a number");
-        assert_eq!(error(r#"{"op":"draft.picker","keys":["1"]}"#), "draft.picker needs label");
-        assert_eq!(error(r#"{"op":"draft.picker","label":"1a","keys":"1"}"#), "keys is a list of text");
-        assert_eq!(error(r#"{"op":"draft.picker","label":"1a","keys":[""]}"#), "a key can't be empty");
-        let many = vec!["1"; MAX_KEYS + 1];
-        let line = json!({ "op": "draft.picker", "label": "1a", "keys": many }).to_string();
-        assert_eq!(error(&line), format!("keys holds {MAX_KEYS} at most"));
+        // The picker's op went with the picker on 2026-11-14
+        assert_eq!(error(r#"{"op":"draft.picker","label":"1a","keys":["1"]}"#), r#"no op called "draft.picker""#);
         assert_eq!(error(r#"{"op":"draft.dance"}"#), r#"no op called "draft.dance""#);
     }
 

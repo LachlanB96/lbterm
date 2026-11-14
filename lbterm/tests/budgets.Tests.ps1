@@ -707,6 +707,20 @@ Describe 'The report, its table and the history' {
     $t[-1] | Should -Match '^2 passed, 0 over budget, 0 couldn''t be measured, 1 with budgets nothing measured'
   }
 
+  It 'says when the runner never read a frame straight before the one that showed an action, and nothing when it read them all' {
+    $sc = [pscustomobject]@{ Name = 'pick'; Kind = 'action'; Domain = 'local'; What = 'a pick'; Bug = $null; Gui = 'pick'; Runs = 3; Warmup = 0
+      Budgets = [ordered]@{ ms = @{ max = 100 } } }
+    $run = { param($ms, $unread) [ordered]@{ warmup = $false; ms = $ms; shown_frame = 1 + $unread; unread_frames = $unread; top = $null } }
+    $late = Test-BudgetScenario -Scenario $sc -Samples @((& $run 70 0), (& $run 88 2), (& $run 72 0))
+    $late.result | Should -Be 'pass'
+    $late.metrics.unread_frames.max | Should -Be 2
+    $r = New-BudgetReport -Run 'r' -Bin 'C:\b' -Build 'b' -Commit 'c' -Started (Get-Date) -Results @($late) -Runs 3 -Seconds 5
+    (@(Format-BudgetTable $r) -join "`n") | Should -Match 'never read straight before the one that showed it[^\n]*\n  pick: 1 of 3 runs, up to 2'
+    $all = Test-BudgetScenario -Scenario $sc -Samples @((& $run 70 0), (& $run 71 0), (& $run 72 0))
+    $r = New-BudgetReport -Run 'r' -Bin 'C:\b' -Build 'b' -Commit 'c' -Started (Get-Date) -Results @($all) -Runs 3 -Seconds 5
+    (@(Format-BudgetTable $r) -join "`n") | Should -Not -Match 'never read'
+  }
+
   It 'says the medians that moved since the last run of each scenario, from one history for every tree' {
     $file = Join-Path $TestDrive 'drift\history.jsonl'
     $old = Test-BudgetScenario -Scenario (New-Scenario) -Samples @([ordered]@{ frames = 0; gui_thread_ms = 4; cpu_ms = 4.5; top = $null })

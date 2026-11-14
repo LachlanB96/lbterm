@@ -160,6 +160,9 @@ param(
   [string]$Command = 'build',
   # test: the crates whose tests run
   [string[]]$Package,
+  # test: only their ignored tests (cargo test -- --ignored): the reports that need an input of
+  # your own, such as lbterm-extras' report_the_context_bar_on_an_own_transcript (CONTEXT.md)
+  [switch]$Ignored,
   # slot: the branch to start (or carry on) in a slot
   [string]$Branch,
   # slot: the slot to put back on main without landing its branch
@@ -621,7 +624,8 @@ switch ($Command) {
     # A crate's tests on their own, while working on it: the check runs them all
     if (-not $Package) { throw 'test needs -Package <crate>[,<crate>...]' }
     # pwsh -File hands a list over as one string: lbterm-extras,config
-    Invoke-Cargo (@('test', '--release', '-j', $Jobs) + (Get-PackageArgs @($Package -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })))
+    $only = if ($Ignored) { @('--', '--ignored') } else { @() }
+    Invoke-Cargo (@('test', '--release', '-j', $Jobs) + (Get-PackageArgs @($Package -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) + $only)
   }
 
   'unify' { Update-Unify }

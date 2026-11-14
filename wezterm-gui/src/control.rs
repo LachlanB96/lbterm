@@ -1,5 +1,5 @@
 //! LBTerm: the control pipe (lbterm/CONTROL.md), on `config::lbterm::control_pipe(<this GUI's
-//! window class>)`, whose lines are lbterm_extras::control's. Earshot drives LBTerm by voice
+//! window class>)`, whose lines are lbterm_extras::control's. LyreBird drives LBTerm by voice
 //! through it, and `lbterm control` is the same from a shell.
 //!
 //! - One thread makes the pipe's instances and waits for each to be connected; each connection is
@@ -249,7 +249,7 @@ fn in_window(id: Value, op: Op, tx: Sender<String>) {
                     }
                 }
                 Op::Mic { state, ttl, heard } => {
-                    // What Earshot heard, and what it did with it, on this window's strip
+                    // What LyreBird heard, and what it did with it, on this window's strip
                     if let Some(heard) = heard {
                         tw.lbterm_strip_notice(format!("{} {heard}", lbterm_extras::mic::GLYPH));
                     }

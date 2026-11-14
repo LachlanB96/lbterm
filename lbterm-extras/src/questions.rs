@@ -12,6 +12,9 @@
 //! as the whole bullet or paragraph it's in.
 
 use serde::Deserialize;
+
+pub mod pane;
+pub mod weights;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -88,10 +91,15 @@ impl Question {
 }
 
 /// One reply's questions.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct Message {
     #[serde(default)]
     pub id: String,
+    /// When the worker wrote it, in Unix milliseconds: after the reply ended, 5 to 20 s after
+    /// for the most part (lbterm/FLOWS.md, "A right hold, to the question colours", What could
+    /// go 1); 0 when the file doesn't say
+    #[serde(default)]
+    pub at: i64,
     #[serde(default)]
     pub questions: Vec<Question>,
 }
@@ -184,6 +192,38 @@ pub struct Marker {
     pub newest: bool,
 }
 
+/// Where a question's own words are against the screen, for the questions bar's arrow (Lachlan's
+/// E15 of 2026-11-14: a question's block in the bar says which way to scroll to it)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Where {
+    /// Found on the screen, or among what of its reply is (no arrow)
+    On,
+    Above,
+    Below,
+    /// Nothing of any reply in the file is on the screen, so which way isn't known
+    Unknown,
+}
+
+impl Where {
+    /// The arrow the bar draws: up, down, or none
+    pub fn arrow(self) -> Option<bool> {
+        match self {
+            Where::Above => Some(true),
+            Where::Below => Some(false),
+            Where::On | Where::Unknown => None,
+        }
+    }
+}
+
+/// One question of the file and where its own words are ([`Where`]), by its reply's id and its
+/// place in the reply, as the questions bar's rows name it (crate::questions::pane::Row)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Place {
+    pub reply: String,
+    pub colour: usize,
+    pub at: Where,
+}
+
 /// Where a question's own words are on the screen: a voice draft that answers it ticks it there
 /// (lbterm/CONTROL.md, "Drafts"), and rings the next one it hasn't.
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +278,11 @@ pub struct Layout {
     pub newest: Vec<Ask>,
     /// What of the newest reply is on the screen, from where in it to where, in words
     pub shown: Option<Range<usize>>,
+    /// Every question in the file, oldest reply first, and where its own words are: a reply
+    /// with something on the screen tells by where each starts against what of it is there;
+    /// one with nothing there is above the screen when a newer reply is on it, below when an
+    /// older one is, else unknown
+    pub places: Vec<Place>,
 }
 
 impl Layout {
@@ -376,7 +421,7 @@ fn is_line(ch: char) -> bool {
 /// Whether a row's text is a rule Claude Code draws round its input box: a line across and
 /// nothing else, or a named conversation's upper rule, which carries its name near the right end
 /// (`──…── LBTerm InMail ─`, since 2.1.314): at least [`RULE_MIN`] of the line, a space, the
-/// name, a space and the line to the end. The same shape as Earshot's
+/// name, a space and the line to the end. The same shape as LyreBird's
 /// `^\s*─{20,}(?: \S.*? ─+)?\s*$`.
 pub fn is_rule_text(text: &str) -> bool {
     let t = text.trim_matches(|c: char| c.is_whitespace() || is_space(c));
@@ -432,14 +477,71 @@ pub fn conversation_hash(screen: &Screen) -> u64 {
     hasher.finish()
 }
 
-/// The screen's words, top to bottom, in its first `end` rows
-fn screen_words(screen: &Screen, end: usize) -> Vec<Word> {
+/// The rows of each table row Claude Code draws in the screen's first `end` rows: a run of rows
+/// whose first ink is the table's `│`, under its top border or a rule between its rows (`┌`,
+/// `├`) or the screen's top, and over a rule or its bottom border (`├`, `└`) or `end`. Claude
+/// Code's renderer (2026-11-14) draws a rule under the header and between every two rows, wraps
+/// each cell in its own column and centres it in its row's height, so a cell of more than one
+/// line isn't one run of words read row by row (lbterm/FLOWS.md, "A right hold, to the question
+/// colours", What could go 4). A box (`╭`, `╰`) isn't a table
+fn table_rows(screen: &Screen, end: usize) -> Vec<Range<usize>> {
+    let first = |row: usize| screen.rows[row].iter().find(|g| !is_space(g.ch)).map(|g| g.ch);
     let mut out = vec![];
-    for (row, glyphs) in screen.rows.iter().take(end).enumerate() {
-        let text: String = glyphs.iter().map(|g| g.ch).collect();
-        out.extend(words(&text).into_iter().map(|text| Word { text, row }));
+    let mut row = 0;
+    while row < end {
+        if first(row) != Some('\u{2502}') {
+            row += 1;
+            continue;
+        }
+        let start = row;
+        while row < end && first(row) == Some('\u{2502}') {
+            row += 1;
+        }
+        let above = start == 0 || matches!(first(start - 1), Some('\u{250c}' | '\u{251c}'));
+        let below = row == end || matches!(first(row), Some('\u{251c}' | '\u{2514}'));
+        if above && below {
+            out.push(start..row);
+        }
     }
     out
+}
+
+/// The screen's words, top to bottom, in its first `end` rows; a table row's ([`table_rows`]) a
+/// cell at a time, left to right, each cell's lines top to bottom, as the reply's markdown has
+/// them. A word keeps the row it's on, so in a table a word can be on a row above the one before
+fn screen_words(screen: &Screen, end: usize, tables: &[Range<usize>]) -> Vec<Word> {
+    let text = |row: usize| -> String { screen.rows[row].iter().map(|g| g.ch).collect() };
+    let mut tables = tables.iter().peekable();
+    let mut out = vec![];
+    let mut row = 0;
+    while row < end {
+        if let Some(table) = tables.next_if(|t| t.start == row) {
+            let cells: Vec<Vec<String>> = table
+                .clone()
+                .map(|r| text(r).split('\u{2502}').map(str::to_owned).collect())
+                .collect();
+            let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
+            for column in 0..columns {
+                for (r, line) in table.clone().zip(&cells) {
+                    if let Some(cell) = line.get(column) {
+                        out.extend(words(cell).into_iter().map(|text| Word { text, row: r }));
+                    }
+                }
+            }
+            row = table.end;
+            continue;
+        }
+        out.extend(words(&text(row)).into_iter().map(|text| Word { text, row }));
+        row += 1;
+    }
+    out
+}
+
+/// The first and last rows `found`'s words are on: in a table they needn't be its first word's
+/// and its last's
+fn rows_of(found: &[Word]) -> (usize, usize) {
+    let rows = found.iter().map(|w| w.row);
+    (rows.clone().min().unwrap_or(0), rows.max().unwrap_or(0))
 }
 
 /// Whether `quote` is among `on` from index `at`
@@ -459,15 +561,17 @@ fn find(on: &[Word], quote: &[String], least_words: usize, area_end: usize) -> O
         return Some(i..i + n);
     }
     let least = MIN_EDGE_WORDS.max((n * 2 + 4) / 5);
-    let top_end = on.iter().position(|w| w.row >= EDGE_ROWS).unwrap_or(on.len());
-    let bottom_start = on.iter().position(|w| w.row + EDGE_ROWS >= area_end).unwrap_or(on.len());
+    // By each word's row, not by where the rows start among the words: a table's are read a
+    // cell at a time ([`screen_words`]), so a later cell's words come back up to the top rows
+    let top: Vec<usize> = (0..on.len()).filter(|&i| on[i].row < EDGE_ROWS).collect();
+    let bottom: Vec<usize> = (0..on.len()).filter(|&i| on[i].row + EDGE_ROWS >= area_end).collect();
     for k in (least..n).rev() {
         // Its end, starting in the top rows
-        if let Some(i) = (0..top_end).find(|&i| matches_at(on, i, &quote[n - k..])) {
+        if let Some(&i) = top.iter().find(|&&i| matches_at(on, i, &quote[n - k..])) {
             return Some(i..i + k);
         }
         // Its start, ending in the bottom rows
-        if let Some(e) = (bottom_start..on.len()).find(|&e| e + 1 >= k && matches_at(on, e + 1 - k, &quote[..k])) {
+        if let Some(&e) = bottom.iter().find(|&&e| e + 1 >= k && matches_at(on, e + 1 - k, &quote[..k])) {
             return Some(e + 1 - k..e + 1);
         }
     }
@@ -537,8 +641,16 @@ fn is_option(info: &RowInfo, number: u32) -> bool {
 /// the same rows it keeps them.
 pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
     let end = conversation_end(screen);
-    let info: Vec<RowInfo> = screen.rows.iter().take(end).map(|r| row_info(r)).collect();
-    let on = screen_words(screen, end);
+    let mut info: Vec<RowInfo> = screen.rows.iter().take(end).map(|r| row_info(r)).collect();
+    // A table row is one block, its first line starting it: a cell's passage is coloured
+    // across its row's height, its other cells' lines with it
+    let tables = table_rows(screen, end);
+    for table in &tables {
+        for row in table.start + 1..table.end {
+            info[row].starts = false;
+        }
+    }
+    let on = screen_words(screen, end, &tables);
     let mut layout = Layout {
         area: 0..end,
         newest: map
@@ -563,7 +675,13 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
         return layout;
     }
 
+    // Per reply, oldest first: what of it is on the screen (from where to where in it, in
+    // words), and which of its questions' own words are
+    let count = map.messages.len();
+    let mut seen: Vec<Option<(usize, usize)>> = vec![None; count];
+    let mut own_found: Vec<Vec<bool>> = map.messages.iter().map(|m| vec![false; m.questions.len()]).collect();
     for (age, message) in map.messages.iter().rev().enumerate() {
+        let j = count - 1 - age;
         // Each question's own words and each passage: where it is in the reply, and on screen
         struct Item {
             question: usize,
@@ -593,6 +711,10 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
         let (Some(&lo), Some(&hi)) = (shown.iter().min(), shown.iter().max()) else {
             continue;
         };
+        seen[j] = Some((lo, hi));
+        for item in items.iter().filter(|i| i.own && i.found.is_some()) {
+            own_found[j][item.question] = true;
+        }
 
         // Questions first, so their own blocks are theirs
         items.sort_by_key(|i| !i.own);
@@ -600,7 +722,8 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
             let Some(found) = &item.found else {
                 continue;
             };
-            let block = block_of(&info, on[found.start].row, on[found.end - 1].row);
+            let (first, last) = rows_of(&on[found.clone()]);
+            let block = block_of(&info, first, last);
             let mut next = block.end;
             add_band(&mut layout.bands, &info, block.clone(), item.question, item.own);
             if !item.own {
@@ -655,6 +778,30 @@ pub fn lay_out(map: &Map, screen: &Screen) -> Layout {
             }
         }
     }
+    for (j, message) in map.messages.iter().enumerate() {
+        for (qi, q) in message.questions.iter().enumerate() {
+            let at = match seen[j] {
+                Some(_) if own_found[j][qi] => Where::On,
+                Some((lo, _)) if q.pos < lo => Where::Above,
+                Some((_, hi)) if q.pos > hi => Where::Below,
+                Some(_) => Where::On,
+                None => {
+                    let newer = seen[j + 1..].iter().any(Option::is_some);
+                    let older = seen[..j].iter().any(Option::is_some);
+                    match (newer, older) {
+                        (true, false) => Where::Above,
+                        (false, true) => Where::Below,
+                        _ => Where::Unknown,
+                    }
+                }
+            };
+            layout.places.push(Place {
+                reply: message.id.clone(),
+                colour: qi,
+                at,
+            });
+        }
+    }
     layout
 }
 
@@ -683,6 +830,7 @@ mod test {
         Map {
             messages: vec![Message {
                 id: "a".into(),
+                at: 0,
                 questions,
             }],
         }
@@ -909,6 +1057,39 @@ mod test {
     }
 
     #[test]
+    fn every_question_in_the_file_has_a_place_for_the_bars_arrow() {
+        // Scrolled down: Q1 and Q2's questions on the screen, their findings off its top
+        let at = |layout: &Layout| layout.places.iter().map(|p| (p.reply.clone(), p.colour, p.at)).collect::<Vec<_>>();
+        let layout = lay_out(&reply(), &Screen::from_lines(&SCREEN[7..]));
+        assert_eq!(at(&layout), vec![("a".into(), 0, Where::On), ("a".into(), 1, Where::On)]);
+        // Only Q2's question on the screen: Q1's starts before it in the reply, so it's above
+        let layout = lay_out(&reply(), &Screen::from_lines(&SCREEN[12..]));
+        assert_eq!(at(&layout), vec![("a".into(), 0, Where::Above), ("a".into(), 1, Where::On)]);
+        assert_eq!(Where::Above.arrow(), Some(true));
+        // An older reply with nothing on the screen is above the newer one that is; with a
+        // newer one off the screen too, that's below
+        let mut map = reply();
+        let mut older = map.messages[0].clone();
+        older.id = "m0".into();
+        older.questions.iter_mut().for_each(|q| {
+            q.text = "Nothing like anything on the screen at all here".into();
+            q.about.clear();
+        });
+        let mut newer = older.clone();
+        newer.id = "m2".into();
+        map.messages = vec![older, map.messages[0].clone(), newer];
+        let layout = lay_out(&map, &Screen::from_lines(SCREEN));
+        let places = at(&layout);
+        assert_eq!(places[0].2, Where::Above, "{places:?}");
+        assert_eq!(places.last().unwrap().2, Where::Below, "{places:?}");
+        assert_eq!(Where::Below.arrow(), Some(false));
+        // Nothing of any reply on the screen: which way isn't known, so no arrow
+        let blank: Vec<&str> = vec![""; 10];
+        let layout = lay_out(&reply(), &Screen::from_lines(&blank));
+        assert!(layout.places.iter().all(|p| p.at.arrow().is_none()));
+    }
+
+    #[test]
     fn a_question_with_nothing_on_screen_gets_no_marker() {
         // Only Q2's question and nothing of Q1
         let screen = Screen::from_lines(&SCREEN[12..]);
@@ -991,6 +1172,7 @@ mod test {
         let mut m = reply();
         m.messages.push(Message {
             id: "b".into(),
+            at: 0,
             questions: vec![question("Q1", "Drop the summary pane as well?", 12, vec![])],
         });
         let layout = lay_out(&m, &Screen::from_lines(SCREEN));
@@ -1039,6 +1221,7 @@ mod test {
             0,
             Message {
                 id: "old".into(),
+                at: 0,
                 questions: vec![question(
                     "Q1",
                     "Remove the two old background agents with claude rm",
@@ -1149,5 +1332,119 @@ mod test {
     fn colours_go_round() {
         assert_eq!(colour(0), COLOURS[0]);
         assert_eq!(colour(COLOURS.len() + 1), COLOURS[1]);
+    }
+
+    /// lbterm/FLOWS.md, "A right hold, to the question colours", What could go 1: the worker
+    /// writes a reply's questions 8 to 19 s after the reply ends, so a hold before then finds
+    /// only the session's older replies in the file. With none of them on the screen nothing is
+    /// drawn, and what the layout calls the newest reply is the one before, whose questions a
+    /// voice draft's ring and ticks would then go by
+    #[test]
+    fn a_hold_before_the_worker_has_written_the_reply_shows_nothing() {
+        let older = Message {
+            id: "older".into(),
+            at: 0,
+            questions: vec![question("Q1", "Which build should the try window run?", 10, vec![])],
+        };
+        let screen = Screen::from_lines(SCREEN);
+        let before = Map {
+            messages: vec![older.clone()],
+        };
+        let layout = lay_out(&before, &screen);
+        assert!(layout.is_empty());
+        assert_eq!(layout.shown, None);
+        let labels = |l: &Layout| l.newest.iter().map(|a| a.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels(&layout), ["Q1"]);
+        assert_eq!(layout.newest[0].pos, 10, "the older reply's Q1");
+
+        // Once the worker has written it, the same screen is coloured
+        let mut after = reply();
+        after.messages.insert(0, older);
+        let layout = lay_out(&after, &screen);
+        assert!(!layout.is_empty());
+        assert_eq!(labels(&layout), ["Q1", "Q2"]);
+    }
+
+    /// The table of the tests below as Claude Code draws it (its renderer, 2026-11-14): a rule
+    /// across under the header and between every two rows, each cell wrapped in its own column
+    /// and centred in its row's height
+    const TABLE: &[&str] = &[
+        "● Two builds differ:",                          // 0
+        "",                                              // 1
+        "  ┌─────────────────────┬────────────┐",        // 2
+        "  │ What it changes     │ Build      │",        // 3
+        "  ├─────────────────────┼────────────┤",        // 4
+        "  │ the rail's labels   │ slot-1     │",        // 5
+        "  │ come from summaries │            │",        // 6
+        "  └─────────────────────┴────────────┘",        // 7
+        "",                                              // 8
+        "  Q1. Which build should the try window run?", // 9
+        "",                                              // 10
+        "──────────────────────────────────────────",    // 11
+        "❯ ",                                            // 12
+    ];
+
+    /// What could go 4: a passage quoted from a cell longer than its column isn't one run of
+    /// words read row by row. Until stage 2 of feat/questions-pane it wasn't coloured, and since
+    /// it wasn't found it counted as scrolled off: a marker said it was above, though it was on
+    /// the screen (25 of 1,921 passages over the ten days to 2026-11-14 were in a table's row).
+    /// The table is read a column at a time now, and the band is the cell's table row
+    #[test]
+    fn a_passage_wrapped_in_a_table_cell_is_found() {
+        let map = map(vec![question(
+            "Q1",
+            "Which build should the try window run?",
+            20,
+            vec![quote("the rail's labels come from summaries", 8)],
+        )]);
+        let layout = lay_out(&map, &Screen::from_lines(TABLE));
+        assert_eq!(bands(&layout), vec![(9, 1, vec![0], true), (5, 2, vec![0], false)]);
+        assert_eq!(layout.markers, vec![], "nothing of it is off the screen");
+    }
+
+    /// A passage that runs on from a cell into the next of its row, as the reply's markdown
+    /// has it, is found too, and its band is the whole table row, though the shorter cell's
+    /// last word is on a row above its first
+    #[test]
+    fn a_passage_from_one_cell_into_the_next_is_found() {
+        let map = map(vec![question(
+            "Q1",
+            "Which build should the try window run?",
+            20,
+            vec![quote("labels | come from summaries | slot-1", 8)],
+        )]);
+        let layout = lay_out(&map, &Screen::from_lines(TABLE));
+        assert_eq!(bands(&layout), vec![(9, 1, vec![0], true), (5, 2, vec![0], false)]);
+    }
+
+    /// A table row cut off by the top: its second cell's passage starts in the top rows, after
+    /// the first cell's words, which reach past them
+    #[test]
+    fn a_passage_in_a_table_cut_off_by_the_top_still_counts() {
+        let screen = Screen::from_lines(&[
+            "  │ one         │ the summaries   │",          // 0
+            "  │ two         │ thread reads    │",          // 1
+            "  │ three       │ every label the │",          // 2
+            "  │ four        │ rail shows once │",          // 3
+            "  │ five        │ a second        │",          // 4
+            "  └─────────────┴─────────────────┘",          // 5
+            "",                                              // 6
+            "  Q1. Which build should the try window run?", // 7
+            "",                                              // 8
+            "──────────────────────────────────────────",    // 9
+            "❯ ",                                            // 10
+        ]);
+        let map = map(vec![question(
+            "Q1",
+            "Which build should the try window run?",
+            20,
+            vec![quote(
+                "The cache keeps the summaries thread reads every label the rail shows once a second",
+                8,
+            )],
+        )]);
+        let layout = lay_out(&map, &screen);
+        assert_eq!(bands(&layout), vec![(7, 1, vec![0], true), (0, 5, vec![0], false)]);
+        assert_eq!(layout.markers, vec![]);
     }
 }

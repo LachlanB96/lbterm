@@ -14,7 +14,7 @@ the test's server: one (the open tab, working), two (working) and three (a quest
    the pad within 8 of the blend of the rail's colour and the pixel as it was), the other pads as
    they were (park-two.png).
 3. A split in two (parked) adds its new pane to the file.
-4. `LbtermPark 'Toggle'` (the event test-park performing it, through the control pipe, as Earshot
+4. `LbtermPark 'Toggle'` (the event test-park performing it, through the control pipe, as LyreBird
    fires lbterm-park-toggle) parks the open tab: its row says so, the file names its pane, and its
    ring and bar beside the pill stay (park-open-tab.png). Open, the panel shows the rows' words, the
    parked ones with a Parked chip (park-panel.png, for the eye).
@@ -76,7 +76,7 @@ config.cursor_blink_rate = 0
 config.default_cursor_style = 'SteadyBlock'
 config.lbterm_compositor = true
 config.lbterm_tab_panel = { enabled = true, open_delay_ms = 0 }
--- The action as Earshot's lbterm-park-toggle will reach it, through the control pipe
+-- The action as LyreBird's lbterm-park-toggle will reach it, through the control pipe
 wezterm.on('test-park', function(window, pane) window:perform_action(wezterm.action.LbtermPark 'Toggle', pane) end)
 "@
 

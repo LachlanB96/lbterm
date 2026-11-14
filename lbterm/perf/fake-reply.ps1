@@ -7,9 +7,13 @@ does: the reply's mark, its text two columns in, then the input box between two 
 status line. It scrolls the reply itself, PgUp and PgDn half a screen, Home to the top, End to
 the bottom, and sets the pane's claude_session user var as claudehook.exe does.
 
-  pwsh -NoProfile -File fake-reply.ps1 -Sid <session id>
+-Reply weights shows a short reply instead, for perf\weights.ps1: three questions whose options
+carry their shares of 100 (0, 30, 50, 70 and 100, one option's line wrapped onto the next row),
+and an extra and a sentence, each with a bracketed number that isn't one.
+
+  pwsh -NoProfile -File fake-reply.ps1 -Sid <session id> [-Reply questions|weights]
 #>
-param([Parameter(Mandatory)][string]$Sid)
+param([Parameter(Mandatory)][string]$Sid, [ValidateSet('questions', 'weights')][string]$Reply = 'questions')
 $ErrorActionPreference = 'Stop'
 $e = [char]27
 
@@ -35,6 +39,27 @@ $lines.Add('')
 $lines.Add('  Q2. Remove the two old background agents with claude rm? That deletes them, so I''ll only do')
 $lines.Add('  it on your yes.')
 
+if ($Reply -eq 'weights') {
+  $lines.Clear()
+  $lines.Add("$([char]0x25cf) Three choices, each option with its share. The last check took (40) minutes.")
+  $lines.Add('')
+  $lines.Add('  Q1. Where should the counts go?')
+  $lines.Add('  1a. Monthly JSONL (70): the dashboard reads a month at a time')
+  $lines.Add('  1b. One file for all of it (30): simpler, but it grows')
+  $lines.Add('  1c. A table in the database (0): nothing here reads one')
+  $lines.Add('')
+  $lines.Add('  Q2. Which build does the check run on?')
+  $lines.Add('  2a. The slot''s own build, kept between runs so a build redoes only what changed, and')
+  $lines.Add('  its tests with it (50): quicker after the first')
+  $lines.Add('  2b. A fresh build each time (50): slower, but nothing carried over')
+  $lines.Add('')
+  $lines.Add('  Q3. Keep the old captures?')
+  $lines.Add('  3a. Yes (100): the look pairs need them')
+  $lines.Add('  3b. No (0): they take disk')
+  $lines.Add('')
+  $lines.Add('  Extras, yes or no each:')
+  $lines.Add('  E4. Colour the brackets too (60): an extra has no share, so this stays as it is')
+}
 # Rows scrolled up from the bottom
 $offset = 0
 

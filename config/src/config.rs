@@ -399,6 +399,12 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub lbterm_next_question_extras: bool,
 
+    /// LBTerm: an option's share of 100 in a Claude pane, "(70)", drawn with its brackets in a
+    /// colour from red at 0 through amber to green at 100 (render/triggers.rs, lbterm/QUESTIONS.md,
+    /// "The weights"); off, they keep the text's colour (Lachlan's 10+ of 2026-11-14)
+    #[dynamic(default = "default_true")]
+    pub lbterm_question_weights: bool,
+
     /// LBTerm: a `#RRGGBB` colour code in a pane's text gets a bar in its own colour along the
     /// foot of its cells, every character staying as it is (render/screen_line.rs, lbterm/HEX.md)
     #[dynamic(default = "default_true")]
@@ -438,6 +444,13 @@ pub struct Config {
     /// (render/context.rs)
     #[dynamic(default)]
     pub lbterm_context: Option<crate::lbterm::LbtermContext>,
+
+    /// LBTerm: the context bar down the window's right, in the objectives strip's room: the open
+    /// tab's Claude conversation's whole context window, a section for each file in it
+    /// (render/context_bar.rs, lbterm/CONTEXT.md). Needs `lbterm_context`, `lbterm_summaries` and
+    /// the tab panel; wins over `lbterm_objectives`
+    #[dynamic(default)]
+    pub lbterm_context_bar: Option<crate::lbterm::LbtermContextBar>,
 
     /// LBTerm: the objectives panel down the right of the window: a mark per tab saying what
     /// became of what its Claude session was started for, and cards of each session's objectives

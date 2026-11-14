@@ -706,7 +706,7 @@ fn until(done: impl Fn() -> bool) -> bool {
 fn store(projects: &std::path::Path) -> (Conversations, Arc<std::sync::Mutex<Vec<String>>>) {
     let woken: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let w = Arc::clone(&woken);
-    let store = Conversations::start(projects.to_path_buf(), None, move |sid: &str| w.lock().unwrap().push(sid.to_string()));
+    let store = Conversations::start(projects.to_path_buf(), None, move |sid: &str, _| w.lock().unwrap().push(sid.to_string()));
     (store, woken)
 }
 
@@ -825,7 +825,7 @@ fn a_transcript_written_as_its_watch_is_made_is_read() -> anyhow::Result<()> {
     let w = Arc::clone(&written);
     let store = Conversations::start_probed(
         dir.path().to_path_buf(),
-        |_: &str| {},
+        |_: &str, _| {},
         move || {
             if !w.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 std::fs::create_dir_all(&folder).unwrap();
@@ -864,7 +864,7 @@ fn a_transcript_written_as_a_second_session_joins_a_watch_that_holds_is_read() -
     let (f, on, w) = (Arc::clone(&follows), Arc::clone(&armed), Arc::clone(&written));
     let store = Conversations::start_probed(
         dir.path().to_path_buf(),
-        |_: &str| {},
+        |_: &str, _| {},
         move || {
             f.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if on.load(std::sync::atomic::Ordering::Acquire) && !w.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -976,4 +976,258 @@ fn quoted_context_records_in_a_message_are_not_read_as_records() {
     let quoted = r#"{"type":"instructions","files":[{"path":"C:/x/CLAUDE.md","type":"User","content":"x"}]}"#;
     f.feed(format!("{}\n", prompt(quoted, "01:00:00")).as_bytes());
     assert!(f.conversation.snapshot().context.files.is_empty());
+}
+
+/// The made-up time `at` on 2026-10-28, in Unix milliseconds
+fn ms(at: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(&format!("2026-10-28T{at}Z")).unwrap().timestamp_millis()
+}
+
+#[test]
+fn each_message_to_claude_starts_a_turn_with_the_questions_his_prompt_names() {
+    use crate::drafts::{Mark, Pick};
+    let c = read();
+    let turns: Vec<&Turn> = c.turns.iter().collect();
+    // /clear, his first prompt, the task finishing (no prompt of his), his second; a meta record,
+    // a tool's result and an interrupt start none
+    assert_eq!(turns.len(), 4, "{turns:#?}");
+    assert_eq!(turns.iter().map(|t| t.at_ms).collect::<Vec<_>>(), vec![ms("01:00:01"), ms("01:00:02"), ms("01:00:18"), ms("01:00:19")]);
+    // A turn last wrote what a snapshot shows: the first prompt's through its turn's end, the
+    // second's through the picker's answer; a subagent's words aren't its
+    assert_eq!(turns[1].last_ms, ms("01:00:17"));
+    assert_eq!(turns[3].last_ms, ms("01:00:23"));
+    assert!(turns.iter().all(|t| t.picks.is_empty()));
+
+    // An answer's picks, line by line, past his words before them
+    let mut f = Follow::default();
+    let lines = [
+        says("Q1. Which way?\n\nE2. Tidy up too?", "02:00:00"),
+        turn_end(1000, "02:00:01"),
+        prompt("ok\n1a\n2- not now", "02:00:30"),
+        says("Done.", "02:00:31"),
+    ];
+    f.feed(format!("{}\n", lines.join("\n")).as_bytes());
+    let snap = f.conversation.snapshot();
+    let turn = snap.turns.iter().last().unwrap();
+    assert_eq!(
+        turn.picks,
+        vec![Pick { number: 1, options: "a".into(), mark: None }, Pick { number: 2, options: "".into(), mark: Some(Mark::No) }]
+    );
+    assert_eq!((turn.at_ms, turn.last_ms), (ms("02:00:30"), ms("02:00:31")));
+    // A snapshot shares the turns' pieces until one changes
+    let again = f.conversation.snapshot();
+    assert!(again.turns.shares_piece(&snap.turns, 0));
+}
+
+/// A queued message, as Claude Code writes one it took while Claude was working: a
+/// `queue-operation` record, then an `attachment` of type `queued_command`, and no `user` record
+fn queued(text: &str, origin: &str, at: &str) -> String {
+    line(
+        json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": text, "commandMode": "prompt", "origin": {"kind": origin}}}),
+        at,
+    )
+}
+
+#[test]
+fn a_prompt_he_typed_while_claude_worked_starts_a_turn_with_the_questions_it_names() {
+    use crate::drafts::{Mark, Pick};
+    let mut f = Follow::default();
+    let lines = [
+        prompt("Build it", "03:00:00"),
+        says("Building.", "03:00:01"),
+        line(json!({"type": "queue-operation", "operation": "enqueue", "content": "1+\n2a"}), "03:00:02"),
+        queued("1+\n2a", "human", "03:00:03"),
+        says("Taking 1 and 2a.", "03:00:04"),
+        queued("From Website: the page is up", "peer", "03:00:05"),
+        line(
+            json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": "<task-notification><summary>Agent \"x\" finished</summary></task-notification>", "commandMode": "task-notification", "origin": {"kind": "task-notification"}}}),
+            "03:00:06",
+        ),
+    ];
+    f.feed(format!("{}\n", lines.join("\n")).as_bytes());
+    let snap = f.conversation.snapshot();
+    let turns: Vec<&Turn> = snap.turns.iter().collect();
+    // His prompt; his queued answer, which wrote on to Claude's words after it; another
+    // session's message and a task finishing, with no picks
+    assert_eq!(turns.iter().map(|t| t.at_ms).collect::<Vec<_>>(), vec![ms("03:00:00"), ms("03:00:03"), ms("03:00:05"), ms("03:00:06")]);
+    assert_eq!(turns[0].last_ms, ms("03:00:01"));
+    assert_eq!(turns[1].last_ms, ms("03:00:04"));
+    assert_eq!(
+        turns[1].picks,
+        vec![Pick { number: 1, options: "".into(), mark: Some(Mark::Yes) }, Pick { number: 2, options: "a".into(), mark: None }]
+    );
+    assert!(turns[2].picks.is_empty() && turns[3].picks.is_empty());
+    // Whose: his two, typed and queued; not the other session's or the task's
+    assert_eq!(turns.iter().map(|t| t.his).collect::<Vec<_>>(), vec![true, true, false, false]);
+    // His queued prompt is a prompt's block with its mark on the strip, as a typed one is
+    // (Lachlan's 7a of 2026-11-14): Claude Code draws it with the same component. The other
+    // session's message has none, and the task its line
+    let k: Vec<BlockKind> = snap.blocks.iter().map(|b| b.kind).collect();
+    assert_eq!(k.iter().filter(|&&b| b == BlockKind::Prompt).count(), 2, "{k:?}");
+    assert_eq!(k.last(), Some(&BlockKind::Note), "{k:?}");
+    let events = f.conversation.events();
+    let prompts: Vec<&str> = events.iter().filter(|e| e.kind == Kind::Prompt).map(|e| e.text.as_str()).collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(prompts[1].starts_with("1+"), "{prompts:?}");
+}
+
+/// The context bar's numbers from a transcript's own records (lbterm/CONTEXT.md, "The context
+/// bar"): what's in use from each main-chain reply, the scale from the first request, Claude
+/// Code's parts from its requests and skills list, a memory file read, and what a subagent, a
+/// pulled-in file, a compaction and a resume do to them
+#[test]
+fn the_context_bars_numbers_come_from_the_replies_and_the_recorded_requests() {
+    use crate::context::{InUse, Kind as K, Scale};
+    use crate::context_bar::{sections, Waiting, What};
+    let own = "C:/Users/me/Work/Harbor";
+    let memory = "C:/Users/me/.claude/projects/C--Users-me-Work-Harbor/memory";
+    let files = json!({"type": "instructions", "files": [
+        {"path": "C:/Users/me/.claude/CLAUDE.md", "type": "User", "content": "u".repeat(4000)},
+        {"path": "C:/Users/me/Work/Harbor/CLAUDE.md", "type": "Project", "content": "p".repeat(2000)},
+        {"path": format!("{memory}/MEMORY.md"), "type": "AutoMem", "content": "m".repeat(400)},
+    ]});
+    let usage = |n: u64| json!({"input_tokens": 2, "cache_read_input_tokens": n - 1002, "cache_creation_input_tokens": 1000, "output_tokens": 50});
+    let reply = |n: u64, at: &str| {
+        line(json!({"type": "assistant", "cwd": own, "message": {"role": "assistant", "model": "m", "usage": usage(n),
+            "content": [{"type": "text", "text": "Done."}]}}), at)
+    };
+    let tools = json!([{"name": "Read", "description": "d".repeat(3990)}]);
+    let shape = |hash: &str, system: usize| {
+        json!({"type": "api-request-shape", "shapeHash": hash, "shape": {"system": [{"type": "text", "text": "s".repeat(system)}], "tools": tools.clone()}}).to_string()
+    };
+    let blob = |hash: &str, chars: usize| {
+        json!({"type": "api-request-blob", "hash": hash, "message": {"role": "user", "content": [{"type": "text", "text": "b".repeat(chars)}]}}).to_string()
+    };
+    let request = |shape: &str, keep: u64, tail: &[&str]| {
+        json!({"type": "api-request", "querySource": "repl_main_thread", "shapeHash": shape, "keep": keep, "tail": tail}).to_string()
+    };
+    let skills = json!({"type": "skill_listing", "isInitial": true, "content": "x"});
+    let mut f = Follow::default();
+    let mut feed = |lines: &[String]| {
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        f.feed(text.as_bytes());
+        f.conversation.snapshot()
+    };
+    let before = feed(&[
+        line(json!({"type": "user", "cwd": own, "message": {"role": "user", "content": "go"}}), "01:00:00"),
+        attached(files.clone(), own, "01:00:01"),
+        line(json!({"type": "attachment", "cwd": own, "attachment": skills, "rendered": [{"content": "k".repeat(800)}]}), "01:00:01"),
+    ]);
+    assert_eq!(before.context.in_use, InUse::Unknown);
+    assert_eq!(sections(&before.context, Some(200_000)), Err(Waiting::FirstReply));
+
+    // The first request, its blobs, and its reply: what's in use, and the scale
+    let tools_est = crate::context::tokens(&tools.to_string());
+    let first = feed(&[shape("s1", 4000), blob("m1", 8000), blob("m2", 2000), request("s1", 0, &["m1", "m2"]), reply(30_000, "01:00:05")]);
+    let estimated = (1000 + tools_est + 2500) as u64;
+    assert_eq!(first.context.in_use, InUse::Known(30_000));
+    assert_eq!(first.context.replies, 1, "a reply to a new request counts");
+    assert_eq!(first.context.scale, Some(Scale { real: 30_000, estimated }));
+    let parts = first.context.parts.unwrap();
+    assert_eq!((parts.system, parts.tools, parts.skills), (1000, tools_est, 200));
+    assert_eq!(sections(&first.context, None), Err(Waiting::Window), "a window size not yet known");
+
+    // A subagent's reply is its own context's size, not this conversation's
+    let side = feed(&[line(
+        json!({"type": "assistant", "isSidechain": true, "message": {"role": "assistant", "usage": usage(500_000), "content": []}}),
+        "01:01:00",
+    )]);
+    assert_eq!(side.context.in_use, InUse::Known(30_000));
+    assert_eq!(side.context.replies, 1, "a subagent's reply isn't the conversation's");
+
+    // Another project's CLAUDE.md pulled in, and a memory file read
+    let pulled = json!({"type": "nested_memory", "path": "C:/Users/me/Work/Ledger/CLAUDE.md", "displayPath": "CLAUDE.md",
+        "content": {"path": "C:/Users/me/Work/Ledger/CLAUDE.md", "type": "Project", "content": "n".repeat(4000)}});
+    let read = feed(&[
+        attached(pulled, "C:/Users/me/Work/Ledger", "01:02:00"),
+        tool("r1", "Read", json!({"file_path": format!("{memory}/feedback_x.md")}), "01:02:01"),
+        line(json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "r".repeat(1200)}]}}), "01:02:02"),
+        reply(36_000, "01:02:03"),
+    ]);
+    let tail: Vec<(K, usize, bool)> = read.context.files.iter().skip(3).map(|f| (f.kind, f.tokens, f.elsewhere)).collect();
+    assert_eq!(tail, vec![(K::Later, 1000, true), (K::Remembered, 300, false)]);
+    let bar = sections(&read.context, Some(200_000)).unwrap();
+    let whats: Vec<What> = bar.sections.iter().map(|s| s.what).collect();
+    use What as W;
+    assert_eq!(whats, vec![W::User, W::Project, W::MemoryIndex, W::Elsewhere, W::Memory, W::System, W::Tools, W::Skills, W::Conversation, W::Free]);
+    assert_eq!((bar.in_use, bar.window, bar.estimate), (36_000, 200_000, false));
+
+    // A resume: the start's files again, a new process's first request and its blobs. Nothing is
+    // dropped, the scale stays, and the blobs aren't read
+    let resumed = feed(&[
+        attached(files.clone(), own, "02:00:00"),
+        shape("s2", 8000),
+        blob("m9", 40_000),
+        request("s2", 0, &["m9"]),
+        reply(41_000, "02:00:05"),
+    ]);
+    assert_eq!(resumed.context.files.len(), 5, "what was pulled in is still in the history");
+    assert_eq!(resumed.context.scale, first.context.scale);
+    assert_eq!(resumed.context.parts.unwrap().system, 2000, "the latest request's system prompt");
+    assert_eq!(resumed.context.in_use, InUse::Known(41_000));
+
+    // A compaction: the files go, and what's in use is its own size until the next reply
+    let compacted = feed(&[line(
+        json!({"type": "system", "subtype": "compact_boundary", "cwd": own, "compactMetadata": {"trigger": "manual", "preTokens": 41_000, "postTokens": 3000}}),
+        "03:00:00",
+    )]);
+    assert!(compacted.context.files.is_empty());
+    assert_eq!(compacted.context.in_use, InUse::Compacted { post: 3000 });
+    let after = feed(&[attached(files, own, "03:00:01")]);
+    let bar = sections(&after.context, Some(200_000)).unwrap();
+    assert!(bar.estimate);
+    assert_eq!(bar.sections.iter().find(|s| s.what == W::Conversation).unwrap().tokens, 3000);
+    let next = feed(&[request("s2", 4, &["m10"]), reply(52_000, "03:00:05")]);
+    assert_eq!(next.context.in_use, InUse::Known(52_000));
+    assert!(!sections(&next.context, Some(200_000)).unwrap().estimate);
+    assert!(!f.conversation.wants_blobs(), "no blob is read once the scale is made");
+}
+
+/// With `LBTERM_CONTEXT_TRANSCRIPT` naming a transcript (one of your own: never copy it into the
+/// repo), fails on purpose with the context bar's sections read from it by the reader, beside
+/// what Claude Code's /context said the last time it ran there (its `contextUsage`), the
+/// transcript read up to that record: lbterm/CONTEXT.md, "Measured, against Claude Code's own
+/// /context". The window is /context's, else `LBTERM_CONTEXT_WINDOW`, else 1M. Ignored, so the
+/// check never counts it passed for having nothing to read (lbterm/PITFALLS.md, 11): run it with
+/// `lbterm.ps1 test -Package lbterm-extras -Ignored`.
+#[test]
+#[ignore = "a report on a transcript LBTERM_CONTEXT_TRANSCRIPT names: lbterm.ps1 test -Package lbterm-extras -Ignored"]
+fn report_the_context_bar_on_an_own_transcript() {
+    let Ok(path) = std::env::var("LBTERM_CONTEXT_TRANSCRIPT") else {
+        return;
+    };
+    let text = std::fs::read_to_string(&path).expect("the transcript LBTERM_CONTEXT_TRANSCRIPT names");
+    let lines: Vec<&str> = text.lines().collect();
+    let asked = lines.iter().rposition(|l| l.contains(r#""contextUsage""#));
+    let mut f = Follow::default();
+    for l in &lines[..asked.unwrap_or(lines.len())] {
+        f.feed(format!("{l}\n").as_bytes());
+    }
+    let snapshot = f.conversation.snapshot();
+    let usage: Option<Value> = asked.and_then(|i| serde_json::from_str::<Value>(lines[i]).ok()).and_then(|r| r.get("contextUsage").cloned());
+    let window = usage
+        .as_ref()
+        .and_then(|u| u.get("raw_max_tokens").and_then(Value::as_u64))
+        .or_else(|| std::env::var("LBTERM_CONTEXT_WINDOW").ok().and_then(|w| w.parse().ok()))
+        .unwrap_or(1_000_000);
+    let c = &snapshot.context;
+    let mut report = format!("in use {:?}, scale {:?}, parts {:?}, window {window}\n", c.in_use, c.scale, c.parts);
+    match crate::context_bar::sections(c, Some(window)) {
+        Err(waiting) => report += &format!("the bar waits: {}\n", waiting.words()),
+        Ok(bar) => {
+            for s in &bar.sections {
+                report += &format!("  {:<14} {:>8}  {}\n", s.what.word(), s.tokens, s.path.as_deref().unwrap_or(""));
+            }
+        }
+    }
+    if let Some(u) = usage {
+        report += &format!("/context: total {}\n", u.get("total_tokens").unwrap_or(&Value::Null));
+        for c in u.get("categories").and_then(Value::as_array).into_iter().flatten() {
+            report += &format!("  {:<26} {}\n", c.get("name").and_then(Value::as_str).unwrap_or(""), c.get("tokens").unwrap_or(&Value::Null));
+        }
+        for m in u.get("memory_files").and_then(Value::as_array).into_iter().flatten() {
+            report += &format!("  memory file {:>8}  {}\n", m.get("tokens").unwrap_or(&Value::Null), m.get("path").and_then(Value::as_str).unwrap_or(""));
+        }
+    }
+    panic!("the context bar on {path}:\n{report}");
 }

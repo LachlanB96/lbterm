@@ -221,6 +221,7 @@ fn the_window_s_visuals_are_made_in_their_order() {
         ("panes", &c.panes),
         ("focus", &c.focus),
         ("over", &c.over),
+        ("over_top", &c.over_top),
         ("sides", &c.sides),
         ("swap", &c.swap),
         ("lights", &c.lights),
@@ -228,6 +229,7 @@ fn the_window_s_visuals_are_made_in_their_order() {
         ("strip_card", &c.strip_card),
         ("objectives", &c.objectives),
         ("readout", &c.readout),
+        ("questions_pane", &c.questions_pane),
         ("panel", &c.panel),
         ("plus", &c.plus),
         ("picker", &c.picker),
@@ -442,3 +444,180 @@ mod rail;
 mod flight;
 /// The light running its laps along a suggested tab connection's line
 mod connections;
+
+/// The questions pane comes out from under the window's right edge on `panel_open` as a right
+/// hold starts: its slider inside a clip that ends at the edge, from the clip's right edge to
+/// nothing. Let go mid-slide, it turns round where it is and goes back under the edge on
+/// `panel_close`, showing until that's done; put away, nothing of it shows; and with motion off
+/// it's out at once (render/questions_pane.rs, lbterm/QUESTIONS.md, "The questions pane")
+#[test]
+fn the_questions_pane_slides_out_from_under_the_window_s_edge_and_turns_round_where_it_is() {
+    let screen = Screen::new();
+    let motion = settings(true);
+    let none = |_: PaneId| false;
+    screen.frame(&[(0, WINDOW)], Some(0), &motion, &none);
+    // The card and its shadow, a gutter in from the edge, and what of the window it may show in:
+    // up to the edge
+    let bounds = PixelRect::new(W as i32 - 92, 30, 90, 200);
+    let clip = PixelRect::new(W as i32 - 92, 30, 92, 200);
+    let out = 92.0;
+    let bar = |open| crate::termwindow::render::questions_pane::BarVisual { bounds, clip, open, travel: out, push: None };
+    let prepare = |want: Option<crate::termwindow::render::questions_pane::BarVisual>, motion: &MotionSettings| {
+        let gpu = &screen.gpu;
+        screen
+            .compositor
+            .prepare_questions_pane(&gpu.instance, &gpu.device, &base(), want, motion)
+            .expect("prepare_questions_pane");
+        screen.commit();
+    };
+
+    let before = Instant::now();
+    prepare(Some(bar(true)), &motion);
+    let (container, slider, edges) = {
+        let s = screen.compositor.questions_pane_slide.borrow();
+        (
+            screen.object(s.container.as_ref().expect("its container")),
+            screen.object(s.slider.as_ref().expect("its slider")),
+            screen.object(s.clip.as_ref().expect("its clip")),
+        )
+    };
+    let tree = screen.recorder.tree();
+    assert_eq!(tree.children(screen.object(&screen.compositor.questions_pane)), vec![container], "{tree}");
+    assert_eq!(tree.link(container, "Clip"), Some(edges), "{tree}");
+    for (edge, value) in [("Left", W as f32 - 92.0), ("Top", 30.0), ("Right", W as f32), ("Bottom", 230.0)] {
+        assert_eq!(tree.value(edges, edge), Some(value), "{edge}\n{tree}");
+    }
+    assert_eq!(
+        tree.curve(slider, "OffsetX").and_then(|c| c.segments()),
+        Some(on(&motion.panel_open, out, 0.0, PIXEL_EPSILON)),
+        "{tree}"
+    );
+    assert!(screen.played("questions.pane", before).is_some(), "questions.pane isn't in flight");
+
+    // Let go part way out: back from where it is, with its speed, not from either end
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    prepare(Some(bar(false)), &motion);
+    let tree = screen.recorder.tree();
+    let back = tree.curve(slider, "OffsetX").and_then(|c| c.segments()).expect("the slide back");
+    let from = back.cubics.first().expect("a curve").coefficients[0] as f64;
+    assert!(from > 0.5 && from < out - 0.5, "turned round from {}, not where it was\n{}", from, tree);
+    assert_eq!(back.end_value, out as f32, "{tree}");
+    let (showing, settles) = screen.compositor.questions_pane_showing(Instant::now());
+    assert!(showing && settles.is_some(), "it shows until it's back under the edge");
+
+    // Put away: nothing of it shows
+    prepare(None, &motion);
+    let tree = screen.recorder.tree();
+    assert_eq!(tree.value(edges, "Right"), Some(0.0), "{tree}");
+    assert_eq!(screen.compositor.questions_pane_showing(Instant::now()), (false, None));
+
+    // Motion off: out at once
+    prepare(Some(bar(true)), &settings(false));
+    let tree = screen.recorder.tree();
+    assert_eq!(tree.value(slider, "OffsetX"), Some(0.0), "{tree}");
+    // With no push nothing else moves
+    assert_eq!(tree.value(screen.object(&screen.compositor.panes), "OffsetX"), None, "{tree}");
+}
+
+/// The questions bar's push (Lachlan's 16 of 2026-11-14): as the bar comes out, everything under
+/// the tab bar that isn't over the window (the panes, their outline, `over`, the strips' pictures,
+/// the objectives' and the context bar's visuals, the tab panel) moves left as far, on one
+/// animation of the bar's curve from the bar's commit, so they stay `travel` apart all the way;
+/// `over` is cut at the tab bar's bottom and the band above shows through `over_top`, which
+/// doesn't move. Let go mid-slide, all of it comes back from where it is; put away, it's all
+/// where it was, still, and `over` is whole again; motion off, pushed at once
+#[test]
+fn the_questions_bar_pushes_the_rail_and_the_conversation_left_as_far_as_it_comes_out() {
+    let screen = Screen::new();
+    let motion = settings(true);
+    let none = |_: PaneId| false;
+    screen.frame(&[(0, WINDOW)], Some(0), &motion, &none);
+    // The bar a gutter in from the edge, the rail's strip (a gutter and the rail) its travel
+    let travel = 72.0;
+    let bounds = PixelRect::new(W as i32 - 73, 30, 70, 560);
+    let clip = PixelRect::new(W as i32 - 73, 30, 73, 560);
+    let band = 28;
+    let bar = |open| crate::termwindow::render::questions_pane::BarVisual { bounds, clip, open, travel, push: Some(band) };
+    let prepare = |want: Option<crate::termwindow::render::questions_pane::BarVisual>, motion: &MotionSettings| {
+        let gpu = &screen.gpu;
+        screen
+            .compositor
+            .prepare_questions_pane(&gpu.instance, &gpu.device, &base(), want, motion)
+            .expect("prepare_questions_pane");
+        screen.commit();
+    };
+    let c = &screen.compositor;
+    let pushed = [
+        ("panes", &c.panes),
+        ("focus", &c.focus),
+        ("over", &c.over),
+        ("sides", &c.sides),
+        ("objectives", &c.objectives),
+        ("panel", &c.panel),
+    ];
+
+    let before = Instant::now();
+    prepare(Some(bar(true)), &motion);
+    let slider = screen.object(c.questions_pane_slide.borrow().slider.as_ref().expect("its slider"));
+    let tree = screen.recorder.tree();
+    for (name, visual) in pushed {
+        assert_eq!(tree.curve(screen.object(visual), "OffsetX").and_then(|c| c.segments()), Some(on(&motion.panel_open, 0.0, -travel, PIXEL_EPSILON)), "{name}\n{tree}");
+    }
+    assert_eq!(
+        tree.curve(slider, "OffsetX").and_then(|c| c.segments()),
+        Some(on(&motion.panel_open, travel, 0.0, PIXEL_EPSILON)),
+        "the bar's own slide\n{tree}"
+    );
+    assert!(screen.played("questions.push", before).is_some(), "questions.push isn't in flight");
+    // `over` below the tab bar moves; the band above it shows through `over_top`, which stays
+    let over_clip = tree.link(screen.object(&c.over), "Clip").expect("over's clip");
+    for (edge, value) in [("Left", 0.0), ("Top", band as f32), ("Right", W as f32), ("Bottom", H as f32)] {
+        assert_eq!(tree.value(over_clip, edge), Some(value), "over's {edge}\n{tree}");
+    }
+    let top = screen.object(&c.over_top);
+    let top_clip = tree.link(top, "Clip").expect("over_top's clip");
+    for (edge, value) in [("Left", 0.0), ("Top", 0.0), ("Right", W as f32), ("Bottom", band as f32)] {
+        assert_eq!(tree.value(top_clip, edge), Some(value), "over_top's {edge}\n{tree}");
+    }
+    assert!(tree.link(top, "Content").is_some(), "over_top shows over's swapchain\n{}", tree);
+    assert_eq!(tree.curve(top, "OffsetX"), None, "the tab bar stays\n{tree}");
+    for (name, visual) in [("swap", &c.swap), ("hover", &c.hover), ("menus", &c.menus), ("lights", &c.lights)] {
+        assert_eq!(tree.curve(screen.object(visual), "OffsetX"), None, "{name} isn't pushed\n{tree}");
+    }
+
+    // Let go part way: all of it back from where it is, still `travel` from the bar
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    prepare(Some(bar(false)), &motion);
+    let tree = screen.recorder.tree();
+    let back = tree.curve(screen.object(&c.panes), "OffsetX").and_then(|c| c.segments()).expect("the push back");
+    let slide = tree.curve(slider, "OffsetX").and_then(|c| c.segments()).expect("the bar's slide back");
+    let from = back.cubics.first().expect("a curve").coefficients[0] as f64;
+    assert!(from < -0.5 && from > -travel + 0.5, "turned round from {}, not where it was\n{}", from, tree);
+    assert_eq!(back.end_value, 0.0, "{tree}");
+    let bar_from = slide.cubics.first().expect("a curve").coefficients[0] as f64;
+    assert!((bar_from - from - travel).abs() < 1e-3, "the bar at {}, the push at {}: not {} apart", bar_from, from, travel);
+    for (name, visual) in pushed {
+        assert_eq!(tree.curve(screen.object(visual), "OffsetX").and_then(|c| c.segments()), tree.curve(screen.object(&c.panes), "OffsetX").and_then(|c| c.segments()), "{name}\n{tree}");
+    }
+
+    // Put away: everything where it was, still, `over` whole and `over_top` showing nothing
+    prepare(None, &motion);
+    let tree = screen.recorder.tree();
+    for (name, visual) in pushed {
+        assert_eq!(tree.value(screen.object(visual), "OffsetX"), Some(0.0), "{name}\n{tree}");
+    }
+    assert_eq!(tree.link(screen.object(&c.over), "Clip"), None, "{tree}");
+    assert_eq!(tree.link(top, "Clip"), None, "{tree}");
+    assert_eq!(tree.link(top, "Content"), None, "{tree}");
+
+    // Motion off: pushed at once
+    prepare(Some(bar(true)), &settings(false));
+    let tree = screen.recorder.tree();
+    for (name, visual) in pushed {
+        assert_eq!(tree.value(screen.object(visual), "OffsetX"), Some(-travel as f32), "{name}\n{tree}");
+    }
+}
+
+/// The context bar's slides: the thin numbers' pane coming out from under the widened bar's
+/// moving edge in its slide, and going back
+mod context_bar;

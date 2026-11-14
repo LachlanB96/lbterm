@@ -1,6 +1,6 @@
 //! LBTerm: every menu's fade and its highlight's glide, built once (lbterm/NEW-TAB.md, section 6;
 //! lbterm/DESIGN.md, "Menus"). The tab menu, the prompt list, the Conductor's menu, and the
-//! InMail list, the agenda, the context pill's list and the + menu (which share z-layers 77 to
+//! InMail list, the agenda and the + menu (which share z-layers 77 to
 //! 79, only one of them ever open) draw their light and card with [`TermWindow::lbterm_menu_card`] and their lit row with
 //! [`TermWindow::lbterm_menu_light`]; the rules are `lbterm_motion::menu`'s and DWM plays them
 //! (the compositor's `prepare_menus`).
@@ -61,8 +61,8 @@ pub enum Slot {
     Prompt = 1,
     /// The Conductor's menu (render/conductor.rs)
     Conductor = 2,
-    /// The InMail button's list (render/inbox.rs), the agenda (render/agenda.rs), the context
-    /// pill's list (render/context.rs) and the + menu (render/new_tab.rs)
+    /// The InMail button's list (render/inbox.rs), the agenda (render/agenda.rs) and the + menu
+    /// (render/new_tab.rs)
     List = 3,
 }
 
@@ -310,8 +310,7 @@ impl TermWindow {
         }
     }
 
-    /// A key a list menu (the prompt list, the Conductor's, the InMail list, the agenda, the
-    /// context list) has no
+    /// A key a list menu (the prompt list, the Conductor's, the InMail list, the agenda) has no
     /// use for: its card's edge flares once (`menu::bump`), unless it's a modifier on its own. Never the pane's
     pub(crate) fn lbterm_menu_stray(&self, slot: Slot, key: &KeyCode, mods: KeyModifiers) {
         if menu_key(key, mods) != menu::Key::Modifier {
@@ -320,7 +319,7 @@ impl TermWindow {
     }
 
     /// Whether a menu is open that takes every key (Lachlan's 7b of 2026-11-07): the tab menu, the
-    /// prompt list, the Conductor's menu, the InMail list, the agenda, the context pill's list, the
+    /// prompt list, the Conductor's menu, the InMail list, the agenda, the
     /// new-tab picker or its + menu. While one is, keyevent.rs acts on no binding (its raw passes
     /// and key_event_impl's ask this before the leader and the bindings) and gives each key to the
     /// menu ([`TermWindow::lbterm_menus_key`]): a bound key it has no use for flares the card's
@@ -337,7 +336,6 @@ impl TermWindow {
             || self.lbterm_conductor_menu_is_open()
             || self.lbterm_inbox_list_is_open()
             || self.lbterm_agenda_list_is_open()
-            || self.lbterm_context_list_is_open()
             || self.lbterm_new_tab_is_open()
     }
 
@@ -353,7 +351,6 @@ impl TermWindow {
             || self.lbterm_conductor_menu_is_open()
             || self.lbterm_inbox_list_is_open()
             || self.lbterm_agenda_list_is_open()
-            || self.lbterm_context_list_is_open()
             || self.lbterm_plus_is_open();
         let compositor = self.webgpu.as_ref().and_then(|w| w.compositor.as_ref());
         // A card the compositor still has open shows too: in the paint where its menu closes, its
@@ -381,7 +378,6 @@ impl TermWindow {
             || self.lbterm_conductor_menu_is_open()
             || self.lbterm_inbox_list_is_open()
             || self.lbterm_agenda_list_is_open()
-            || self.lbterm_context_list_is_open()
         {
             return false;
         }
@@ -393,7 +389,7 @@ impl TermWindow {
 
     /// A key pressed while a menu takes every key ([`TermWindow::lbterm_menu_takes_keys`]), for
     /// the first one open in this order: the tab menu, the prompt list, the Conductor's, the InMail
-    /// list, the agenda, the context list, the picker and its + menu (each answers false only when it isn't open).
+    /// list, the agenda, the picker and its + menu (each answers false only when it isn't open).
     /// Composed words (an IME's, a dead key's) go into the name the tab menu is renaming to or the
     /// picker's box; anywhere else they're a key no row takes. Nothing reaches the pane
     pub(crate) fn lbterm_menus_key(&mut self, key: Key, mods: KeyModifiers) {
@@ -404,7 +400,6 @@ impl TermWindow {
                     || self.lbterm_conductor_menu_key(&code, mods)
                     || self.lbterm_inbox_list_key(&code, mods)
                     || self.lbterm_agenda_list_key(&code, mods)
-                    || self.lbterm_context_list_key(&code, mods)
                     || self.lbterm_new_tab_key(&code, mods);
             }
             Key::Composed(words) => {
@@ -415,10 +410,7 @@ impl TermWindow {
                     self.lbterm_menu_bump(Slot::Prompt);
                 } else if self.lbterm_conductor_menu_is_open() {
                     self.lbterm_menu_bump(Slot::Conductor);
-                } else if self.lbterm_inbox_list_is_open()
-                    || self.lbterm_agenda_list_is_open()
-                    || self.lbterm_context_list_is_open()
-                {
+                } else if self.lbterm_inbox_list_is_open() || self.lbterm_agenda_list_is_open() {
                     self.lbterm_menu_bump(Slot::List);
                 } else {
                     self.lbterm_new_tab_text(&words);

@@ -38,6 +38,7 @@ pub fn looks(row: &Row) -> (u64, u64) {
         link,
         quiet,
         cost,
+        prompted,
         hidden,
         parked,
     } = row;
@@ -54,8 +55,9 @@ pub fn looks(row: &Row) -> (u64, u64) {
     // bars' tracks (how far along glides in a layer of its own, so only whether there's a bar and
     // how many subagents' bars)
     (title, project, status, message, agents, progress.is_some(), estimated, left, agent_bars.len(), age, level, cost).hash(&mut words);
-    // A tuple hashes up to twelve fields; the Parked chip
-    (hidden, parked).hash(&mut words);
+    // A tuple hashes up to twelve fields; the Parked chip, and how long ago he last prompted it,
+    // which only the open panel's first line shows (lbterm/TAB-PANEL.md, "What a row says")
+    (hidden, parked, prompted).hash(&mut words);
     (rail.finish(), words.finish())
 }
 
@@ -105,6 +107,7 @@ mod test {
             ("age", |r| r.age.push('x')),
             ("level", |r| r.level += 1),
             ("cost", |r| r.cost.push('x')),
+            ("prompted", |r| r.prompted.push('x')),
         ];
         for (name, change) in words_only {
             let mut r = base();

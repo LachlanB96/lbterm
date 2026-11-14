@@ -48,6 +48,11 @@ pub enum Target<Id> {
     /// the projects card (2, 27 to 29): faded in and out by DWM (wezterm-gui's render/objectives.rs
     /// and render/projects.rs).
     Objectives(usize),
+    /// The context bar's moving parts over the panes on the right (wezterm-gui's
+    /// render/context_bar.rs): its pane (0, z-layers 101 to 103), its widened bar's drawer of labels
+    /// (1, 105 to 107), each sliding out from under the bar's edge by DWM, and the scroll strip
+    /// riding on their left edge (2, z-layer 104), glided by DWM.
+    ContextBar(usize),
     /// The turning arc on a Conductor menu item that waits for its answer (z-layer 76): a
     /// template never seen itself, which a visual over the menu shows, turned by DWM
     /// (wezterm-gui's render/conductor.rs).
@@ -98,6 +103,11 @@ pub enum Target<Id> {
     /// rounded clip that glides between rows (`crate::menu::light`). No quads: cleared to white,
     /// and only in a frame when it's new or a new size.
     MenuLight(usize),
+    /// The questions pane down the window's right while a right hold shows the question colours
+    /// (z-layers 101 and 102), over the strips and the panes' last columns: slid out from under
+    /// the window's right edge by DWM on `panel_open` as the hold starts and back on
+    /// `panel_close` as it ends (wezterm-gui's render/questions_pane.rs).
+    QuestionsPane,
 }
 
 /// The template cards, each drawn as wide as the window (its corners, top

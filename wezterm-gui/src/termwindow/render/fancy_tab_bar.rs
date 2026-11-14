@@ -132,7 +132,8 @@ impl crate::TermWindow {
                 | TabBarItem::LbtermPromptList
                 | TabBarItem::LbtermInbox
                 | TabBarItem::LbtermAgenda
-                | TabBarItem::LbtermContext => element
+                | TabBarItem::LbtermContext
+                | TabBarItem::LbtermProjects => element
                     .item_type(UIItemType::TabBar(TabBarItem::None))
                     .line_height(Some(1.75))
                     .margin(BoxDimension {
@@ -475,7 +476,7 @@ impl crate::TermWindow {
             };
             right_eles.insert(0, crate::restart::pill_element(&font, &metrics, surface));
         }
-        // LBTerm: the mic mark while Earshot listens, left of the pill (mic.rs)
+        // LBTerm: the mic mark while LyreBird listens, left of the pill (mic.rs)
         if let Some(state) = crate::mic::shown() {
             let surface = if hide_tabs {
                 palette.background
@@ -514,6 +515,12 @@ impl crate::TermWindow {
         // and the objectives panel's down the right, so the window's buttons stay at its edge
         // (render/objectives.rs)
         border.right -= ::window::ULength::new(super::objectives::strip_width(
+            &self.config,
+            &self.dimensions,
+            &self.render_metrics,
+        ) as usize);
+        // or the context bar's in its room (render/context_bar.rs)
+        border.right -= ::window::ULength::new(super::context_bar::strip_width(
             &self.config,
             &self.dimensions,
             &self.render_metrics,

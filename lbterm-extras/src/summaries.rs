@@ -1,10 +1,9 @@
-//! Each Claude Code session's summary, as Terminal's summary worker
-//! (`shared/claude/summary-worker.js`) writes it to `~/.claude/summaries`:
-//! `<sid>.txt`, where the conversation is up to, in a line; `<sid>.detail.txt`,
-//! a few lines more; and `<sid>.label.txt`, a word or three naming what the
-//! session is for, which the tab rail shows under each pad. Terminal's
-//! statusline adds `<sid>.cwd.txt`, the folder the session is in now, which
-//! the tab panel names the tab's project from. Terminal's question worker
+//! Each Claude Code session's summary, as the summary worker writes it to
+//! `~/.claude/summaries`: `<sid>.txt`, where the conversation is up to, in a
+//! line; `<sid>.detail.txt`, a few lines more; and `<sid>.label.txt`, a word or
+//! three naming what the session is for, which the tab rail shows under each
+//! pad. The statusline adds `<sid>.cwd.txt`, the folder the session is in now,
+//! which the tab panel names the tab's project from. The question worker
 //! adds `<sid>.questions.json`, the questions its last replies asked and the
 //! passages each is about, for the question colours (questions.rs). Whoever
 //! writes the summaries keeps `<sid>.objectives.json` too, what Lachlan asked
@@ -13,8 +12,14 @@
 //! tasks the session still has running, for the card the tab panel shows on a
 //! tab's row (tasks.rs), and `<sid>.usage.json`, what the conversation has cost
 //! and its context window, for the pill under the InMail button and the open
-//! tab panel's rows (lbterm/CONTEXT.md). The session is the `claude_session`
-//! user var Terminal's claudehook.exe sets in its pane.
+//! tab panel's rows (lbterm/CONTEXT.md). `<sid>.prompt.json` is when Lachlan
+//! last sent the session a prompt, `{ "at": <Unix ms> }`, which the statusline
+//! was asked on 2026-11-14 to keep beside it, for the time since his last input
+//! on the open tab panel's rows (lbterm/TAB-PANEL.md, "What a row says"):
+//! anything that shows it takes it from the summary with [`Summary::last_prompt`],
+//! the seam a session of the harness that's to take Claude Code's place will give
+//! its time through instead. The session is the `claude_session` user var the
+//! Claude hook (claudehook.exe) sets in its pane.
 //!
 //! The folder holds a thousand sessions and more, so only the ones asked for
 //! are read, and never on the GUI thread: [`Summaries::get`] answers from
@@ -29,10 +34,22 @@
 //! often as a working session's cost moves a cent, so a change to that alone
 //! wakes the GUI with [`Changed::Usage`] and the sessions it was for: only a
 //! window showing one of them repaints, where any other change repaints them
-//! all.
+//! all. When a session was last prompted shows only on the open panel's rows,
+//! where its cost shows too, so a change to it, alone or with the cost, wakes
+//! the same way, its session on the same `Usage` list, and lays nothing out
+//! again. A `<sid>.prompt.json` that can't be read is no time, as no file is,
+//! and the log says why once, not at every read.
 //!
 //! The same thread follows `expanded.flag` in the folder, which Terminal's
 //! Alt+S (its lbterm.lua, lbterm-summary-detail) toggles to show each summary's detail.
+//!
+//! It hears `<sid>.cost.json` too, the Claude project's split of what a conversation
+//! cost, which the statusline writes whole each time it moves, and reads none of it:
+//! the cost pane reads it (wezterm-gui's cost.rs) and only while it's open. For a
+//! session asked for, each write heard counts one more on
+//! [`Summaries::split_written`], and wakes the GUI with [`Changed::Split`], so a pane
+//! open on that session reads the file on its own write and one shut reads it as it
+//! opens only when it was written meanwhile (lbterm/CONTEXT.md, "The cost pane").
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,12 +94,16 @@ pub struct Summary {
     pub objectives: Option<Arc<Objectives>>,
     /// The background tasks it still has running, shared as the questions are
     pub tasks: Option<Arc<tasks::List>>,
-    /// What the conversation has cost and its context window, as Terminal's statusline last
-    /// wrote them
+    /// What the conversation has cost and its context window, as the statusline last wrote them
     pub usage: Option<Usage>,
+    /// When Lachlan last sent it a prompt, from `<sid>.prompt.json`: none with no file or one
+    /// that can't be read. Asked for only through [`Summary::last_prompt`]
+    prompted: Option<SystemTime>,
+    /// Why `<sid>.prompt.json` can't be read, while it can't: kept so the log says it once
+    prompt_unread: Option<String>,
 }
 
-/// What a conversation has used, from `<sid>.usage.json` (Terminal's statusline, `rememberUsage`):
+/// What a conversation has used, from `<sid>.usage.json` (the statusline's `rememberUsage`):
 /// `{ "usd": 12.34, "window": 1000000 }`
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Usage {
@@ -103,6 +124,49 @@ pub fn parse_usage(text: &str) -> Option<Usage> {
     })
 }
 
+/// When a `<sid>.prompt.json`'s text says Lachlan last sent the session a prompt, `{ "at": <Unix
+/// ms> }` as the statusline was asked on 2026-11-14 to write it, or why it says no time: it isn't
+/// JSON, it has no `at`, or its `at` isn't a whole number of milliseconds after 1970.
+pub fn parse_prompt(text: &str) -> Result<SystemTime, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|err| format!("it isn't JSON ({err})"))?;
+    let at = v.get("at").ok_or_else(|| "it has no `at`".to_string())?;
+    at.as_u64()
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+        .ok_or_else(|| format!("its `at` is {at}, not a time in Unix milliseconds"))
+}
+
+/// When session `sid`'s `<sid>.prompt.json` in `dir` says it was last prompted: `Ok(None)` with no
+/// file, and why it says no time when it can't be read or isn't one.
+fn read_prompt(dir: &Path, sid: &str) -> Result<Option<SystemTime>, String> {
+    match std::fs::read_to_string(dir.join(format!("{sid}.prompt.json"))) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("it can't be read ({err})")),
+        Ok(text) => parse_prompt(&text).map(Some),
+    }
+}
+
+/// Why `now`'s `<sid>.prompt.json` can't be read, when that's news since `was`: it could be read
+/// then, or there was none, or it couldn't for another reason. What the log says, once a spell.
+fn prompt_news<'a>(was: &Summary, now: &'a Summary) -> Option<&'a str> {
+    now.prompt_unread.as_deref().filter(|why| was.prompt_unread.as_deref() != Some(*why))
+}
+
+impl Summary {
+    /// When Lachlan last sent this session a prompt, typed, a voice draft LBTerm typed into Claude
+    /// Code's box, or from his phone, which the open tab panel's row counts the time since his last
+    /// input from: the one call anything asks it by, from a summary it already holds, so showing
+    /// it costs no second lookup (render/tab_panel.rs' `panel_tab` runs for every tab the rail
+    /// paints, and for the strip's tab on every paint). Today it's what the watching thread last
+    /// read of `<sid>.prompt.json`; a session of the harness that's to take Claude Code's place
+    /// will give it from that harness's session list instead, behind this same call, and wake the
+    /// windows as a change to the file does ([`Changed::Usage`]). None with no file, or one that
+    /// can't be read: never a zero.
+    pub fn last_prompt(&self) -> Option<SystemTime> {
+        self.prompted
+    }
+}
+
 /// Which of a session's files a file is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Part {
@@ -114,6 +178,7 @@ pub enum Part {
     Objectives,
     Tasks,
     Usage,
+    Prompt,
 }
 
 /// What changed in the sessions asked for, told to the wake
@@ -121,17 +186,22 @@ pub enum Part {
 pub enum Changed {
     /// Anything a window may show: every window repaints
     Any,
-    /// Only what these sessions have cost: a window repaints when it shows one of them
+    /// Only what these sessions have cost, or when they were last prompted (which the open tab
+    /// panel's rows alone show, beside the cost): a window repaints when it shows one of them
     Usage(Vec<String>),
+    /// These sessions' `<sid>.cost.json` was written (none of it read here): what a cost pane
+    /// open on one of them reads, and nothing else shows. Told apart from the others, before
+    /// them, so nothing wakes while no pane is open
+    Split(Vec<String>),
 }
 
-/// Some of a session's files: those a burst of changes was to
+/// Some of a session's files: those a burst of changes was to, a bit for each [`Part`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Parts(u8);
+pub struct Parts(u16);
 
 impl Parts {
     /// Every file: a session read for the first time
-    pub const ALL: Parts = Parts(0xff);
+    pub const ALL: Parts = Parts(u16::MAX);
 
     pub fn of(part: Part) -> Parts {
         Parts(1 << part as u8)
@@ -146,6 +216,11 @@ impl Parts {
     }
 }
 
+// Each part's bit is inside Parts' word. Part::Prompt is the last part, and a part one past the
+// word would take the first part's bit in a release build, where the shift is masked to the word
+// and the tests run (PITFALLS 380): a part added after it moves this to it
+const _: () = assert!((Part::Prompt as u32) < u16::BITS);
+
 /// The session a file in the folder belongs to, and which of its files it is.
 pub fn parse_name(name: &str) -> Option<(&str, Part)> {
     [
@@ -156,6 +231,7 @@ pub fn parse_name(name: &str) -> Option<(&str, Part)> {
         (".objectives.json", Part::Objectives),
         (".tasks.json", Part::Tasks),
         (".usage.json", Part::Usage),
+        (".prompt.json", Part::Prompt),
         (".txt", Part::Short),
     ]
         .into_iter()
@@ -164,6 +240,11 @@ pub fn parse_name(name: &str) -> Option<(&str, Part)> {
                 .filter(|sid| is_session_id(sid))
                 .map(|sid| (sid, part))
         })
+}
+
+/// The session a `<sid>.cost.json` in the folder is the Claude project's split of (`@Claude:cost`)
+pub fn split_of(name: &str) -> Option<&str> {
+    name.strip_suffix(".cost.json").filter(|sid| is_session_id(sid))
 }
 
 /// A label as Haiku wrote it, tidied: its first line, without quotes or a
@@ -245,6 +326,14 @@ pub fn read_parts(dir: &Path, sid: &str, parts: Parts, was: &Summary) -> Summary
     if parts.has(Part::Usage) {
         s.usage = text(".usage.json").as_deref().and_then(parse_usage);
     }
+    if parts.has(Part::Prompt) {
+        let read = read_prompt(dir, sid);
+        s.prompt_unread = read.as_ref().err().cloned();
+        s.prompted = read.ok().flatten();
+        if let Some(why) = prompt_news(was, &s) {
+            log::warn!("summaries: no time from {sid}.prompt.json, as {why}");
+        }
+    }
     s
 }
 
@@ -262,6 +351,9 @@ struct Shared {
     asked: Mutex<HashSet<String>>,
     expanded: AtomicBool,
     generation: AtomicU64,
+    /// How many times each session's `<sid>.cost.json` has been heard written, for the sessions
+    /// asked for
+    splits: Mutex<HashMap<String, u64>>,
     wake: Box<dyn Fn(Changed) + Send + Sync>,
 }
 
@@ -285,6 +377,7 @@ impl Summaries {
             asked: Mutex::new(HashSet::new()),
             expanded: AtomicBool::new(dir.join(EXPANDED_FLAG).exists()),
             generation: AtomicU64::new(0),
+            splits: Mutex::new(HashMap::new()),
             wake: Box::new(wake),
         });
         let (tx, rx) = channel();
@@ -319,6 +412,14 @@ impl Summaries {
     /// ([`Changed::Usage`]), or [`Self::expanded`].
     pub fn generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
+    }
+
+    /// How many times session `sid`'s `<sid>.cost.json` has been heard written since it was
+    /// first asked for (0 before any), counted one more for every session asked for when the
+    /// folder came, went or its watch went wrong, since a write may have gone unheard then. The
+    /// file is never read here: two looks that agree mean it hasn't been written between them
+    pub fn split_written(&self, sid: &str) -> u64 {
+        lock(&self.shared.splits).get(sid).copied().unwrap_or(0)
     }
 
     /// Whether the summaries' detail is to be shown: `expanded.flag` is in
@@ -368,6 +469,8 @@ fn watch(dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Msg>, events: Sender<Ms
         }
         // Each session due a read, and which of its files
         let mut due: HashMap<String, Parts> = HashMap::new();
+        // Each session whose split was written: counted, never read
+        let mut splits: HashSet<String> = HashSet::new();
         let mut flag = false;
         // Every session asked for, and the flag: the folder came, went or moved, or its watch
         // went wrong
@@ -387,6 +490,8 @@ fn watch(dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Msg>, events: Sender<Ms
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name == EXPANDED_FLAG {
                         flag = true;
+                    } else if let Some(sid) = split_of(name).filter(|sid| asked.contains(*sid)) {
+                        splits.insert(sid.to_string());
                     } else if let Some((sid, part)) = parse_name(name).filter(|(sid, _)| asked.contains(*sid)) {
                         due.entry(sid.to_string()).or_default().add(Parts::of(part));
                     }
@@ -409,6 +514,14 @@ fn watch(dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Msg>, events: Sender<Ms
             flag = true;
             for sid in lock(&shared.asked).iter() {
                 due.entry(sid.clone()).or_default().add(Parts::ALL);
+                splits.insert(sid.clone());
+            }
+        }
+        // Counted before anything wakes, so a window woken for this batch sees them
+        if !splits.is_empty() {
+            let mut written = lock(&shared.splits);
+            for sid in &splits {
+                *written.entry(sid.clone()).or_default() += 1;
             }
         }
 
@@ -424,18 +537,40 @@ fn watch(dir: PathBuf, shared: Arc<Shared>, rx: Receiver<Msg>, events: Sender<Ms
             let summary = read_parts(&dir, &sid, parts, was.as_deref().unwrap_or(&Summary::default()));
             if was.as_deref() != Some(&summary) {
                 if summary != Summary::default() || was.is_some() {
-                    let only_usage = was.as_deref().is_some_and(|was| Summary { usage: summary.usage, ..was.clone() } == summary);
-                    if only_usage {
-                        usage.push(sid.clone());
-                    } else {
-                        any = true;
+                    // What it cost and when it was last prompted wake only the windows showing them
+                    // (the pill and the open panel's rows), and why its prompt's file can't be read
+                    // shows nowhere
+                    let alone = was.as_deref().filter(|was| {
+                        let others = Summary {
+                            usage: summary.usage,
+                            prompted: summary.prompted,
+                            prompt_unread: summary.prompt_unread.clone(),
+                            ..(*was).clone()
+                        };
+                        others == summary
+                    });
+                    match alone {
+                        Some(was) => {
+                            if (was.usage, was.prompted) != (summary.usage, summary.prompted) {
+                                usage.push(sid.clone());
+                            }
+                        }
+                        None => any = true,
                     }
                 }
                 lock(&shared.known).insert(sid, Arc::new(summary));
             }
         }
+        // A split written: told first and apart, so an open cost pane asks for it before a window
+        // woken for the same batch paints, and nothing else wakes for it
+        if !splits.is_empty() {
+            let mut splits: Vec<String> = splits.into_iter().collect();
+            splits.sort();
+            (shared.wake)(Changed::Split(splits));
+        }
         // The generation keys what's laid out from the summaries (the question colours, the
-        // drafts), none of which shows what a session has cost: a cent moving lays out nothing
+        // drafts), none of which shows what a session has cost or when it was last prompted: a
+        // cent moving lays out nothing
         if any {
             shared.generation.fetch_add(1, Ordering::AcqRel);
             (shared.wake)(Changed::Any);
@@ -464,10 +599,40 @@ mod test {
         assert_eq!(parse_name(&format!("{SID}.objectives.json")), Some((SID, Part::Objectives)));
         assert_eq!(parse_name(&format!("{SID}.tasks.json")), Some((SID, Part::Tasks)));
         assert_eq!(parse_name(&format!("{SID}.usage.json")), Some((SID, Part::Usage)));
+        assert_eq!(parse_name(&format!("{SID}.prompt.json")), Some((SID, Part::Prompt)));
+        assert_eq!(parse_name(&format!("{SID}.prompt.json.tmp")), None);
         assert_eq!(parse_name(&format!("{SID}.json")), None);
         assert_eq!(parse_name(&format!("{SID}.worker")), None);
         assert_eq!(parse_name("expanded.flag"), None);
         assert_eq!(parse_name("notes.txt"), None);
+    }
+
+    /// Every part, in the order `Part` declares them: a part added there is added here too
+    const EVERY: [Part; 9] = [
+        Part::Short,
+        Part::Detail,
+        Part::Label,
+        Part::Cwd,
+        Part::Questions,
+        Part::Objectives,
+        Part::Tasks,
+        Part::Usage,
+        Part::Prompt,
+    ];
+
+    /// Each part has a bit of its own in `Parts`, compared with every other part: "every file has
+    /// the new part" and "some other part lacks it" both still hold when a part one past the word
+    /// takes the first part's bit, as it does in a release build, where `lbterm.ps1 test` runs
+    /// these (PITFALLS 380)
+    #[test]
+    fn each_part_has_a_bit_of_its_own() {
+        for (i, a) in EVERY.into_iter().enumerate() {
+            assert_eq!(a as usize, i, "EVERY lists the parts in Part's order");
+            assert!(Parts::ALL.has(a), "{a:?}");
+            for b in EVERY.into_iter().filter(|b| *b != a) {
+                assert!(!Parts::of(a).has(b), "{a:?} has {b:?}'s bit");
+            }
+        }
     }
 
     #[test]
@@ -550,6 +715,140 @@ mod test {
         assert_eq!(read(dir.path(), SID).tasks, None);
     }
 
+    /// `<sid>.prompt.json` as the statusline was asked to write it, `{ "at": <Unix ms> }`: its time,
+    /// and no time, never a zero, with no file or one that isn't that, saying why
+    #[test]
+    fn when_a_session_was_last_prompted_is_read_as_the_statusline_writes_it() {
+        let at = |ms: u64| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
+        assert_eq!(parse_prompt(r#"{"at":1763100000000}"#), Ok(at(1_763_100_000_000)));
+        assert_eq!(parse_prompt(r#"{ "at": 1763100000123, "by": "statusline" }"#), Ok(at(1_763_100_000_123)));
+        for text in ["", "{", "{}", "[1763100000000]", r#"{"at":null}"#, r#"{"at":"1763100000000"}"#, r#"{"at":-5}"#, r#"{"at":0}"#, r#"{"at":1.5e12}"#] {
+            assert!(parse_prompt(text).is_err(), "{text}");
+        }
+        assert_eq!(parse_prompt("{}"), Err("it has no `at`".to_string()));
+        assert!(parse_prompt("{").is_err_and(|why| why.starts_with("it isn't JSON")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{SID}.prompt.json"));
+        // Missing: no time, and nothing to say
+        assert_eq!(read(dir.path(), SID), Summary::default());
+        // Present
+        std::fs::write(&file, r#"{"at":1763100000000}"#).unwrap();
+        let one = read(dir.path(), SID);
+        assert_eq!((one.last_prompt(), one.prompt_unread.as_deref()), (Some(at(1_763_100_000_000)), None));
+        // Written again: read alone
+        std::fs::write(&file, r#"{"at":1763100060000}"#).unwrap();
+        let two = read_parts(dir.path(), SID, Parts::of(Part::Prompt), &one);
+        assert_eq!(two.prompted, Some(at(1_763_100_060_000)));
+        // Malformed: no time, and why kept
+        std::fs::write(&file, r#"{"at":"soon"}"#).unwrap();
+        let bad = read_parts(dir.path(), SID, Parts::of(Part::Prompt), &two);
+        assert_eq!(bad.prompted, None);
+        assert_eq!(bad.prompt_unread.as_deref(), Some(r#"its `at` is "soon", not a time in Unix milliseconds"#));
+        // Removed: no time, and nothing to say
+        std::fs::remove_file(&file).unwrap();
+        let gone = read_parts(dir.path(), SID, Parts::of(Part::Prompt), &bad);
+        assert_eq!((gone.prompted, gone.prompt_unread.as_deref()), (None, None));
+    }
+
+    /// The log says why a prompt's file can't be read once a spell: when it could before, or there
+    /// was none, or it couldn't for another reason; not again while it stays the same
+    #[test]
+    fn a_prompt_file_that_cant_be_read_is_logged_once() {
+        let fine = Summary { prompted: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)), ..Summary::default() };
+        let bad = |why: &str| Summary { prompt_unread: Some(why.to_string()), ..Summary::default() };
+        let none = Summary::default();
+        assert_eq!(prompt_news(&none, &bad("it has no `at`")), Some("it has no `at`"));
+        assert_eq!(prompt_news(&fine, &bad("it has no `at`")), Some("it has no `at`"));
+        assert_eq!(prompt_news(&bad("it has no `at`"), &bad("it has no `at`")), None);
+        assert_eq!(prompt_news(&bad("it has no `at`"), &bad("it isn't JSON")), Some("it isn't JSON"));
+        assert_eq!(prompt_news(&bad("it has no `at`"), &fine), None);
+        assert_eq!(prompt_news(&bad("it has no `at`"), &none), None);
+    }
+
+    /// When a session was last prompted, followed as the statusline writes it, whole through a
+    /// rename: read with its other files, and a change to it alone, or with its cost, wakes as a
+    /// cost does, `Changed::Usage` alone (only the open panel's rows and the pill show either), and
+    /// moves no generation; written again the same, or malformed again, it wakes nothing; malformed
+    /// or removed, it gives no time
+    #[test]
+    fn when_a_session_was_last_prompted_is_followed_and_wakes_as_its_cost_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |suffix: &str| dir.path().join(format!("{SID}{suffix}"));
+        let at = |ms: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms));
+        let write = |text: &str| {
+            let tmp = file(".prompt.json.tmp");
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, file(".prompt.json")).unwrap();
+        };
+        std::fs::write(file(".label.txt"), "Tab bar bugs").unwrap();
+        write(r#"{"at":1763100000000}"#);
+        let woke = Arc::new(Mutex::new(vec![]));
+        let w = Arc::clone(&woke);
+        let summaries = Summaries::start(dir.path().to_path_buf(), move |changed| lock(&w).push(changed));
+        let since = |wakes: usize| lock(&woke)[wakes..].to_vec();
+        let last = || summaries.get(SID).and_then(|s| s.last_prompt());
+        let shown = Changed::Usage(vec![SID.to_string()]);
+
+        // Present: asked for, and read off thread with the session's other files
+        assert_eq!(last(), None);
+        assert!(until(|| last() == at(1_763_100_000_000)));
+        assert_eq!(lock(&woke).last(), Some(&Changed::Any), "a session read for the first time");
+        // Give the watcher a moment to start before the folder changes
+        std::thread::sleep(Duration::from_millis(200));
+        let generation = summaries.generation();
+
+        // Written again: read again, and only the windows showing it wake
+        let wakes = lock(&woke).len();
+        write(r#"{"at":1763100060000}"#);
+        assert!(until(|| last() == at(1_763_100_060_000)));
+        assert!(until(|| since(wakes) == vec![shown.clone()]));
+        assert_eq!(summaries.get(SID).and_then(|s| s.label.clone()).as_deref(), Some("Tab bar bugs"));
+        assert_eq!(summaries.generation(), generation, "nothing laid out from the summaries shows it");
+
+        // With its cost, as the statusline may write them: told as a cost is, one batch or two,
+        // nothing else
+        std::thread::sleep(Duration::from_millis(400));
+        let wakes = lock(&woke).len();
+        std::fs::write(file(".usage.json"), r#"{"usd":1.25,"window":200000}"#).unwrap();
+        write(r#"{"at":1763100120000}"#);
+        assert!(until(|| {
+            last() == at(1_763_100_120_000) && summaries.get(SID).and_then(|s| s.usage).map(|u| u.usd) == Some(1.25)
+        }));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!since(wakes).is_empty() && since(wakes).iter().all(|c| *c == shown), "{:?}", since(wakes));
+
+        // The same time written again changes nothing, and wakes nothing
+        std::thread::sleep(Duration::from_millis(400));
+        let wakes = lock(&woke).len();
+        write(r#"{"at":1763100120000}"#);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(since(wakes), vec![]);
+
+        // Malformed: no time, never a zero, and the windows showing it wake to show none
+        let wakes = lock(&woke).len();
+        write(r#"{"at":"soon"}"#);
+        assert!(until(|| last().is_none()));
+        assert!(until(|| since(wakes) == vec![shown.clone()]));
+        assert!(summaries.get(SID).is_some_and(|s| s.prompt_unread.as_deref().is_some_and(|why| why.contains("soon"))));
+        // Malformed again the same way: nothing to show, and nothing new to log
+        std::thread::sleep(Duration::from_millis(400));
+        let wakes = lock(&woke).len();
+        write(r#"{"at":"soon"}"#);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(since(wakes), vec![]);
+
+        // Fine again, then removed: no time
+        write(r#"{"at":1763100180000}"#);
+        assert!(until(|| last() == at(1_763_100_180_000)));
+        std::thread::sleep(Duration::from_millis(400));
+        let wakes = lock(&woke).len();
+        std::fs::remove_file(file(".prompt.json")).unwrap();
+        assert!(until(|| last().is_none()));
+        assert!(until(|| since(wakes) == vec![shown.clone()]));
+        assert_eq!(summaries.generation(), generation);
+    }
+
     #[test]
     fn what_a_conversation_has_used_is_read_as_the_statusline_writes_it() {
         assert_eq!(parse_usage(r#"{"usd":12.34,"window":1000000}"#), Some(Usage { usd: 12.34, window: Some(1_000_000) }));
@@ -597,6 +896,58 @@ mod test {
         assert!(until(|| lock(&woke).last() == Some(&Changed::Any)));
     }
 
+    /// The Claude project's split, `<sid>.cost.json`, is heard and never read: a write to an asked
+    /// session's counts one more and wakes only with `Changed::Split`, before anything else the
+    /// same batch wakes for; one to a session not asked for counts and wakes nothing; and a cost
+    /// moving a cent without it counts nothing (lbterm/CONTEXT.md, "The cost pane")
+    #[test]
+    fn a_split_written_is_counted_and_told_apart_but_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |sid: &str, suffix: &str| dir.path().join(format!("{sid}{suffix}"));
+        std::fs::write(file(SID, ".usage.json"), r#"{"usd":1.25,"window":200000}"#).unwrap();
+        let woke = Arc::new(Mutex::new(vec![]));
+        let w = Arc::clone(&woke);
+        let summaries = Summaries::start(dir.path().to_path_buf(), move |changed| lock(&w).push(changed));
+        assert!(until(|| summaries.get(SID).is_some()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(summaries.split_written(SID), 0);
+        assert_eq!(split_of(&format!("{SID}.cost.json")), Some(SID));
+        assert_eq!(split_of("journal.cost.json"), None);
+
+        let wakes = lock(&woke).len();
+        std::fs::write(file(SID, ".cost.json"), "not read").unwrap();
+        assert!(until(|| summaries.split_written(SID) >= 1));
+        assert!(until(|| lock(&woke).len() > wakes));
+        assert_eq!(lock(&woke)[wakes], Changed::Split(vec![SID.to_string()]));
+        assert!(summaries.get(SID).is_some_and(|s| s.usage.is_some_and(|u| u.usd == 1.25)), "the summary as it was");
+
+        // Written with the cost moving a cent, as the statusline writes them: the split told first
+        let written = summaries.split_written(SID);
+        let wakes = lock(&woke).len();
+        std::fs::write(file(SID, ".usage.json"), r#"{"usd":1.26,"window":200000}"#).unwrap();
+        std::fs::write(file(SID, ".cost.json"), "still not read").unwrap();
+        assert!(until(|| lock(&woke).last() == Some(&Changed::Usage(vec![SID.to_string()]))));
+        assert!(summaries.split_written(SID) > written);
+        assert_eq!(lock(&woke)[wakes], Changed::Split(vec![SID.to_string()]));
+
+        // The cost alone: no split counted. Windows can tell one write as two changes, the second
+        // in a later batch (counted twice, which asks once more and reads the same split), so
+        // what's left of the last is let through first
+        std::thread::sleep(Duration::from_millis(400));
+        let written = summaries.split_written(SID);
+        std::fs::write(file(SID, ".usage.json"), r#"{"usd":1.27,"window":200000}"#).unwrap();
+        assert!(until(|| lock(&woke).last() == Some(&Changed::Usage(vec![SID.to_string()]))));
+        assert_eq!(summaries.split_written(SID), written);
+
+        // A session nobody asked for: nothing
+        std::thread::sleep(Duration::from_millis(400));
+        let wakes = lock(&woke).len();
+        std::fs::write(file(OTHER, ".cost.json"), "{}").unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!lock(&woke)[wakes..].iter().any(|c| matches!(c, Changed::Split(sids) if sids.iter().any(|s| s == OTHER))));
+        assert_eq!(summaries.split_written(OTHER), 0);
+    }
+
     /// Waits for `done`, up to five seconds.
     fn until(done: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -607,6 +958,31 @@ mod test {
             std::thread::sleep(Duration::from_millis(20));
         }
         done()
+    }
+
+    /// ToolBelt's question worker writes `<sid>.questions.json` through a rename: a file renamed
+    /// over a known session's is read again like one written in place, and bumps the generation
+    /// the question colours' layout is keyed by (lbterm/FLOWS.md, "A right hold, to the question
+    /// colours", steps 4 and 5)
+    #[test]
+    fn a_questions_file_renamed_over_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{SID}.questions.json"));
+        let one = r#"{"messages":[{"id":"a","questions":[{"label":"Q1","text":"Which?"}]}]}"#;
+        let two = r#"{"messages":[{"id":"a","questions":[{"label":"Q1","text":"Which?"}]},{"id":"b","questions":[{"label":"Q1","text":"And now?"}]}]}"#;
+        std::fs::write(&file, one).unwrap();
+        let summaries = Summaries::start(dir.path().to_path_buf(), |_| {});
+        let replies = |s: &Summaries| s.get(SID).and_then(|s| s.questions.clone()).map(|q| q.messages.len());
+        assert_eq!(summaries.get(SID), None);
+        assert!(until(|| replies(&summaries) == Some(1)));
+        let generation = summaries.generation();
+        // Give the watcher a moment to start before the folder changes
+        std::thread::sleep(Duration::from_millis(200));
+        let tmp = dir.path().join(format!("{SID}.questions.json.tmp"));
+        std::fs::write(&tmp, two).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+        assert!(until(|| replies(&summaries) == Some(2)));
+        assert!(summaries.generation() > generation);
     }
 
     #[test]

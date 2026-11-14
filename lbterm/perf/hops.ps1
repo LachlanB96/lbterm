@@ -52,7 +52,7 @@ for _, b in ipairs({
     event = { Down = { streak = 1, button = b[1] } }, mods = b[2], alt_screen = 'Any', action = act.LbtermTab(b[3]),
   })
 end
--- The action as Earshot's lbterm-park-toggle reaches it, through the control pipe
+-- The action as LyreBird's lbterm-park-toggle reaches it, through the control pipe
 wezterm.on('test-park', function(window, pane) window:perform_action(act.LbtermPark 'Toggle', pane) end)
 "@
 

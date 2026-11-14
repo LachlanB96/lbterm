@@ -6,7 +6,7 @@ use super::render::tab_panel::server_pane_id;
 use super::{TermWindow, TermWindowNotif};
 use config::lbterm::LbtermDraft;
 use lbterm_extras::control::{DraftAct, Focus};
-use lbterm_extras::drafts::{self, Body, Draft};
+use lbterm_extras::drafts::{self, Draft};
 use lbterm_extras::questions::Screen;
 use mux::pane::Pane;
 use mux::Mux;
@@ -18,21 +18,29 @@ use window::WindowOps;
 
 /// What the pane shows now, at the bottom of its scrollback: what Claude Code has drawn, wherever
 /// the window's scrolled to
-fn live_screen(pane: &Arc<dyn Pane>) -> Screen {
+pub(crate) fn live_screen(pane: &Arc<dyn Pane>) -> Screen {
     let dims = pane.get_dimensions();
     read_screen(pane, dims.physical_top, dims.viewport_rows)
 }
 
-/// Types `keys` into `pane`, each written whole, [`drafts::KEY_GAP_MS`] apart: a picker moves to
-/// its next question between them
+/// Types `keys` into `pane`, each written whole, [`drafts::KEY_GAP_MS`] apart: Claude Code takes
+/// an Enter written with its text as a new line of a paste
 ///
-/// A key that doesn't get there stops the rest, and `sent`, the draft they type, goes back over
-/// the pane with why on its scroll strip (Lachlan's 3a of 2026-11-08: a lost dictation is the
-/// costliest thing to retype). On a mux pane each key's answer is waited for before the next
+/// A key that doesn't get there stops the rest, and `failed` hears it on the GUI thread, with the
+/// window's id for the pane, why, and whether the connection ended before the server answered: a
+/// voice draft goes back over the pane with why on its scroll strip (Lachlan's 3a of 2026-11-08: a
+/// lost dictation is the costliest thing to retype), the context bar's Compact now says so in its
+/// pane (render/context_bar.rs). On a mux pane each key's answer is waited for before the next
 /// (`ClientPane::lbterm_write_answered`), which a `PaneWriter`'s write isn't, so the failure is
 /// heard here, and only here; on the window's own pane a write that fails says so at once
-fn type_keys(window: Option<::window::Window>, pane: &Arc<dyn Pane>, keys: Vec<String>, sent: Draft) {
+pub(crate) fn type_keys(
+    window: Option<::window::Window>,
+    pane: &Arc<dyn Pane>,
+    keys: Vec<String>,
+    failed: impl FnOnce(&mut TermWindow, mux::pane::PaneId, String, bool) + Send + Sync + 'static,
+) {
     let pane = Arc::clone(pane);
+    let mut failed = Some(failed);
     promise::spawn::spawn(async move {
         for (i, key) in keys.iter().enumerate() {
             if i > 0 {
@@ -42,19 +50,17 @@ fn type_keys(window: Option<::window::Window>, pane: &Arc<dyn Pane>, keys: Vec<S
             let answer = pane
                 .downcast_ref::<ClientPane>()
                 .map(|client| client.lbterm_write_answered(key.as_bytes()));
-            let failed = match answer {
+            let answer_failed = match answer {
                 Some(answer) => answer
                     .await
                     .map(|f| (f.to_string(), f.reached() == mux::lbterm_writes::Reached::Maybe)),
                 None => pane.writer().write_all(key.as_bytes()).err().map(|err| (format!("{err:#}"), false)),
             };
-            if let Some((why, maybe)) = failed {
-                log::warn!("control: typing a voice draft into pane {}: {why}", pane.pane_id());
+            if let Some((why, maybe)) = answer_failed {
+                log::warn!("control: typing keys into pane {}: {why}", pane.pane_id());
                 let local = pane.pane_id();
-                if let Some(window) = window {
-                    window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                        tw.lbterm_draft_failed(local, sent, why, maybe)
-                    })));
+                if let (Some(window), Some(failed)) = (window, failed.take()) {
+                    window.notify(TermWindowNotif::Apply(Box::new(move |tw| failed(tw, local, why, maybe))));
                 }
                 break;
             }
@@ -138,21 +144,6 @@ impl TermWindow {
                 d.add(&text)?;
                 keep(d)
             }
-            DraftAct::Picker {
-                label,
-                keys,
-                questions,
-                missing,
-            } => keep(Draft {
-                pane: id,
-                session,
-                body: Body::Picker {
-                    label,
-                    keys,
-                    questions,
-                    missing,
-                },
-            }),
             DraftAct::Scratch => {
                 let Some(mut d) = current else {
                     return Err("there's no draft there to take back".to_string());
@@ -175,13 +166,16 @@ impl TermWindow {
                     d.send_keys()
                 } else {
                     drafts::may_edit(&d, &screen)?;
-                    d.edit_text().into_iter().collect()
+                    vec![d.edit_text()]
                 };
                 log::info!(
                     "control: voice draft {} into pane {id}",
                     if send { "sent" } else { "typed" }
                 );
-                type_keys(self.window.clone(), &pane, keys, d.clone());
+                let sent = d.clone();
+                type_keys(self.window.clone(), &pane, keys, move |tw, local, why, maybe| {
+                    tw.lbterm_draft_failed(local, sent, why, maybe)
+                });
                 crate::drafts::take(id);
                 did.insert((if send { "sent" } else { "typed" }).to_string(), json!(d.text()));
                 None

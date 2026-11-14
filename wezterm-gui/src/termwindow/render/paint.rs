@@ -392,6 +392,16 @@ impl crate::TermWindow {
         self.lbterm_sides_begin();
         self.paint_lbterm_objectives()
             .context("paint_lbterm_objectives")?;
+        // LBTerm: or the context bar in its room, which wins over it (render/context_bar.rs)
+        self.paint_lbterm_context_bar()
+            .context("paint_lbterm_context_bar")?;
+        // LBTerm: the projects card, hanging from its pad on the strip's second row, which the tab
+        // bar has laid out by now (render/projects.rs)
+        self.paint_lbterm_projects()
+            .context("paint_lbterm_projects")?;
+        // LBTerm: the cost pane under the strip, which the context pill's press opens
+        // (render/cost.rs)
+        self.paint_lbterm_cost().context("paint_lbterm_cost")?;
         // LBTerm: the scroll strip left of it, and its card (render/scroll_strip.rs)
         self.paint_lbterm_scroll_strip()
             .context("paint_lbterm_scroll_strip")?;
@@ -422,9 +432,6 @@ impl crate::TermWindow {
             .context("paint_lbterm_inbox_list")?;
         self.paint_lbterm_agenda_list()
             .context("paint_lbterm_agenda_list")?;
-        // LBTerm: and the context pill's list (render/context.rs)
-        self.paint_lbterm_context_list()
-            .context("paint_lbterm_context_list")?;
 
         Ok(())
     }

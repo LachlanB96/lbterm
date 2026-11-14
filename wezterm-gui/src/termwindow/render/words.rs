@@ -103,7 +103,6 @@ impl crate::TermWindow {
         self.lbterm_strip.forget_card_words();
         self.lbterm_inbox.forget_words();
         self.lbterm_agenda.forget_words();
-        self.lbterm_context.forget_words();
         self.lbterm_tasks.words.get_mut().forget();
         self.lbterm_menu.words.get_mut().forget();
         self.lbterm_drafts.words.get_mut().forget();

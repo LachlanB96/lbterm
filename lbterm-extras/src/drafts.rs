@@ -1,17 +1,18 @@
 //! Voice drafts (lbterm/CONTROL.md, "Drafts"). Lachlan's pick (2026-10-25, 1a): an answer he says
 //! to a Claude session isn't typed into its prompt as he says it. LBTerm holds it as a draft over
 //! the pane it's for, drawn above Claude Code's input box, and types it whole when he says "send":
-//! each new line as Shift+Enter makes it (ESC CR), then Enter; picks for an AskUserQuestion picker
-//! as the keys that make them. "Scratch that" takes the newest piece back, and "edit" types it into
-//! the prompt without sending, for him to finish by hand. Earshot hears the words and writes them
+//! each new line as Shift+Enter makes it (ESC CR), then Enter. "Scratch that" takes the newest piece back, and "edit" types it into
+//! the prompt without sending, for him to finish by hand. LyreBird hears the words and writes them
 //! the way he types answers ("1a", "2. yes", a blank line, "also, ..."); this is what LBTerm does
 //! with them.
 //!
 //! A pane only shows Claude Code's screen, so whether it's safe to type there is read off it
-//! ([`bottom`], [`may_send`]): text only into the input box, picks only into the picker they were
-//! made for, and never into a permission prompt.
+//! ([`bottom`], [`may_send`]): text only into the input box, never into a permission prompt or
+//! a menu. Drafts made picks for Claude Code's AskUserQuestion picker until 2026-11-14, when
+//! Lachlan had the picker's code taken out everywhere (his 2a; AskUserQuestion is denied in his
+//! settings since 2026-11-12).
 
-use crate::questions::{is_rule, is_space, words, Glyph, Screen};
+use crate::questions::{is_rule, is_space, Glyph, Screen};
 use std::ops::Range;
 
 /// A new line in Claude Code's prompt without sending it: what Shift+Enter sends in LBTerm
@@ -20,40 +21,18 @@ pub const NEWLINE: &str = "\x1b\r";
 pub const ENTER: &str = "\r";
 /// The most a draft holds, in characters: a spoken answer is a few hundred
 pub const MAX_CHARS: usize = 8000;
-/// The longest a picker's keys go, between one and the next: the picker moves to its next tab
+/// The gap between one write of typed keys and the next (a draft's text and its Enter, Compact
+/// now's `/compact` and its Enter): Claude Code takes an Enter written with its text as a new
+/// line of a paste
 pub const KEY_GAP_MS: u64 = 150;
 /// How far above the screen's last written row Claude Code's input box's lower rule can sit: the
 /// status line's rows and Claude Code's mode line under it, with room to spare
 const FOOTER_ROWS: usize = 12;
 /// How tall the input box can grow, as a prompt's typed
 const BOX_ROWS_MAX: usize = 30;
-/// How many rows up from the screen's last written row a picker's question is looked for
-const PICKER_ROWS: usize = 40;
-/// How many of a picker question's first words have to be on screen, and the fewest that will do
-const PICKER_WORDS: usize = 8;
-const PICKER_WORDS_MIN: usize = 2;
-/// Words in what a prompt that isn't Claude Code's input box says: a picker's footer, a permission
+/// Words in what a prompt that isn't Claude Code's input box says: a menu's footer, a permission
 /// prompt's question
 const NOT_A_PROMPT: [&str; 4] = ["Enter to select", "Esc to cancel", "Do you want to", "Tab/Arrow keys"];
-
-/// What a draft holds
-#[derive(Debug, Clone, PartialEq)]
-pub enum Body {
-    /// An answer for Claude Code's prompt: its pieces as they were said, newest last. Together
-    /// they're the text, new lines included.
-    Text { pieces: Vec<String> },
-    /// Picks for an AskUserQuestion picker
-    Picker {
-        /// What they read as: "1a 2b"
-        label: String,
-        /// The keys that make them, typed [`KEY_GAP_MS`] apart
-        keys: Vec<String>,
-        /// The picker's questions, by which it's known on screen
-        questions: Vec<String>,
-        /// Its questions without a pick yet ("Q3"): a picker takes every answer at once
-        missing: Vec<String>,
-    },
-}
 
 /// One pane's draft
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +41,9 @@ pub struct Draft {
     pub pane: u64,
     /// The Claude session in the pane when it began: a draft doesn't outlive it
     pub session: Option<String>,
-    pub body: Body,
+    /// An answer for Claude Code's prompt: its pieces as they were said, newest last. Together
+    /// they're the text, new lines included.
+    pub pieces: Vec<String>,
 }
 
 /// A line of the draft as its card shows it, and the question it answers
@@ -73,26 +54,129 @@ pub struct Line {
 }
 
 /// The number a line of an answer starts with, the way he types them: "1a", "4ab", "2. yes",
-/// "2 yes", "3) no"; not "2026 was" or "1.5 s"
+/// "2 yes", "3) no", "2+", "4-", "1+ but more salt"; not "2026 was", "1.5 s" or "2-3 days"
 pub fn answers(line: &str) -> Option<u32> {
-    let t = line.trim_start();
+    pick(line).map(|p| p.number)
+}
+
+/// What he says of a question by a mark after its number (Blueprint's rules for asking him)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// `+`
+    Yes,
+    /// `-`: an extra answered so is declined
+    No,
+    /// `?`: he wants more said, and a recommendation
+    Unsure,
+    /// `??`: he has no idea what it's about
+    Lost,
+    /// `?!`: something said looks badly wrong to him
+    Shocked,
+    /// `//`: filed for later
+    Later,
+}
+
+impl Mark {
+    /// The mark `text` starts with, and how many bytes it takes
+    fn read(text: &str) -> Option<(Self, usize)> {
+        let marks = [("??", Mark::Lost), ("?!", Mark::Shocked), ("//", Mark::Later), ("?", Mark::Unsure), ("+", Mark::Yes), ("-", Mark::No)];
+        marks.iter().find(|(m, _)| text.starts_with(m)).map(|(m, mark)| (*mark, m.len()))
+    }
+}
+
+/// One question named in an answer: its number, the options picked by their letters ("deg" for
+/// 3deg, which picks 3d, 3e and 3g), and the mark after them. Whatever follows is his words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pick {
+    pub number: u32,
+    pub options: String,
+    pub mark: Option<Mark>,
+}
+
+impl Pick {
+    /// It settles the question: anything but asking back (`?`, `??`, `?!`), which leaves it
+    /// waiting on Claude to say more and ask again
+    pub fn settles(&self) -> bool {
+        !matches!(self.mark, Some(Mark::Unsure | Mark::Lost | Mark::Shocked))
+    }
+}
+
+/// The question a line of an answer names first, and how many bytes of it that took, the way he
+/// types them: a number of up to three digits, the options' letters, a mark, then the line's end,
+/// a space or a stop (`2.`, `2:`, `2,`, `3)`), never a digit after a stop or a dash
+fn pick_at(t: &str) -> Option<(Pick, usize)> {
     let digits = t.chars().take_while(char::is_ascii_digit).count();
     if digits == 0 || digits > 3 {
         return None;
     }
     let rest = &t[digits..];
     let letters = rest.chars().take_while(char::is_ascii_lowercase).count();
-    let after = rest[letters..].chars().next();
-    let fits = match after {
+    let after = &rest[letters..];
+    let (mark, marked) = Mark::read(after).map_or((None, 0), |(m, n)| (Some(m), n));
+    let tail = &after[marked..];
+    let fits = match tail.chars().next() {
         None => true,
-        Some(' ') | Some(':') => true,
-        Some('.') | Some(')') => {
-            // "2. yes", "1a." and the end; not "1.5"
-            !rest[letters + 1..].starts_with(|c: char| c.is_ascii_digit())
-        }
+        Some(c) if c.is_whitespace() => true,
+        Some(':' | ',' | ';') => true,
+        // "2. yes", "1a." and the end; not "1.5"
+        Some('.' | ')') => !tail[1..].starts_with(|c: char| c.is_ascii_digit()),
+        // "2-3 days" is a range, not 2 declined, and "1/2" a half
         _ => false,
     };
-    fits.then(|| t[..digits].parse().ok()).flatten()
+    fits.then_some(())?;
+    let number = t[..digits].parse().ok()?;
+    let pick = Pick { number, options: rest[..letters].to_string(), mark };
+    Some((pick, digits + letters + marked))
+}
+
+/// The question a line of an answer names first: "1a", "2. yes", "2+", "3deg", "4-",
+/// "1+ but more salt", "2b, and keep it"
+pub fn pick(line: &str) -> Option<Pick> {
+    pick_at(line.trim_start()).map(|(p, _)| p)
+}
+
+/// The questions a line of an answer names: its first, and every one after it when the line is
+/// nothing but them ("1a 2b", "1a, 2+"), as a picker's picks read. His words after one end it,
+/// so "1+ but use 2 cores" names 1 alone.
+pub fn picks(line: &str) -> Vec<Pick> {
+    let mut out = vec![];
+    let mut rest = line.trim_start();
+    while let Some((pick, len)) = pick_at(rest) {
+        out.push(pick);
+        let after = rest[len..].trim_start_matches(|c: char| c == ',' || c == ';' || c.is_whitespace());
+        if !only_picks(after) {
+            break;
+        }
+        rest = after;
+    }
+    out
+}
+
+/// `text` is one or more picks and nothing else, apart by spaces or commas
+fn only_picks(text: &str) -> bool {
+    let mut rest = text;
+    if rest.is_empty() {
+        return false;
+    }
+    loop {
+        let Some((_, len)) = pick_at(rest) else {
+            return false;
+        };
+        let tail = &rest[len..];
+        // A stop or a colon after a pick ("2. yes", "1:") starts his words
+        if tail.starts_with(['.', ':', ')']) {
+            return tail[1..].trim().is_empty();
+        }
+        rest = tail.trim_start_matches(|c: char| c == ',' || c == ';' || c.is_whitespace());
+        if rest.is_empty() {
+            return true;
+        }
+    }
+}
+
+/// Every question an answer names, line by line, in its order: what a prompt of his answers
+pub fn picks_in(text: &str) -> Vec<Pick> {
+    text.lines().flat_map(picks).collect()
 }
 
 impl Draft {
@@ -100,48 +184,28 @@ impl Draft {
         Self {
             pane,
             session,
-            body: Body::Text { pieces: vec![] },
+            pieces: vec![],
         }
     }
 
-    /// What it says: the text, or a picker's picks
+    /// What it says
     pub fn text(&self) -> String {
-        match &self.body {
-            Body::Text { pieces } => pieces.concat(),
-            Body::Picker { label, .. } => label.clone(),
-        }
+        self.pieces.concat()
     }
 
     pub fn is_empty(&self) -> bool {
-        match &self.body {
-            Body::Text { pieces } => pieces.concat().trim().is_empty(),
-            Body::Picker { keys, missing, .. } => keys.is_empty() && missing.is_empty(),
-        }
-    }
-
-    pub fn is_picker(&self) -> bool {
-        matches!(self.body, Body::Picker { .. })
+        self.text().trim().is_empty()
     }
 
     /// The lines its card shows, each with the question it answers
     pub fn lines(&self) -> Vec<Line> {
-        match &self.body {
-            Body::Text { pieces } => pieces
-                .concat()
-                .split('\n')
-                .map(|text| Line {
-                    text: text.to_string(),
-                    question: answers(text),
-                })
-                .collect(),
-            Body::Picker { label, .. } => label
-                .split_whitespace()
-                .map(|pick| Line {
-                    text: pick.to_string(),
-                    question: answers(pick),
-                })
-                .collect(),
-        }
+        self.text()
+            .split('\n')
+            .map(|text| Line {
+                text: text.to_string(),
+                question: answers(text),
+            })
+            .collect()
     }
 
     /// The questions it answers, by number, each once, in its order
@@ -155,19 +219,14 @@ impl Draft {
         out
     }
 
-    /// Adds a piece of an answer, as Earshot wrote it: new lines as `\n`. A picker's picks give
-    /// way to it. Refused when the draft would grow past [`MAX_CHARS`].
+    /// Adds a piece of an answer, as LyreBird wrote it: new lines as `\n`. Refused when the draft
+    /// would grow past [`MAX_CHARS`].
     pub fn add(&mut self, piece: &str) -> Result<(), String> {
         let piece = piece.replace("\r\n", "\n").replace('\r', "\n");
         if piece.chars().any(|c| c.is_control() && c != '\n') {
             return Err("a piece of an answer can't hold control characters".to_string());
         }
-        if !matches!(self.body, Body::Text { .. }) {
-            self.body = Body::Text { pieces: vec![] };
-        }
-        let Body::Text { pieces } = &mut self.body else {
-            unreachable!()
-        };
+        let pieces = &mut self.pieces;
         let have: usize = pieces.iter().map(|p| p.chars().count()).sum();
         if have + piece.chars().count() > MAX_CHARS {
             return Err(format!("a draft holds {MAX_CHARS} characters at most"));
@@ -178,41 +237,24 @@ impl Draft {
         Ok(())
     }
 
-    /// "Scratch that": the newest piece taken back, or a picker's picks dropped; what went
+    /// "Scratch that": the newest piece taken back; what went
     pub fn scratch(&mut self) -> Option<String> {
-        match &mut self.body {
-            Body::Text { pieces } => pieces.pop(),
-            Body::Picker { label, .. } => {
-                let went = std::mem::take(label);
-                self.body = Body::Text { pieces: vec![] };
-                Some(went)
-            }
-        }
+        self.pieces.pop()
     }
 
     /// What "send" types, each written on its own: the text with Shift+Enter's ESC CR for each
-    /// new line, then Enter in a write of its own; a picker's keys, one at a time. Claude Code
+    /// new line, then Enter in a write of its own. Claude Code
     /// takes a long write as a paste, and an Enter inside a paste is a new line, not a send: on
     /// 2026-10-25 an 85-character draft sat in the box with "Removed 1 invisible character", and
     /// Enter written after the text, even under 45 ms after, sent 1,061 characters clean (Earshot's
     /// InMail; measured 2026-10-27 in a Haiku session on 2.1.311)
     pub fn send_keys(&self) -> Vec<String> {
-        match &self.body {
-            Body::Text { pieces } => {
-                let text = pieces.concat().trim_end_matches('\n').replace('\n', NEWLINE);
-                vec![text, ENTER.to_string()]
-            }
-            Body::Picker { keys, .. } => keys.clone(),
-        }
+        vec![self.edit_text(), ENTER.to_string()]
     }
 
-    /// What "edit" types: the text without Enter, for him to finish by hand. A picker's picks
-    /// have no text to edit.
-    pub fn edit_text(&self) -> Option<String> {
-        match &self.body {
-            Body::Text { pieces } => Some(pieces.concat().trim_end_matches('\n').replace('\n', NEWLINE)),
-            Body::Picker { .. } => None,
-        }
+    /// What "edit" types: the text without Enter, for him to finish by hand
+    pub fn edit_text(&self) -> String {
+        self.text().trim_end_matches('\n').replace('\n', NEWLINE)
     }
 }
 
@@ -221,7 +263,7 @@ impl Draft {
 pub enum Bottom {
     /// Claude Code's input box: the rows between its two rules
     Prompt(Range<usize>),
-    /// Something else: a picker, a permission prompt, another program
+    /// Something else: a permission prompt, a menu, another program
     Other,
 }
 
@@ -246,7 +288,7 @@ fn box_rules(screen: &Screen) -> Option<(usize, usize)> {
 }
 
 /// Whether Claude Code's input box is at the bottom of the screen: two rules with its prompt mark
-/// (❯) starting the first row between them, and nothing a picker or a permission prompt says
+/// (❯) starting the first row between them, and nothing a menu or a permission prompt says
 pub fn bottom(screen: &Screen) -> Bottom {
     let Some((upper, lower)) = box_rules(screen) else {
         return Bottom::Other;
@@ -257,8 +299,8 @@ pub fn bottom(screen: &Screen) -> Bottom {
         return Bottom::Other;
     }
     let last = last_ink(screen).unwrap_or(lower);
-    // From under the upper rule, which can hold the conversation's name: a name with a picker's
-    // words in it isn't a picker
+    // From under the upper rule, which can hold the conversation's name: a name with a menu's
+    // words in it isn't a menu
     let tail: String = screen.rows[upper + 1..=last].iter().map(|r| text_of(r) + "\n").collect();
     if NOT_A_PROMPT.iter().any(|w| tail.contains(w)) {
         return Bottom::Other;
@@ -267,7 +309,7 @@ pub fn bottom(screen: &Screen) -> Bottom {
 }
 
 /// The row a draft's card sits above: the input box's upper rule, or what took its place (a
-/// picker's, a permission prompt's), else under the last written row
+/// menu's, a permission prompt's), else under the last written row
 pub fn anchor_row(screen: &Screen) -> usize {
     match box_rules(screen) {
         Some((upper, _)) => upper,
@@ -275,64 +317,19 @@ pub fn anchor_row(screen: &Screen) -> usize {
     }
 }
 
-/// Whether the screen shows the picker asking `questions`, at its first question: no input box,
-/// and that question's first words near the bottom. The picks are typed from the first question,
-/// so a picker moved on by hand doesn't count.
-pub fn shows_picker(screen: &Screen, questions: &[String]) -> bool {
-    if matches!(bottom(screen), Bottom::Prompt(_)) {
-        return false;
-    }
-    let Some(first) = questions.first() else {
-        return false;
-    };
-    let want: Vec<String> = words(first).into_iter().take(PICKER_WORDS).collect();
-    if want.len() < PICKER_WORDS_MIN {
-        return false;
-    }
-    let Some(last) = last_ink(screen) else {
-        return false;
-    };
-    let from = (last + 1).saturating_sub(PICKER_ROWS);
-    let on: Vec<String> = screen.rows[from..=last]
-        .iter()
-        .flat_map(|r| words(&text_of(r)))
-        .collect();
-    on.windows(want.len()).any(|w| w == want.as_slice())
-}
-
 /// Whether "send" may type `draft` into a pane showing `screen`, or why not
 pub fn may_send(draft: &Draft, screen: &Screen) -> Result<(), String> {
     if draft.is_empty() {
         return Err("there's nothing in the draft to send".to_string());
     }
-    match &draft.body {
-        Body::Text { .. } => match bottom(screen) {
-            Bottom::Prompt(_) => Ok(()),
-            Bottom::Other => Err("Claude Code's prompt isn't showing there: a picker or a permission prompt has its place".to_string()),
-        },
-        Body::Picker {
-            missing, questions, ..
-        } => {
-            if !missing.is_empty() {
-                return Err(format!(
-                    "no pick yet for {}: a picker takes every answer at once",
-                    missing.join(", ")
-                ));
-            }
-            if shows_picker(screen, questions) {
-                Ok(())
-            } else {
-                Err("the picker those picks are for isn't on screen at its first question".to_string())
-            }
-        }
+    match bottom(screen) {
+        Bottom::Prompt(_) => Ok(()),
+        Bottom::Other => Err("Claude Code's prompt isn't showing there: a permission prompt or a menu has its place".to_string()),
     }
 }
 
 /// Whether "edit" may type `draft` into a pane showing `screen`, or why not
 pub fn may_edit(draft: &Draft, screen: &Screen) -> Result<(), String> {
-    if draft.is_picker() {
-        return Err("a picker's picks have no text to edit: say send, or scratch that".to_string());
-    }
     if draft.is_empty() {
         return Err("there's nothing in the draft to edit".to_string());
     }
@@ -398,22 +395,7 @@ mod test {
         Draft {
             pane: 3,
             session: Some("s".into()),
-            body: Body::Text {
-                pieces: pieces.iter().map(|p| p.to_string()).collect(),
-            },
-        }
-    }
-
-    fn picker_draft(missing: &[&str]) -> Draft {
-        Draft {
-            pane: 3,
-            session: None,
-            body: Body::Picker {
-                label: "1b 2a".into(),
-                keys: vec!["2".into(), "1".into(), "1".into()],
-                questions: vec!["Which colour should the pad take?".into(), "And its ring?".into()],
-                missing: missing.iter().map(|m| m.to_string()).collect(),
-            },
+            pieces: pieces.iter().map(|p| p.to_string()).collect(),
         }
     }
 
@@ -425,6 +407,57 @@ mod test {
         for line in ["also, check the build", "2026 was", "1.5 s", "", "x1", "1A", "1234 rows"] {
             assert_eq!(answers(line), None, "{line}");
         }
+    }
+
+    fn p(number: u32, options: &str, mark: Option<Mark>) -> Pick {
+        Pick { number, options: options.into(), mark }
+    }
+
+    #[test]
+    fn his_shorthand_names_the_question_its_options_and_his_mark() {
+        use Mark::*;
+        for (line, want) in [
+            ("1a", p(1, "a", None)),
+            ("2.", p(2, "", None)),
+            ("2. explain more", p(2, "", None)),
+            ("2+", p(2, "", Some(Yes))),
+            ("3deg", p(3, "deg", None)),
+            ("1+ but add more salt", p(1, "", Some(Yes))),
+            ("4-", p(4, "", Some(No))),
+            ("12- not now", p(12, "", Some(No))),
+            ("2?", p(2, "", Some(Unsure))),
+            ("2??", p(2, "", Some(Lost))),
+            ("2?! that can't be right", p(2, "", Some(Shocked))),
+            ("5//", p(5, "", Some(Later))),
+            ("2b, but also allow it as a setting", p(2, "b", None)),
+            ("2, I did not change them", p(2, "", None)),
+            ("  11b", p(11, "b", None)),
+        ] {
+            assert_eq!(pick(line), Some(want.clone()), "{line}");
+            assert_eq!(answers(line), Some(want.number), "{line}");
+        }
+        for line in ["2-3 days", "1/2 of them", "2+3", "1.5x", "Q1 yes", "yes"] {
+            assert_eq!(pick(line), None, "{line}");
+        }
+        assert!(p(1, "a", None).settles() && p(4, "", Some(No)).settles() && p(5, "", Some(Later)).settles());
+        assert!(!p(2, "", Some(Unsure)).settles() && !p(2, "", Some(Lost)).settles() && !p(2, "", Some(Shocked)).settles());
+    }
+
+    #[test]
+    fn a_line_of_picks_names_each_and_his_words_end_them() {
+        use Mark::*;
+        assert_eq!(picks("1a 2b"), vec![p(1, "a", None), p(2, "b", None)]);
+        assert_eq!(picks("1a, 2+, 3-"), vec![p(1, "a", None), p(2, "", Some(Yes)), p(3, "", Some(No))]);
+        assert_eq!(picks("1+ but use 2 cores"), vec![p(1, "", Some(Yes))]);
+        assert_eq!(picks("1a 2b and more"), vec![p(1, "a", None)]);
+        assert_eq!(picks("1. 2 more tests"), vec![p(1, "", None)]);
+        assert_eq!(picks("we said 2b"), vec![]);
+        // A prompt: each line's, in order, past his words before them
+        let prompt = "If I use a reset, the limit should go up too\n\n1+\n2- not now\n4. explain more\n3deg";
+        assert_eq!(
+            picks_in(prompt),
+            vec![p(1, "", Some(Yes)), p(2, "", Some(No)), p(4, "", None), p(3, "deg", None)]
+        );
     }
 
     #[test]
@@ -460,22 +493,13 @@ mod test {
         assert_eq!(d.scratch().as_deref(), Some("1a"));
         assert!(d.is_empty());
         assert_eq!(d.scratch(), None);
-
-        let mut p = picker_draft(&[]);
-        assert_eq!(p.scratch().as_deref(), Some("1b 2a"));
-        assert!(p.is_empty() && !p.is_picker());
     }
 
     #[test]
     fn send_types_shift_enter_between_lines_then_enter() {
         let d = text_draft(&["1a", "\n2. yes", "\n\nalso, check the build\n"]);
         assert_eq!(d.send_keys(), vec!["1a\x1b\r2. yes\x1b\r\x1b\ralso, check the build", "\r"], "Enter in a write of its own");
-        assert_eq!(d.edit_text().as_deref(), Some("1a\x1b\r2. yes\x1b\r\x1b\ralso, check the build"));
-        let p = picker_draft(&[]);
-        assert_eq!(p.send_keys(), vec!["2", "1", "1"]);
-        assert_eq!(p.edit_text(), None);
-        assert_eq!(p.answered(), vec![1, 2]);
-        assert_eq!(p.lines().len(), 2);
+        assert_eq!(d.edit_text(), "1a\x1b\r2. yes\x1b\r\x1b\ralso, check the build");
     }
 
     #[test]
@@ -502,14 +526,13 @@ mod test {
         assert_eq!(anchor_row(&s), 5, "the card sits above the named rule");
         assert!(may_send(&text_draft(&["1a", "\n2a"]), &s).is_ok());
         assert!(may_edit(&text_draft(&["1a"]), &s).is_ok());
-        assert!(!shows_picker(&s, &["Which colour should the pad take?".into()]));
-        // A name with a picker's words in it is still a name
+        // A name with a menu's words in it is still a name
         named[5] = "──────────────────────────────────────── Do you want to rename it ─";
         assert_eq!(bottom(&screen(&named)), Bottom::Prompt(6..7));
     }
 
     #[test]
-    fn a_permission_prompt_or_a_picker_isnt_the_prompt() {
+    fn a_permission_prompt_or_a_menu_isnt_the_prompt() {
         let permission = screen(&[
             "● I'll remove it.",
             RULE,
@@ -522,12 +545,13 @@ mod test {
         assert_eq!(bottom(&permission), Bottom::Other);
         assert!(may_send(&text_draft(&["1a"]), &permission).is_err());
 
-        // Its own rules, one above it and one before "Chat about this"
+        // A menu with its own rules, one above it and one before "Chat about this" (AskUserQuestion's
+        // picker, as Claude Code 2.1.311 drew it)
         let picker = screen(&picker_lines());
         assert_eq!(bottom(&picker), Bottom::Other);
         assert_eq!(anchor_row(&picker), 1);
 
-        // Two rules round something starting with ❯ but saying a picker's words
+        // Two rules round something starting with ❯ but saying a menu's words
         let sneaky = screen(&[RULE, "❯ 1. Yes", RULE, "Enter to select · Esc to cancel"]);
         assert_eq!(bottom(&sneaky), Bottom::Other);
         // No rules at all: another program
@@ -553,23 +577,13 @@ mod test {
     }
 
     #[test]
-    fn text_goes_only_into_the_prompt_and_picks_only_into_their_picker() {
+    fn text_goes_only_into_the_prompt() {
         let at_prompt = screen(&prompt());
-        let at_picker = screen(&picker_lines());
+        let at_menu = screen(&picker_lines());
         assert_eq!(may_send(&text_draft(&["1a"]), &at_prompt), Ok(()));
-        assert!(may_send(&text_draft(&["1a"]), &at_picker).unwrap_err().contains("prompt isn't showing"));
-        assert_eq!(may_send(&picker_draft(&[]), &at_picker), Ok(()));
-        assert!(may_send(&picker_draft(&[]), &at_prompt).unwrap_err().contains("isn't on screen"));
-        assert!(may_send(&picker_draft(&["Q2"]), &at_picker).unwrap_err().contains("no pick yet for Q2"));
+        assert!(may_send(&text_draft(&["1a"]), &at_menu).unwrap_err().contains("prompt isn't showing"));
         assert!(may_send(&text_draft(&[]), &at_prompt).unwrap_err().contains("nothing"));
-
-        // Moved on to its second question by hand: the picks would land on the wrong ones
-        let mut moved = picker_lines();
-        moved[4] = "And its ring?";
-        assert!(may_send(&picker_draft(&[]), &screen(&moved)).is_err());
-
         assert_eq!(may_edit(&text_draft(&["1a"]), &at_prompt), Ok(()));
-        assert!(may_edit(&text_draft(&["1a"]), &at_picker).is_err());
-        assert!(may_edit(&picker_draft(&[]), &at_picker).is_err());
+        assert!(may_edit(&text_draft(&["1a"]), &at_menu).is_err());
     }
 }

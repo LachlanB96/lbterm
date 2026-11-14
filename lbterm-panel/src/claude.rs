@@ -288,6 +288,10 @@ pub struct Tab {
     /// What its Claude conversation has cost at list price, as Terminal's statusline last wrote
     /// it (`<session>.usage.json`), once it has
     pub usd: Option<f64>,
+    /// When Lachlan last sent its Claude session a prompt, in Unix seconds, once it's known
+    /// (lbterm_extras::summaries::Summary::last_prompt, `<session>.prompt.json`): none for a tab
+    /// without Claude, never a zero
+    pub prompted: Option<f64>,
     /// Its Claude sessions are hidden from the Conductor, as its button.json says, or a Hide from
     /// Conductor picked for it waits for that (wezterm-gui's render/conductor_hide.rs;
     /// lbterm/NEW-TAB.md, section 8)
@@ -348,6 +352,11 @@ pub struct Row {
     /// What its conversation has cost, "$12.34" (text::dollars), at the second line's end on the
     /// open panel (Lachlan's E6, 2026-11-07); empty until it's known
     pub cost: String,
+    /// How long ago Lachlan last sent its session a prompt, "4 min" (text::since), at the start of
+    /// the open panel's second line, before the project (his ask of 2026-11-11, his 1c of 2026-11-14);
+    /// empty while it isn't known, as for a tab without Claude. Not on the closed rail
+    /// (lbterm/TAB-PANEL.md, "What a row says")
+    pub prompted: String,
     /// Hidden from the Conductor ([`Tab::hidden`]): the eye-off mark at its pad's bottom-right
     /// on the rail, and a "Hidden" chip on the open panel (lbterm/NEW-TAB.md, section 8, "The
     /// look"), so both looks count it and the row dissolves into it on `swap`
@@ -374,7 +383,9 @@ impl Row {
 /// finished tab's age each minute until 2026-10-30, to paint what nobody could see.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Changes {
-    /// Its age ("now", then "1m", "2m" and on), on the open panel
+    /// Its age ("now", then "1m", "2m" and on), or the time since Lachlan's last prompt to it
+    /// ("just now", then "1 min" and on), whichever reads differently first: both on the open
+    /// panel alone
     pub age: Option<f64>,
     /// Its idle bars' next step, on the rail
     pub step: Option<f64>,
@@ -639,11 +650,19 @@ fn row_since(tab: &Tab, now: f64, idle_full: f64) -> (Row, Changes, Option<f64>)
         .max_by_key(|q| q.stamp)
         .filter(|q| state == RowState::Working && newest_light.map_or(true, |s| q.stamp > s));
     let mut wake = wake;
+    // How long ago Lachlan last prompted it, on the open panel; its words change when a minute,
+    // an hour or a day is up, as the age's do, and the panel wakes then only while it's open
+    let prompted = tab.prompted.map(|at| (now - at).max(0.0));
+    if let Some(secs) = prompted {
+        let next = text::ago_changes_in(secs);
+        wake.age = Some(wake.age.map_or(next, |age| age.min(next)));
+    }
     let (state, status, message, quiet) = match quiet {
         Some(q) if q.level == QuietLevel::Stuck => {
             let secs = (now - q.since).max(0.0);
-            // Its minutes, counted on the open panel
-            wake.age = Some(60.0 - secs % 60.0);
+            // Its minutes, counted on the open panel, or the time since his prompt if that's sooner
+            let next = 60.0 - secs % 60.0;
+            wake.age = Some(wake.age.map_or(next, |age| age.min(next)));
             (RowState::Stuck, format!("Stuck? {}m", (secs / 60.0) as u64), String::new(), false)
         }
         Some(q) if q.level == QuietLevel::Quiet => (state, status, message, true),
@@ -673,6 +692,7 @@ fn row_since(tab: &Tab, now: f64, idle_full: f64) -> (Row, Changes, Option<f64>)
         link,
         quiet,
         cost: tab.usd.map(text::dollars).unwrap_or_default(),
+        prompted: prompted.map(text::since).unwrap_or_default(),
         hidden: tab.hidden,
         parked: tab.parked,
     };
@@ -815,6 +835,7 @@ mod test {
             link: None,
             quiets: vec![],
             usd: None,
+            prompted: None,
             hidden: false,
             parked: false,
         }
@@ -825,6 +846,45 @@ mod test {
         assert_eq!(row(&tab(), 1_000.0, 3_600.0).0.cost, "");
         let costed = Tab { usd: Some(12.349), ..tab() };
         assert_eq!(row(&costed, 1_000.0, 3_600.0).0.cost, "$12.34");
+    }
+
+    #[test]
+    fn a_tabs_row_says_how_long_ago_he_last_prompted_it_once_its_known() {
+        let working = || {
+            let mut t = tab();
+            t.statuses = vec![Status { colour: Some(WORKING), stamp: Some(STAMP) }];
+            t
+        };
+        // Not known (a shell, or a session whose file isn't in): no words and no wake, never a zero
+        let (r, wake) = row(&working(), UNIX, 3600.0);
+        assert_eq!((r.prompted.as_str(), wake.next(true)), ("", None));
+        // Four and a half minutes ago, the tab working: "4 min", the open panel waking at five
+        let t = Tab { prompted: Some(UNIX - 270.0), ..working() };
+        let (r, wake) = row(&t, UNIX, 3600.0);
+        assert_eq!(r.prompted, "4 min");
+        assert_eq!(wake.next(true), Some(30.0), "its words next change at 5 min");
+        assert_eq!(wake.next(false), None, "the closed rail doesn't show it, so it wakes for nothing");
+        // A clock a moment ahead of this one: just now
+        let ahead = Tab { prompted: Some(UNIX + 3.0), ..working() };
+        assert_eq!(row(&ahead, UNIX, 3600.0).0.prompted, "just now");
+        // Finished 20 s ago (its age turns 1m in 40 s) and prompted 125 s ago (2 min, turning
+        // 3 min in 55 s): both on the open panel, so it wakes for whichever changes first
+        let done = Tab { prompted: Some(UNIX - 105.0), ..tab() };
+        let (r, wake) = row(&done, UNIX + 20.0, 3600.0);
+        assert_eq!((r.age.as_str(), r.prompted.as_str()), ("now", "2 min"));
+        assert_eq!(wake.age, Some(40.0));
+        let done = Tab { prompted: Some(UNIX - 150.0), ..tab() };
+        assert_eq!(row(&done, UNIX + 20.0, 3600.0).1.age, Some(10.0), "2 min turns 3 min in 10 s");
+        // Stuck, its minutes counting too: the sooner of the two
+        let mut stuck = Tab { prompted: Some(UNIX - 150.0), ..working() };
+        stuck.quiets = Quiet::parse(&format!("stuck|{}|{}", ((UNIX - 430.0) * 1000.0) as u64, STAMP + 1)).into_iter().collect();
+        let (r, wake) = row(&stuck, UNIX + 20.0, 3600.0);
+        assert_eq!((r.state, r.prompted.as_str()), (RowState::Stuck, "2 min"));
+        assert_eq!(wake.age, Some(10.0), "the prompt's 3 min in 10 s, before the stuck minutes' 8m in 30 s");
+        // The words alone count: the same words a second later are the same row
+        let a = row(&Tab { prompted: Some(UNIX - 200.0), ..working() }, UNIX, 3600.0).0;
+        let b = row(&Tab { prompted: Some(UNIX - 201.0), ..working() }, UNIX, 3600.0).0;
+        assert_eq!(a, b);
     }
 
     fn program(id: &str, state: ProgramState, updated: f64) -> Program {

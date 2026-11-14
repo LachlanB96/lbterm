@@ -43,7 +43,7 @@ pub fn fades(item: &UIItemType) -> bool {
                 | TabBarItem::LbtermSummary
                 | TabBarItem::LbtermInbox
                 | TabBarItem::LbtermAgenda
-                | TabBarItem::LbtermContext
+                | TabBarItem::LbtermProjects
         )
     )
 }

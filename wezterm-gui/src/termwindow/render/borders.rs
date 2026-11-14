@@ -120,6 +120,10 @@ impl crate::TermWindow {
         border.right += ULength::new(
             super::objectives::strip_width(config, dimensions, render_metrics) as usize,
         );
+        // or the context bar's, which takes the objectives strip's room (render/context_bar.rs)
+        border.right += ULength::new(
+            super::context_bar::strip_width(config, dimensions, render_metrics) as usize,
+        );
         // and the scroll strip's, left of it (render/scroll_strip.rs)
         border.right += ULength::new(
             super::scroll_strip::strip_width(config, dimensions, render_metrics) as usize,

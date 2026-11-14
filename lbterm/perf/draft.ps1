@@ -4,7 +4,7 @@
 Voice drafts end to end (lbterm/CONTROL.md, "Drafts"), through `lbterm control draft`, in a test
 window that looks like Lachlan's LBTerm (New-TestConfig) with lbterm_summaries pointed at a folder
 of its own. Its pane runs fake-prompt.ps1, a stand-in for Claude Code: a reply asking Q1 and Q2,
-with the prompt, a permission prompt or a picker under it as the test says, and every key it's
+with the prompt, a permission prompt or a menu under it as the test says, and every key it's
 sent written down. The folder holds the session's questions.json, as Terminal's question worker
 writes it.
 
@@ -17,8 +17,9 @@ writes it.
 4. At the prompt, send types it all: Shift+Enter's ESC CR for each new line, then Enter; the card
    goes.
 5. LbtermDraft 'Edit' (F9 here) types a draft without Enter.
-6. A picker's picks go only into their picker, as its keys; with a question still to pick, send
-   is refused.
+6. With a menu in the box's place (fake-prompt's picker screen, AskUserQuestion's as Claude Code
+   drew it), send is refused. Drafts made a picker's picks until 2026-11-14, when the picker's code
+   went (Lachlan's 2a).
 7. Another Claude session in the pane lets its draft go.
 
 Keys are posted messages, never real input.
@@ -157,28 +158,18 @@ table.insert(config.keys, { key = 'F9', mods = 'NONE', action = wezterm.action.L
   else { 'edit (F9): typed 1b without Enter' }
   Wait-Change { param($x) @($x.drafts).Count -eq 0 } -What 'the card gone after edit' | Out-Null
 
-  # 6. A picker's picks
+  # 6. A menu in the box's place
   Set-Mode 'picker' $w
-  $q = 'Which colour should the pad take?'
-  $r = Invoke-Control draft picker --label '1b 2a' --key 2 --key 1 --question $q --question 'And its ring?' --missing Q2
-  Wait-Change { param($x) @($x.drafts).Count -eq 1 -and $x.drafts[0].kind -eq 'picker' } -What 'the picker card' | Out-Null
-  $r = Invoke-Control draft send
-  if ($r.Code -ne 1 -or $r.Error -notmatch 'no pick yet for Q2') { Add-Failure "send with Q2 to pick: exit $($r.Code), '$($r.Error)'" }
-  else { "a picker with a question to pick: refused ($($r.Error))" }
-  Invoke-Control draft picker --label '1b 2a' --key 2 --key 1 --key 1 --question $q --question 'And its ring?' | Out-Null
+  Invoke-Control draft add '1a' | Out-Null
   $before = Get-KeyCount
   $r = Invoke-Control draft send
-  $done = Wait-Until { $script:typed = Get-Typed $before; $script:typed -eq '211' } -TimeoutSec 5
-  if ($r.Code -ne 0 -or -not $done) { Add-Failure "picker send: exit $($r.Code) '$($r.Error)', typed '$($script:typed)'" }
-  else { 'picker: its keys typed, 2 1 1' }
-  Invoke-Control draft add '1a' | Out-Null
-  $r = Invoke-Control draft send
-  if ($r.Code -ne 1 -or $r.Error -notmatch "prompt isn't showing") { Add-Failure "text sent into a picker: exit $($r.Code), '$($r.Error)'" }
-  else { 'text into a picker: refused' }
+  Start-Sleep -Milliseconds 300
+  if ($r.Code -ne 1 -or $r.Error -notmatch "prompt isn't showing" -or (Get-Typed $before)) { Add-Failure "text sent into a menu: exit $($r.Code), '$($r.Error)', typed '$(Get-Typed $before)'" }
+  else { 'text into a menu: refused, nothing typed' }
 
   # 7. Another session in the pane
   Set-Mode 'newsession' $w
   $gone = Wait-Until { $null -eq (Invoke-Control draft get).Reply.draft } -TimeoutSec 5
   if (-not $gone) { Add-Failure 'the draft outlived the session it was for' }
   else { 'another session in the pane: the draft let go' }
-} -Passed 'draft: the card, its ticks and the next question''s red ring follow the pieces, send types it all only into the prompt or its picker, edit types it without Enter, a new session lets it go'
+} -Passed 'draft: the card, its ticks and the next question''s red ring follow the pieces, send types it all only into the prompt, edit types it without Enter, a new session lets it go'

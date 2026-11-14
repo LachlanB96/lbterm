@@ -1,18 +1,23 @@
-"""An animated GIF of frames from capture.ps1 or panel-demo.ps1, at real speed.
+"""An animated GIF of frames from capture.ps1, panel-demo.ps1 or a demo script, at real speed.
 
 usage: python gif.py DIR [--out FILE] [--crop X0,Y0,X1,Y1] [--scale S] [--step MS]
-                         [--slowdown K] [--hold MS]
+                         [--slowdown K] [--hold MS] [--pointer [--pointer-scale S]]
 
 Reads DIR/frame*.png and DIR/frames.csv (frame, ms). Every STEP ms of real time (the frames'
 times divided by --slowdown, the slowdown they were taken at) it shows the last frame taken by
 then, so the GIF plays at the speed the motion really has. --hold pauses on the first and last
 frames. One palette for every frame, so nothing flickers between them.
+
+--pointer draws an arrow where a posted pointer was in each frame, from frames.csv's x and y
+columns (client pixels, -1 while it was off the window; strips-demo.ps1 writes them): posted
+messages move no real pointer, and captures have none, so without it a card opens with nothing
+to say why. --pointer-scale sizes it to the window's DPI (1.25 at 120).
 """
 import argparse
 import csv
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ap = argparse.ArgumentParser()
 ap.add_argument("dir")
@@ -22,6 +27,8 @@ ap.add_argument("--scale", type=float, default=1.0)
 ap.add_argument("--step", type=float, default=20)
 ap.add_argument("--slowdown", type=float, default=1.0)
 ap.add_argument("--hold", type=float, default=700)
+ap.add_argument("--pointer", action="store_true")
+ap.add_argument("--pointer-scale", type=float, default=1.0)
 args = ap.parse_args()
 d = Path(args.dir)
 out = Path(args.out) if args.out else d / "demo.gif"
@@ -29,6 +36,19 @@ out = Path(args.out) if args.out else d / "demo.gif"
 rows = list(csv.DictReader(open(d / "frames.csv")))
 times = [float(r["ms"]) / args.slowdown for r in rows]
 crop = tuple(int(v) for v in args.crop.split(",")) if args.crop else None
+if args.pointer and rows and "x" not in rows[0]:
+    raise SystemExit(f"{d / 'frames.csv'} has no x and y columns for --pointer")
+
+# Windows' arrow, its tip at (0, 0), in pixels at 96 DPI
+ARROW = [(0, 0), (0, 16), (4, 12), (7, 19), (10, 18), (7, 11), (12, 11)]
+
+
+def draw_pointer(img, x, y):
+    k = args.pointer_scale * args.scale
+    ox, oy = (crop[0], crop[1]) if crop else (0, 0)
+    px, py = (x - ox) * args.scale, (y - oy) * args.scale
+    ImageDraw.Draw(img).polygon([(px + ax * k, py + ay * k) for ax, ay in ARROW], fill=(255, 255, 255),
+                                outline=(0, 0, 0), width=max(1, round(k)))
 
 
 def load(i):
@@ -37,6 +57,8 @@ def load(i):
         img = img.crop(crop)
     if args.scale != 1.0:
         img = img.resize((round(img.width * args.scale), round(img.height * args.scale)), Image.LANCZOS)
+    if args.pointer and int(rows[i]["x"]) >= 0:
+        draw_pointer(img, int(rows[i]["x"]), int(rows[i]["y"]))
     return img
 
 

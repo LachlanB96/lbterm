@@ -429,28 +429,9 @@ pub fn card(
     })
 }
 
-/// Where a card `height` tall goes for a pad whose zone runs from `zone.0` to `zone.1`, between
-/// `ceiling` and `floor`: down from the pad's top when it fits (the pad at the strip's top, level
-/// with the Conductor's), else up from the pad's foot (the pad at the strip's foot), never above
-/// the ceiling.
-pub fn place(zone: (f64, f64), height: f64, (ceiling, floor): (f64, f64)) -> f64 {
-    if zone.0 + height <= floor {
-        zone.0
-    } else {
-        (zone.1 - height).max(ceiling)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn the_card_opens_down_from_a_pad_at_the_top_and_up_from_one_at_the_foot() {
-        assert_eq!(place((60.0, 105.0), 300.0, (40.0, 730.0)), 60.0);
-        assert_eq!(place((659.0, 734.0), 300.0, (40.0, 730.0)), 434.0);
-        assert_eq!(place((659.0, 734.0), 900.0, (40.0, 730.0)), 40.0, "never above the ceiling");
-    }
 
     #[test]
     fn a_folder_is_compared_without_case_slashes_or_url() {

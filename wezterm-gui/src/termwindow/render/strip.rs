@@ -420,6 +420,8 @@ impl crate::TermWindow {
         let content = self.lbterm_strip_content();
         // The context pill's dollars (render/context.rs), for the session the content just found
         let context_changed = self.lbterm_context_refresh();
+        // And the projects pad beside it, lit while its card is open (render/projects.rs)
+        let projects_changed = self.lbterm_projects_refresh();
         let card = self.lbterm_strip_card_for(content.as_ref());
         if content != self.lbterm_strip.shown || card != self.lbterm_strip.shown_card {
             // Words that change in the same tab dissolve into the new ones, and a tab's into the
@@ -436,7 +438,7 @@ impl crate::TermWindow {
             self.lbterm_strip.shown_card = card;
             self.invalidate_fancy_tab_bar();
         }
-        if inbox_changed || agenda_changed || context_changed {
+        if inbox_changed || agenda_changed || context_changed || projects_changed {
             self.invalidate_fancy_tab_bar();
         }
         let notice_due = self
@@ -618,23 +620,66 @@ impl crate::TermWindow {
         }
         let cell = font.metrics().cell_width.get() as f32;
         let mut kids = vec![];
-        // The context pill under the InMail button, centred on the rail's column as that is, with
-        // the strip between it and the prompt; past the prompt's start it pushes the prompt on, a
-        // column after it (render/context.rs)
+        // The context pill under the InMail button, centred on the rail's column as that is, and
+        // the projects pad after it, or in its place without it, as the agenda's button is after
+        // the InMail button on the first row (render/inbox.rs, `lbterm_strip_buttons`); then the
+        // strip between them and the prompt. Past the prompt's start they push the prompt on, a
+        // column after the last (render/context.rs, render/projects.rs). While the pill can show
+        // in this window its room is kept, as wide as the widest dollars it says with the pill
+        // centred in it, in a tab with no Claude session too, so the pad after it stays where it
+        // is as he goes from tab to tab (Lachlan's 6a of 2026-11-09)
         let mut start = indent;
         let mut left = indent;
-        if let Some((pill, w)) = self.lbterm_context_pill(font, metrics, surface, bar)? {
+        let spacer = |w: f32| {
+            Element::new(font, ElementContent::Children(vec![]))
+                .item_type(UIItemType::TabBar(TabBarItem::None))
+                .min_width(Some(Dimension::Pixels(w)))
+        };
+        let room = self.lbterm_context_room(font, metrics, surface, bar)?;
+        let pill = self.lbterm_context_pill(font, metrics, surface, bar)?;
+        let first: Option<(Vec<Element>, f32)> = match (room, pill) {
+            (Some(room), pill) => {
+                let w = room.max(pill.as_ref().map_or(0., |(_, w)| *w));
+                let mut kept = vec![];
+                match pill {
+                    Some((pill, pw)) => {
+                        let before = ((w - pw) / 2.).floor();
+                        if before > 0. {
+                            kept.push(spacer(before));
+                        }
+                        kept.push(pill);
+                        if w - pw - before > 0. {
+                            kept.push(spacer(w - pw - before));
+                        }
+                    }
+                    None => kept.push(spacer(w)),
+                }
+                Some((kept, w))
+            }
+            (None, Some((pill, w))) => Some((vec![pill], w)),
+            (None, None) => None,
+        };
+        let pills: Vec<(Vec<Element>, f32)> = first
+            .into_iter()
+            .chain(self.lbterm_projects_pad(font, metrics, surface, bar)?.map(|(pad, w)| (vec![pad], w)))
+            .collect();
+        if let Some(first_w) = pills.first().map(|(_, w)| *w) {
             let column = super::tab_panel::rail_column(&self.config, &self.dimensions, &self.render_metrics);
-            let x = (column - w / 2.).round().max(0.);
-            let gap = (indent - x - w).max(cell);
-            kids.push(pill);
-            kids.push(
-                Element::new(font, ElementContent::Children(vec![]))
-                    .item_type(UIItemType::TabBar(TabBarItem::None))
-                    .min_width(Some(Dimension::Pixels(gap))),
-            );
+            let x = (column - first_w / 2.).round().max(0.);
+            let between_pills = (metrics.cell_size.width as f32 * 0.5).round();
+            let mut used = x;
+            for (i, (pill, w)) in pills.into_iter().enumerate() {
+                if i > 0 {
+                    kids.push(spacer(between_pills));
+                    used += between_pills;
+                }
+                kids.extend(pill);
+                used += w;
+            }
+            let gap = (indent - used).max(cell);
+            kids.push(spacer(gap));
             left = x;
-            start = x + w + gap;
+            start = used + gap;
         }
         if content.prompt.is_some() || content.note.is_some() {
             // The chip's corners: filled in its colour, which the border is too

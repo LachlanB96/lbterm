@@ -1,6 +1,6 @@
 #Requires -Version 7
 # Variant: -NoCompositor
-# Covers: lbterm-extras/src/tasks.rs, lbterm-extras/src/summaries.rs, wezterm-gui/src/termwindow/render/tasks_card.rs, wezterm-gui/src/termwindow/render/tab_panel.rs, wezterm-gui/src/termwindow/compositor.rs
+# Covers: lbterm-extras/src/tasks.rs, lbterm-extras/src/summaries.rs, wezterm-gui/src/termwindow/render/tasks_card.rs, wezterm-gui/src/termwindow/render/tab_panel.rs, wezterm-gui/src/termwindow/compositor.rs, wezterm-gui/src/termwindow/render/composited.rs, wezterm-gui/src/termwindow/render/objectives.rs
 <#
 The card of what a tab's Claude session has running (lbterm/TAB-PANEL.md, "What's running"), end to
 end. A test window with lbterm_summaries pointed at a scratch folder (<out>\summaries) gets two
@@ -13,7 +13,9 @@ plain.
 
 1. The pointer rests on the first row: the panel opens, then the card drops beside the row
    (rail-tasks.png). It must list the three tasks with their ages, the subagent's latest tool call,
-   its tool calls and its tokens under it.
+   its tool calls and its tokens under it, and the card must be on the capture: its words, on a
+   3 px grid over its rect, far from the panes' colour beside it (a card whose z-layers another owner
+   claims is in the state file and on no screen, lbterm/PITFALLS.md 300).
 2. The subagent's transcript grows by a tool call while the card is open: the card must say so
    within a few seconds, with nothing done to the window, and keep its width though the line got
    shorter (rail-tasks-later.png).
@@ -92,7 +94,27 @@ Invoke-Test {
   # 1. Resting on the first row: the panel, then the card
   Set-PointerHold $w $onFirst[0] $onFirst[1]
   $s = Wait-Change { param($s) $s.rail.open -and $s.tasks -and $s.tasks.row -eq 0 } -What 'the card beside the first row' -Animating -TimeoutSec 20
-  Get-Shot $w -Name 'rail-tasks' | ForEach-Object { $_.Dispose() }
+  # The card on the screen, not only in the state file, which says what the window meant to show: with
+  # the compositor on, a card whose z-layers another owner claims has its quads drawn into that
+  # owner's visual and shows nowhere, while its words are all in the state file (lbterm/PITFALLS.md
+  # 300 and 285, the cost pane's 80 to 82 of 2026-11-09). The card's fill is the panes' own colour
+  # (its ring and words tell it apart), and the panes under it are empty here, so its words are what's
+  # looked for: the points of a 3 px grid over its rect far from the panes' colour beside it, a few
+  # hundred with the card's four rows drawn and none without it
+  $shot = Get-Shot $w -Name 'rail-tasks'
+  try {
+    $r = $s.tasks.rect
+    $outside = $shot.GetPixel([Math]::Min([int]($r.x + $r.w + 24), $shot.Width - 2), [int]($r.y + $r.h / 2))
+    $points = 0; $apart = 0
+    for ($y = [int]$r.y + 2; $y -lt [Math]::Min($r.y + $r.h - 2, $shot.Height); $y += 3) {
+      for ($x = [int]$r.x + 2; $x -lt [Math]::Min($r.x + $r.w - 2, $shot.Width); $x += 3) {
+        $p = $shot.GetPixel($x, $y); $points++
+        if ([Math]::Abs($p.R - $outside.R) + [Math]::Abs($p.G - $outside.G) + [Math]::Abs($p.B - $outside.B) -gt 90) { $apart++ }
+      }
+    }
+    "the card on the capture: $apart of $points points of its rect far from the panes' colour beside it ($outside)"
+    if ($apart -lt [Math]::Max(20, $points / 100)) { Add-Failure "the card isn't drawn: $apart of $points points inside its rect $($r.x),$($r.y) $($r.w)x$($r.h) differ from the panes beside it (rail-tasks.png)" }
+  } finally { $shot.Dispose() }
   $lines = @($s.tasks.lines)
   "the card says:"; $lines | ForEach-Object { "  $_" }
   $want = @(

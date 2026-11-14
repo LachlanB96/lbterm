@@ -295,6 +295,11 @@ impl crate::TermWindow {
             // LBTerm: the rows the pane draws, so the triggers know which of their lines have gone
             // (render/triggers.rs)
             self.lbterm_triggers_view(pane_id, stable_range.clone(), &palette);
+            // LBTerm: a Claude pane's rows are read for the weights, each handed what the row
+            // above left it, from the pane's top row down (render/triggers.rs)
+            let weights_head = self
+                .lbterm_triggers_weighs(&pos.pane)
+                .then_some(lbterm_extras::questions::weights::Head::Closed);
 
             struct LineRender<'a, 'b> {
                 term_window: &'a mut crate::TermWindow,
@@ -323,6 +328,9 @@ impl crate::TermWindow {
                 // LBTerm: the cells linking to a picture row, drawn over after the lines
                 // (render/thumbnails.rs)
                 thumbnail_runs: Vec<lbterm_extras::thumbnails::Run>,
+                // LBTerm: what the row drawn last left the next for the weights, `None` in a
+                // pane with no Claude session (render/triggers.rs)
+                weights_head: Option<lbterm_extras::questions::weights::Head>,
             }
 
             let left_pixel_x = padding_left
@@ -359,6 +367,7 @@ impl crate::TermWindow {
                 layers,
                 error: None,
                 thumbnail_runs: vec![],
+                weights_head,
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -376,6 +385,7 @@ impl crate::TermWindow {
                         stable_row,
                         line,
                         self.palette,
+                        &mut self.weights_head,
                     );
                     let line: &Line = styled.as_deref().unwrap_or(&**line);
                     let (shape_hash, by_state) = self.term_window.lbterm_shape_hash_for_line(line);

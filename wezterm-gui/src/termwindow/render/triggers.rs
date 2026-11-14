@@ -5,6 +5,12 @@
 //! is drawn once into a sheet, each burst is handed over as it rises, and each frame says where
 //! its pane is, so they follow it and hide while it isn't shown. Otherwise they're drawn here
 //! frame by frame, over their pane as it is in each.
+//!
+//! The weights ride on the same kept copy (lbterm/QUESTIONS.md, "The weights"): in a pane with a
+//! Claude session, a row is read for an option's share of 100 as it's read for the rules, by
+//! `lbterm_extras::questions::weights::on_row`, and the share's digits are coloured on the copy in
+//! `config::lbterm::weight_colour`. A row's reading turns on the row above's ([`Head`]), handed
+//! down the pane's rows as a frame draws them, top first.
 
 use crate::customglyph::{BlockAlpha, BlockCoord, Poly, PolyCommand, PolyStyle};
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator};
@@ -12,13 +18,16 @@ use crate::termwindow::compositor::{HeartsBurst, HeartsPlan};
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use crate::scripting::guiwin::GuiWin;
 use config::lbterm::LbtermTrigger;
+use lbterm_extras::questions::weights::{self, Head, OnRow};
+use lbterm_extras::questions::Glyph;
 use lbterm_motion::PixelRect;
 use lbterm_triggers::{colour, hearts, Effect, Fire, Hit, LineText, Rgb, Rules, Seen, Spec, Style};
-use mux::pane::PaneId;
+use mux::pane::{Pane, PaneId};
 use mux::Mux;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
 use wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
@@ -102,6 +111,77 @@ struct Matched {
     palette: u64,
     /// The columns its rainbow rules matched, for screen_line to shade each glyph across its match
     rainbow: Option<Rc<Vec<Range<usize>>>>,
+    /// The weights' reading of it, for the head the row above left it; `None` in a pane with no
+    /// Claude session, where nothing's read
+    weighed: Option<Weighed>,
+}
+
+/// A Claude pane's row read for an option's share (`weights::on_row`): read again only when its
+/// line changes or the row above hands it another head
+#[derive(Clone, PartialEq)]
+struct Weighed {
+    /// The head the row above left it, which it was read with
+    head: Head,
+    share: Option<OnRow>,
+    /// What it leaves the row under it
+    next: Head,
+}
+
+/// A row's glyphs kept for the weights as its cells are walked: each cell's first char at its
+/// column, and only as far as the row's first ink, unless that says the row is read on
+/// (`weights::reads_on`), so most rows keep their leading spaces and nothing more
+struct Keep<'a> {
+    glyphs: &'a mut Vec<Glyph>,
+    head: Head,
+    on: Option<bool>,
+}
+
+impl<'a> Keep<'a> {
+    fn new(glyphs: &'a mut Vec<Glyph>, head: Head) -> Self {
+        glyphs.clear();
+        Self { glyphs, head, on: None }
+    }
+
+    fn cell(&mut self, col: usize, text: &str, width: usize) {
+        if self.on == Some(false) {
+            return;
+        }
+        let ch = text.chars().next().unwrap_or(' ');
+        if self.on.is_none() {
+            self.on = weights::reads_on(ch, self.head);
+            if self.on == Some(false) {
+                return;
+            }
+        }
+        self.glyphs.push(Glyph { col, ch, width });
+    }
+
+    /// The row's first ink said it isn't read on: nothing more of it is kept
+    fn done(&self) -> bool {
+        self.on == Some(false)
+    }
+}
+
+impl Weighed {
+    /// `line` read with `head`, a walk of its cells of its own, into `glyphs` (the buffer kept
+    /// from row to row): when the row above hands an unchanged line another head. The walk stops
+    /// at the first ink when the row isn't read on
+    fn read(line: &Line, head: Head, glyphs: &mut Vec<Glyph>) -> Self {
+        let mut keep = Keep::new(glyphs, head);
+        for cell in line.visible_cells() {
+            keep.cell(cell.cell_index(), cell.str(), cell.width());
+            if keep.done() {
+                break;
+            }
+        }
+        drop(keep);
+        Self::of(glyphs, head)
+    }
+
+    fn of(row: &[Glyph], head: Head) -> Self {
+        let (share, next) = weights::on_row(row, head);
+        Self { head, share, next }
+    }
 }
 
 /// A window's triggers: the rules, what each pane's lines matched, and the hearts in flight
@@ -122,6 +202,13 @@ pub struct TriggersState {
     /// The columns rainbow rules matched in the line being drawn, for screen_line to shade
     /// each glyph across its match
     rainbow: Option<Rc<Vec<Range<usize>>>>,
+    /// Which panes have a Claude session (a `claude_session` user var), and so have their rows
+    /// read for the weights: read from the pane the first time it's drawn, then kept in step by
+    /// the user var's alert (`lbterm_triggers_claude`), so a frame clones no pane's user vars
+    claude: HashMap<PaneId, bool>,
+    /// The glyphs of the row being read for the weights, kept from row to row so a read
+    /// allocates nothing once it's grown to a row
+    glyphs: Vec<Glyph>,
     /// When the next frame of hearts is due
     wake: Option<Instant>,
     /// DWM plays the hearts: with the compositor and motion on, as this frame's paint found
@@ -150,6 +237,98 @@ impl TriggersState {
             self.forget(pane, row);
         }
         self.views.clear();
+    }
+
+    /// What [`TermWindow::lbterm_trigger_line`] does for one row once its rules are in hand
+    /// (and there are rules, or `head` says the pane is a Claude pane): an unchanged line costs
+    /// a lookup, read again only when the row above hands it another head or the palette
+    /// changed; a new or changed one is walked once, matched and read for the weights. Here so a
+    /// test can drive it a frame at a time
+    fn line(
+        &mut self,
+        rules: &Rules,
+        pane_id: PaneId,
+        row: StableRowIndex,
+        line: &Line,
+        palette: &ColorPalette,
+        head: &mut Option<Head>,
+    ) -> Option<Rc<Line>> {
+        let seqno = line.current_seqno();
+        let palette_now = self.views.get(&pane_id).map_or(0, |v| v.palette_generation);
+        if let Some(matched) = self.lines.get_mut(&(pane_id, row)) {
+            if matched.seqno == seqno {
+                // The same line handed another head by the row above (or its pane's session
+                // came or went): read again, which only walks it
+                let reread = matched.weighed.as_ref().map(|w| w.head) != *head;
+                if reread {
+                    // No closure: in edition 2018 one would take the whole of self
+                    matched.weighed = match *head {
+                        Some(h) => Some(Weighed::read(line, h, &mut self.glyphs)),
+                        None => None,
+                    };
+                }
+                let repalette = matched.palette != palette_now && !matched.hits.is_empty();
+                if reread || repalette {
+                    // The same line in another palette, or with another share: recoloured,
+                    // nothing new about it
+                    let weight = matched.weighed.as_ref().and_then(|w| w.share.as_ref());
+                    let (styled, rainbow) = style(rules, line, &matched.hits, weight, palette);
+                    matched.styled = styled;
+                    matched.rainbow = rainbow;
+                    matched.palette = palette_now;
+                }
+                *head = matched.weighed.as_ref().map(|w| w.next);
+                self.rainbow = matched.rainbow.clone();
+                return matched.styled.clone();
+            }
+        }
+
+        // New, or changed: its text made once, matched, and what's new among its matches noted;
+        // in a Claude pane its first chars kept from the same walk for the weights
+        let mut text = LineText::with_capacity(if rules.is_empty() { 0 } else { 160 });
+        let mut glyphs = std::mem::take(&mut self.glyphs);
+        let mut keep = head.map(|h| Keep::new(&mut glyphs, h));
+        for cell in line.visible_cells() {
+            if !rules.is_empty() {
+                text.push(cell.cell_index(), cell.str(), cell.width());
+            }
+            if let Some(keep) = keep.as_mut() {
+                keep.cell(cell.cell_index(), cell.str(), cell.width());
+            }
+            // With no rules the walk is the weights' alone, done at the row's first ink
+            if rules.is_empty() && keep.as_ref().map_or(true, Keep::done) {
+                break;
+            }
+        }
+        drop(keep);
+        let hits = if rules.is_empty() { vec![] } else { rules.find_in(&text) };
+        let hash = if hits.is_empty() { 0 } else { text.hash() };
+        let weighed = head.map(|h| Weighed::of(&glyphs, h));
+        self.glyphs = glyphs;
+        *head = weighed.as_ref().map(|w| w.next);
+        if self.lines.len() >= MAX_LINES {
+            self.forget_all();
+        }
+        self.forget(pane_id, row);
+        if !hits.is_empty() {
+            self.seen.entry(pane_id).or_default().came(row, hash, &hits);
+        }
+        let weight = weighed.as_ref().and_then(|w| w.share.as_ref());
+        let (styled, rainbow) = style(rules, line, &hits, weight, palette);
+        self.rainbow = rainbow.clone();
+        self.lines.insert(
+            (pane_id, row),
+            Matched {
+                seqno,
+                text: hash,
+                hits,
+                styled: styled.clone(),
+                palette: palette_now,
+                rainbow,
+                weighed,
+            },
+        );
+        styled
     }
 }
 
@@ -185,13 +364,14 @@ fn style(
     rules: &Rules,
     line: &Line,
     hits: &[Hit],
+    weight: Option<&OnRow>,
     palette: &ColorPalette,
 ) -> (Option<Rc<Line>>, Option<Rc<Vec<Range<usize>>>>) {
     let styled: Vec<(&Hit, Style)> = hits
         .iter()
         .filter_map(|h| rules.get(h.rule).style.map(|s| (h, s)))
         .collect();
-    if styled.is_empty() {
+    if styled.is_empty() && weight.is_none() {
         return (None, None);
     }
     let mut rainbow = vec![];
@@ -212,6 +392,23 @@ fn style(
                     colour::tint(fg, colour, amount)
                 }
                 Style::Rainbow => colour::rainbow((i as f32 + 0.5) / len as f32),
+            };
+            cell.attrs_mut()
+                .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(srgba(colour)));
+        }
+    }
+    // The share in its colour, its digits and the brackets round them, over any rule's (the
+    // brackets too since Lachlan's 9 of 2026-11-14): a bracket is the column either side of the
+    // digits, coloured only when it's there, so one Claude Code wrapped onto the row above keeps
+    // the text's colour
+    if let Some(weight) = weight {
+        let c = config::lbterm::weight_colour(weight.share);
+        let colour = Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
+        let open = weight.cols.start.checked_sub(1).filter(|&col| cells.get(col).is_some_and(|c| c.str() == "("));
+        let close = Some(weight.cols.end).filter(|&col| cells.get(col).is_some_and(|c| c.str() == ")"));
+        for col in open.into_iter().chain(weight.cols.clone()).chain(close) {
+            let Some(cell) = cells.get_mut(col) else {
+                break;
             };
             cell.attrs_mut()
                 .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(srgba(colour)));
@@ -277,68 +474,78 @@ impl TermWindow {
         }
     }
 
+    /// Whether `pane` has a Claude session, so its rows are read for the weights: kept, and read
+    /// from the pane only the first time it's drawn (a clone of its user vars), then kept in step
+    /// by `lbterm_triggers_claude`
+    pub(crate) fn lbterm_triggers_weighs(&mut self, pane: &Arc<dyn Pane>) -> bool {
+        // Off (`lbterm_question_weights = false`): no row is read for a share, and a row read
+        // before the switch is read again with no head, which takes its colour off
+        if !self.config.lbterm_question_weights {
+            return false;
+        }
+        *self
+            .lbterm_triggers
+            .claude
+            .entry(pane.pane_id())
+            .or_insert_with(|| {
+                pane.copy_user_vars()
+                    .get("claude_session")
+                    .is_some_and(|sid| !sid.is_empty())
+            })
+    }
+
+    /// The shares the pane's last frame drew in their colours, top first, for the state file
+    pub(crate) fn lbterm_state_weights(&self, pane: PaneId) -> Vec<lbterm_extras::state::Weight> {
+        let state = &self.lbterm_triggers;
+        let Some(view) = state.views.get(&pane) else {
+            return vec![];
+        };
+        if state.claude.get(&pane) != Some(&true) {
+            return vec![];
+        }
+        view.rows
+            .clone()
+            .filter_map(|row| {
+                let share = state.lines.get(&(pane, row))?.weighed.as_ref()?.share.as_ref()?;
+                Some(lbterm_extras::state::Weight {
+                    row: (row - view.rows.start) as i64,
+                    col: share.cols.start,
+                    share: share.share,
+                })
+            })
+            .collect()
+    }
+
+    /// A pane's `claude_session` user var set (claudehook.exe at a session's start and with each
+    /// status) or cleared: its rows are read for the weights, or no longer, from its next frame
+    pub(crate) fn lbterm_triggers_claude(&mut self, pane: PaneId, value: &str) {
+        self.lbterm_triggers.claude.insert(pane, !value.is_empty());
+    }
+
     /// Runs for every line a pane draws. Returns a recoloured copy to draw instead when a rule
-    /// styles part of it, and notes new matches for [`Self::lbterm_triggers_fire`]. A line is
-    /// matched when it's new or has changed, and what it matched (and its copy) kept until then:
-    /// an unchanged line costs a lookup, where each frame copied, recoloured and hashed every
-    /// line with a match again, and told what it matched again to what's new (PERF.md, finding 62)
+    /// styles part of it or, in a Claude pane, it holds an option's share, and notes new matches
+    /// for [`Self::lbterm_triggers_fire`]. A line is matched when it's new or has changed, and
+    /// what it matched (and its copy) kept until then: an unchanged line costs a lookup, where
+    /// each frame copied, recoloured and hashed every line with a match again, and told what it
+    /// matched again to what's new (PERF.md, finding 62). `head`
+    /// is `None` for a pane with no Claude session; otherwise it comes in as what the row above
+    /// left this one (`Head::Closed` for the pane's top row) and goes out as what this row leaves
+    /// the next, so the caller hands it down the pane's rows top first
     pub(crate) fn lbterm_trigger_line(
         &mut self,
         pane_id: PaneId,
         row: StableRowIndex,
         line: &Line,
         palette: &ColorPalette,
+        head: &mut Option<Head>,
     ) -> Option<Rc<Line>> {
         self.lbterm_triggers.rainbow = None;
         let rules = self.lbterm_trigger_rules();
-        if rules.is_empty() {
+        if rules.is_empty() && head.is_none() {
             return None;
         }
-        let seqno = line.current_seqno();
-        let state = &mut self.lbterm_triggers;
-        let palette_now = state.views.get(&pane_id).map_or(0, |v| v.palette_generation);
-        if let Some(matched) = state.lines.get_mut(&(pane_id, row)) {
-            if matched.seqno == seqno {
-                if matched.palette != palette_now && !matched.hits.is_empty() {
-                    // The same line in another palette: recoloured, nothing new about it
-                    let (styled, rainbow) = style(&rules, line, &matched.hits, palette);
-                    matched.styled = styled;
-                    matched.rainbow = rainbow;
-                    matched.palette = palette_now;
-                }
-                state.rainbow = matched.rainbow.clone();
-                return matched.styled.clone();
-            }
-        }
-
-        // New, or changed: its text made once, matched, and what's new among its matches noted
-        let mut text = LineText::with_capacity(160);
-        for cell in line.visible_cells() {
-            text.push(cell.cell_index(), cell.str(), cell.width());
-        }
-        let hits = rules.find_in(&text);
-        let hash = if hits.is_empty() { 0 } else { text.hash() };
-        if state.lines.len() >= MAX_LINES {
-            state.forget_all();
-        }
-        state.forget(pane_id, row);
-        if !hits.is_empty() {
-            state.seen.entry(pane_id).or_default().came(row, hash, &hits);
-        }
-        let (styled, rainbow) = style(&rules, line, &hits, palette);
-        state.rainbow = rainbow.clone();
-        state.lines.insert(
-            (pane_id, row),
-            Matched {
-                seqno,
-                text: hash,
-                hits,
-                styled: styled.clone(),
-                palette: palette_now,
-                rainbow,
-            },
-        );
-        styled
+        self.lbterm_triggers
+            .line(&rules, pane_id, row, line, palette, head)
     }
 
     /// For screen_line: the rainbow at a glyph's left and right edges (`x0`, `x1`, pixels from
@@ -408,6 +615,7 @@ impl TermWindow {
             }
             state.lines.retain(|(pane, _), _| mux.get_pane(*pane).is_some());
             state.views.retain(|pane, _| mux.get_pane(*pane).is_some());
+            state.claude.retain(|pane, _| mux.get_pane(*pane).is_some());
         }
     }
 
@@ -640,5 +848,91 @@ impl TermWindow {
             _ => None,
         };
         (flying.len(), span)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use termwiz::cell::CellAttributes;
+    use termwiz::surface::SEQ_ZERO;
+
+    fn line(text: &str) -> Line {
+        Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None)
+    }
+
+    /// A Claude pane's option line is drawn from a copy with its share's digits and brackets in
+    /// the share's colour (the brackets since Lachlan's 9 of 2026-11-14), the rest of the line as
+    /// it was; the line itself never changes.
+    /// A row is read with the head the row above left it, so a share Claude Code wrapped onto the
+    /// next row is found there, and a line with neither a share nor a rule's style gets no copy
+    #[test]
+    fn a_share_is_drawn_in_its_colour_on_the_copy_and_nowhere_else() {
+        let (rules, _) = Rules::compile(&[]);
+        let palette = ColorPalette::default();
+        let row = line("  1a. Monthly JSONL (70): reason");
+        let mut glyphs = vec![];
+        let weighed = Weighed::read(&row, Head::Closed, &mut glyphs);
+        assert!(weighed.share == Some(OnRow { share: 70, cols: 21..23 }));
+        let (styled, rainbow) = style(&rules, &row, &[], weighed.share.as_ref(), &palette);
+        let styled = styled.expect("a copy");
+        assert!(rainbow.is_none());
+        let c = config::lbterm::weight_colour(70);
+        let want = ColorAttribute::TrueColorWithDefaultFallback(srgba(Rgb(
+            (c >> 16) as u8,
+            (c >> 8) as u8,
+            c as u8,
+        )));
+        let fg = |l: &Line, col: usize| l.visible_cells().nth(col).unwrap().attrs().foreground();
+        for col in 0..row.len() {
+            let expected = if (20..24).contains(&col) { want } else { ColorAttribute::Default };
+            assert!(fg(&styled, col) == expected, "column {}", col);
+            assert!(fg(&row, col) == ColorAttribute::Default, "the line itself, column {}", col);
+        }
+
+        let first = line("  1a. Monthly JSONL, one file a month, which");
+        let rest = line("  the dashboard reads (30): reason");
+        let open = Weighed::read(&first, Head::Closed, &mut glyphs);
+        assert!(open.share.is_none() && open.next == Head::Open { words: true });
+        let wrapped = Weighed::read(&rest, open.next, &mut glyphs);
+        assert!(wrapped.share.as_ref().map(|s| s.share) == Some(30) && wrapped.next == Head::Closed);
+        assert!(Weighed::read(&rest, Head::Closed, &mut glyphs).share.is_none());
+        assert!(style(&rules, &rest, &[], None, &palette).0.is_none());
+    }
+
+    /// A wrapped option's second row keeps its line (its seqno) while the row above changes:
+    /// it's read again with the head that row now hands it, and recoloured or put back, frame
+    /// by frame, as the kept-entry branch of `TriggersState::line` does
+    #[test]
+    fn an_unchanged_row_is_recoloured_when_the_row_above_hands_it_another_head() {
+        let (rules, _) = Rules::compile(&[]);
+        let palette = ColorPalette::default();
+        let mut state = TriggersState::default();
+        let at = |text: &str, seqno: SequenceNo| Line::from_text(text, &CellAttributes::default(), seqno, None);
+        let label = at("  1a. Monthly JSONL, one file a month, which", 1);
+        let words = at("  something else entirely", 2);
+        let rest = at("  the dashboard reads (30): reason", 3);
+        let share = |state: &TriggersState| {
+            state.lines[&(1, 1)].weighed.as_ref().and_then(|w| w.share.as_ref()).map(|s| s.share)
+        };
+        // One frame: the pane's rows top first, the head handed down
+        let frame = |state: &mut TriggersState, top: &Line| {
+            let mut head = Some(Head::Closed);
+            assert!(state.line(&rules, 1, 0, top, &palette, &mut head).is_none());
+            let drawn = state.line(&rules, 1, 1, &rest, &palette, &mut head);
+            (drawn, head)
+        };
+        let (drawn, head) = frame(&mut state, &label);
+        assert!(drawn.is_some() && share(&state) == Some(30) && head == Some(Head::Closed));
+        // The row above is something else now; the row under it the same line, uncoloured
+        let (drawn, _) = frame(&mut state, &words);
+        assert!(drawn.is_none() && share(&state).is_none());
+        assert!(state.lines[&(1, 1)].seqno == 3);
+        // And back
+        let (drawn, _) = frame(&mut state, &label);
+        let drawn = drawn.expect("coloured again");
+        let c = config::lbterm::weight_colour(30);
+        let want = ColorAttribute::TrueColorWithDefaultFallback(srgba(Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)));
+        assert!(drawn.visible_cells().nth(23).unwrap().attrs().foreground() == want);
     }
 }

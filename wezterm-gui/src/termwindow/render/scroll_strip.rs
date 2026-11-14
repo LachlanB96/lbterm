@@ -499,6 +499,7 @@ impl crate::TermWindow {
             _ => {
                 self.lbterm_scroll_strip.reset();
                 crate::conversations::shows(self.mux_window_id, crate::conversations::Reader::ScrollStrip, None);
+                self.lbterm_context_bar_rode(None);
                 return Ok(());
             }
         };
@@ -563,7 +564,11 @@ impl crate::TermWindow {
             }
             _ => (panel.y as f64, (panel.y + panel.h) as f64),
         };
-        let strip = Rect { x: room.right as f64, y: top, w: width, h: (bottom - top).max(2.0 * ends + 1.0) };
+        // While the context bar's drawer or pane is out, the strip rides on its left edge
+        // (render/context_bar.rs): drawn there, and with the compositor in a visual of its own
+        // that DWM glides there from where it showed
+        let ride = self.lbterm_context_bar_ride();
+        let strip = Rect { x: room.right as f64 + ride.offset, y: top, w: width, h: (bottom - top).max(2.0 * ends + 1.0) };
         let track = Rect {
             x: strip.x + inset,
             y: strip.y + ends,
@@ -601,8 +606,20 @@ impl crate::TermWindow {
             }
         }
         let lit = self.lbterm_scroll_strip.pointer_on || self.lbterm_scroll_strip.drag.is_some();
-        let shapes = self.lbterm_scroll_draw(&layout, room, strip, track, dim_to, surface, lit, scale);
-        self.lbterm_sides_draw(shapes);
+        let mut shapes = self.lbterm_scroll_draw(&layout, room, strip, track, dim_to, surface, lit, scale);
+        if ride.own {
+            // The panes' colour under its own place stays; the strip goes to its visual
+            let riding = shapes.split_off(1.min(shapes.len()));
+            self.lbterm_sides_draw(shapes);
+            self.lbterm_shapes(super::context_bar::RIDE_Z, &riding)?;
+            let (x0, y0) = (strip.x.floor(), strip.y.floor());
+            let (x1, y1) = ((strip.x + strip.w).ceil(), (strip.y + strip.h).ceil());
+            let bounds = PixelRect::new(x0 as i32, y0 as i32, (x1 - x0).max(1.0) as u32, (y1 - y0).max(1.0) as u32);
+            self.lbterm_context_bar_rode(Some((bounds, (x0 - ride.offset) as i32)));
+        } else {
+            self.lbterm_sides_draw(shapes);
+            self.lbterm_context_bar_rode(None);
+        }
 
         // The card: laid out afresh while open, and with the compositor drawn as it was while
         // its visual fades out
@@ -616,9 +633,9 @@ impl crate::TermWindow {
             self.webgpu
                 .as_ref()
                 .and_then(|w| w.compositor.as_ref())
-                .map_or(([false; 4], None), |c| c.objectives_showing(now))
+                .map_or(([false; super::objectives::CARDS], None), |c| c.objectives_showing(now))
         } else {
-            ([false; 4], None)
+            ([false; super::objectives::CARDS], None)
         };
         let card = match strip_card::card_draw(open, fading[WHICH]) {
             CardDraw::Fresh => self.lbterm_scroll_lay_out_card(&layout, strip, &settings, scale)?,

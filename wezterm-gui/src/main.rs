@@ -36,6 +36,8 @@ use wezterm_toast_notification::*;
 
 mod colorease;
 mod commands;
+mod context_edits;
+mod cost;
 mod conversations;
 mod control;
 mod counters;

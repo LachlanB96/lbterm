@@ -1,5 +1,5 @@
 //! LBTerm: the mic mark on the window strip (lbterm/CONTROL.md, "The mic mark"; the logic is
-//! lbterm_extras::mic): what Earshot last said of its listening, over the control pipe, shown
+//! lbterm_extras::mic): what LyreBird last said of its listening, over the control pipe, shown
 //! left of the window's buttons in every window until its time runs out.
 
 use crate::termwindow::box_model::{BorderColor, Element, ElementColors, ElementContent};
@@ -18,7 +18,7 @@ pub fn shown() -> Option<MicState> {
     MIC.lock().unwrap().shown(Instant::now())
 }
 
-/// Earshot's `mic`: `state` for `ttl`; every window's strip is built again now, and once its
+/// LyreBird's `mic`: `state` for `ttl`; every window's strip is built again now, and once its
 /// time's run out
 pub fn set(state: Option<MicState>, ttl: Duration) -> Option<MicState> {
     let now = Instant::now();
